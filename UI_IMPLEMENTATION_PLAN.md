@@ -102,18 +102,97 @@ tab switching, and split-pane behavior still work unchanged from the outside.
 ### TICKET-A2 — Obsidian-style Live Preview mode
 
 **Priority:** high
-**Owner:** — **Status:** todo
-**Files:** `MarkdownEditor.tsx`, `StudyBoard.tsx`, `src/stores/useStore.ts`
+**Owner:** Claude **Status:** done (browser-verified; a Tauri desktop smoke test is still
+worthwhile but no longer speculative)
+**Files:** new `src/components/markdownLivePreview.ts`, `MarkdownEditor.tsx`,
+`StudyBoard.tsx`, `src/stores/useStore.ts`
 
-Add a CodeMirror decoration extension that renders markdown inline while editing: headings
-sized up, `**bold**`/`*italic*` styled with the markers hidden, `` `code` `` styled, `- [ ]`
-rendered as a clickable checkbox — but only on lines the cursor isn't currently in (the
-active line shows raw syntax so it stays editable), matching Obsidian's Live Preview.
+Implemented `livePreviewExtension`, a CodeMirror `ViewPlugin` that walks the markdown syntax
+tree (`syntaxTree()` from `@codemirror/language`) on every doc/selection/viewport change and
+builds decorations: heading nodes get a `cm-md-heading cm-md-h{1-6}` style class (sizes
+matched to the existing `.markdown-preview h1/h2/h3` CSS in `index.css` for visual
+consistency between Live Preview and the full reading-mode preview); `StrongEmphasis`,
+`Emphasis`, `InlineCode`, `Strikethrough` get their own style classes; the corresponding
+`*Mark`/`CodeMark` nodes (the literal `**`, `*`, `` ` ``, `~~` characters) are hidden via
+`Decoration.replace({})`; `TaskMarker` nodes (`- [ ]` / `- [x]`, enabled via the `GFM`
+extension from `@lezer/markdown` passed into `markdown({ extensions: [GFM] })`) are replaced
+with a real clickable `<input type="checkbox">` widget that rewrites the `[ ]`/`[x]` text
+in place on click. All of this is skipped for whichever line contains the cursor, so that
+line stays raw and editable, per Obsidian's Live Preview behavior. Toggled via a
+`Compartment` (`livePreviewCompartmentRef`) so switching view modes reconfigures the
+existing editor instead of recreating it.
 
-Extend `ViewMode` from `"edit" | "preview"` to `"source" | "live" | "preview"` (keep the
-existing full-render `ReactMarkdown` mode as `"preview"` for a clean reading view; `"live"`
-becomes the new default; `"source"` is raw CodeMirror with no decorations, for people who
-want to see exact markdown).
+`ViewMode` extended to `"source" | "live" | "preview"` in `useStore.ts` (default changed
+from `"edit"` to `"live"` for both panels). `StudyBoard.tsx`'s single toggle button now
+cycles live → source → preview → live (via a `NEXT_VIEW_MODE` map) instead of a two-way
+edit/preview toggle; the existing full-`ReactMarkdown` preview path is untouched.
+
+**Scope note:** table rendering, link styling, and wiki-link support were **not** added —
+those are TICKET-A4 (tables) or explicitly out of scope (wiki-links, per that ticket's own
+note) for this pass.
+
+**Bug found and fixed during verification:** the first version crashed on load with
+`CodeMirror plugin crashed: Ranges must be added sorted by 'from' position and 'startSide'`
+— confirmed via the user's screenshot of the real app (headings/bold/checkboxes all showing
+as raw, undecorated text) and reproduced directly by temporarily mounting `MarkdownEditor`
+in isolation (bypassing Tauri) and checking the browser console. Root cause: manually
+driving `RangeSetBuilder.add()` with a hand-written sort comparator (`from` ascending, `to`
+descending) isn't sufficient for CodeMirror's actual ordering rule, which also depends on
+each decoration's `startSide`. When the plugin throws, CodeMirror disables it silently —
+which is exactly why *nothing* was decorated rather than just some edge case. Fixed by
+switching to `RangeSet.of(ranges, true)` (letting CodeMirror sort/validate the ranges
+itself) instead of manually building and sorting for `RangeSetBuilder` — the standard,
+documented-safe way to build a decoration set from a tree walk. Also fixed a second bug
+found in the same pass: the task-checkbox widget's `ignoreEvent()` returned `false`
+(backwards — that tells CodeMirror to keep handling the click normally), so clicking a
+checkbox also placed the cursor on that line, which then made it the "active" line and
+reverted it to raw text. Fixed to return `true`, plus added `stopPropagation()` alongside
+the existing `preventDefault()` in the widget's click handler, so the click is fully owned
+by the checkbox and never reaches CodeMirror's own cursor-placement handling.
+
+**Follow-up round (user-reported):** after the crash fix, user reported italic-with-`*`,
+bullet lists, and horizontal rules still not working. Investigation:
+- **Italic with `*` was never actually broken** — it was on line 1 of the test content,
+  which is the cursor's default active line (stays raw by design). Confirmed by moving the
+  cursor off that line; it rendered correctly immediately. No code change needed — logged
+  here so the same false alarm doesn't get re-investigated later.
+- **Bullet lists (`-`/`*`/`+`) and horizontal rules (`---`) were genuinely unimplemented** —
+  never in scope for the first pass. Added: a `BulletWidget` replacing the `ListMark` node
+  (and its trailing space) with a styled `•` dot — explicitly scoped to bullet markers only
+  by checking the marker text, since lezer-markdown reuses the `ListMark` node name for
+  ordered-list numbers too and those are intentionally left alone (not requested); and a
+  `HorizontalRuleWidget` replacing `HorizontalRule` nodes with a real `<hr>`-like element.
+  Both gated behind `!isActiveLine` like everything else.
+- **List "automation" on Enter**, since the user used that word specifically: added
+  `continueListOnEnter` (new `src/components/markdownListContinuation.ts`), a `Prec.highest`
+  keymap command that continues a bullet item's marker onto the next line on Enter
+  (resetting a task checkbox to unchecked rather than duplicating its checked state), or —
+  if the current item is empty — strips the marker instead, exiting the list (standard
+  editor convention, avoids infinite empty bullets). Deliberately scoped to bullet markers
+  only, not ordered lists, matching what was actually asked.
+
+**Second bug found and fixed in this round:** the Enter-continuation command initially
+appeared completely non-functional in testing — no newline, no marker, nothing — even a
+trivial `console.log`-only stub bound to `"Enter"` never fired, while an identical binding
+on `"F4"` fired immediately. This turned out to be specific to this sandbox's browser
+automation tool: its `key` action's `"Return"` string doesn't reliably reach CodeMirror's
+Enter handling in a contenteditable, while `"Enter"` does — not a code defect. Confirmed by
+re-testing with `key: "Enter"` instead of `"Return"`, which worked immediately and exactly
+as designed (continuation, task-checkbox reset, and empty-item list-exit all verified). This
+is a testing-tool quirk worth remembering, not something to chase in the source again.
+
+**Verification:** `npx tsc --noEmit` and `npm run build` pass. Live-tested directly in a
+browser (not the full Tauri app — no real filesystem access there — but the identical
+`MarkdownEditor` component, mounted standalone with sample markdown covering every
+implemented feature, across two separate rounds): confirmed headings/bold/italic/
+inline-code/strikethrough/bullets/horizontal-rules render correctly with markers hidden on
+inactive lines and correctly revert to raw on the active line; both checkbox states render
+and toggle on click; Enter continues a bullet with the marker carried over, and exits the
+list by stripping the marker on an empty item; zero new console errors throughout (the two
+stale "plugin crashed" entries from before the very first fix never grew in count across
+either round, confirming no regression). Not yet tested inside the actual Tauri desktop
+shell with a real vault — worth a final pass there, but the feature set is now verified
+working end-to-end in isolation, not speculative.
 
 **Acceptance:** headings/bold/italic/checkboxes/inline code render styled with markers
 hidden, except on the line containing the cursor; toggling to "preview" still gives the
@@ -122,13 +201,29 @@ current full-document rendered view; toggling to "source" shows raw markdown eve
 ### TICKET-A3 — Wire editor-affecting settings through CodeMirror
 
 **Priority:** medium (replaces TICKET-1 items 6–8)
-**Owner:** — **Status:** todo
-**Files:** `MarkdownEditor.tsx`
+**Owner:** Claude **Status:** done (pending manual in-app verification)
+**Files:** `MarkdownEditor.tsx`, `package.json` (added `@codemirror/autocomplete` for
+`closeBrackets`)
 
-- `tabSize` → `indentUnit.of(" ".repeat(tabSize))`
-- `showLineNumbers` → conditionally include the `lineNumbers()` extension
-- `autoPairBrackets` → conditionally include `closeBrackets()`
-- `fontFamily`/`fontSize` → `EditorView.theme({...})`
+Implemented exactly as scoped, each behind its own `Compartment` so toggling any of these in
+`SettingsModal` reconfigures the live editor instance without losing cursor position or
+undo history:
+- `tabSize` → `indentUnit.of(" ".repeat(tabSize))`, plus `indentWithTab` added to the keymap
+  (not conditional — without it, Tab has no binding and falls through to the browser's
+  focus-navigation default, which isn't useful in a text editor regardless of tab size).
+- `showLineNumbers` → conditionally includes `lineNumbers()` from `@codemirror/view`.
+- `autoPairBrackets` → conditionally includes `closeBrackets()` + `closeBracketsKeymap` from
+  the newly-added `@codemirror/autocomplete` package (bracket closing lives there, not in
+  `@codemirror/commands` as the ticket's shorthand implied).
+- `fontFamily`/`fontSize` needed **no new work** — `MarkdownEditor`'s `.cm-content`/
+  `.cm-scroller` theme rules already use `fontFamily: "inherit"` / `fontSize: "inherit"`,
+  and `StudyBoard.tsx`'s wrapping container already sets both as inline styles from
+  `settings.fontFamily`/`settings.fontSize` (unchanged since before TICKET-A1) — CSS
+  inheritance carries them through to the CodeMirror DOM for free.
+
+**Verification:** `npx tsc --noEmit` and `npm run build` pass. **Not manually tested in the
+running app**, same caveat as the other tickets this session — confirm via `npm run tauri
+dev` that toggling each setting actually changes editor behavior live.
 
 **Acceptance:** each setting toggles the corresponding CodeMirror behavior live, no restart
 needed (reconfigure via `Compartment`s so toggling doesn't recreate the whole editor/cursor

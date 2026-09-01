@@ -1,9 +1,16 @@
 import { useState, useEffect, useRef } from "react";
-import { useStore, Tab } from "../stores/useStore";
+import { useStore, Tab, ViewMode } from "../stores/useStore";
 import ReactMarkdown from "react-markdown";
 import MarkdownEditor from "./MarkdownEditor";
 
 export const TAB_DRAG_MIME = "application/x-lsn-tab";
+
+// Cycle order for the view-mode toggle button: live -> source -> preview -> live
+const NEXT_VIEW_MODE: Record<ViewMode, ViewMode> = {
+  live: "source",
+  source: "preview",
+  preview: "live",
+};
 
 export default function StudyBoard() {
   const splitActive = useStore((s) => s.splitActive);
@@ -289,21 +296,23 @@ function EditorPanel({ panel }: EditorPanelProps) {
 
         {/* Right Controls of Tab Bar */}
         <div className="flex items-center gap-1 shrink-0 ml-2">
-          {/* View toggle (Eye / Edit) */}
+          {/* View mode cycle: live (Obsidian-style rendered markdown) -> source (raw) -> preview (full reading view) -> live */}
           <button
-            onClick={() => setPanelViewMode(panel, viewMode === "edit" ? "preview" : "edit")}
-            title={viewMode === "preview" ? "Switch to live edit" : "Switch to preview"}
+            onClick={() => setPanelViewMode(panel, NEXT_VIEW_MODE[viewMode])}
+            title={`Switch to ${NEXT_VIEW_MODE[viewMode]}`}
             className="rounded p-1 text-muted hover:bg-card hover:text-white cursor-pointer transition-colors"
           >
             {viewMode === "preview" ? (
               <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
-                <path d="M12 20h9" />
-                <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
-              </svg>
-            ) : (
-              <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
                 <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
                 <circle cx="12" cy="12" r="3" />
+              </svg>
+            ) : viewMode === "source" ? (
+              <span className="block w-3.5 text-center text-[10px] font-mono font-bold leading-none">{"</>"}</span>
+            ) : (
+              <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
+                <path d="M12 20h9" />
+                <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
               </svg>
             )}
           </button>
@@ -403,11 +412,13 @@ function EditorPanel({ panel }: EditorPanelProps) {
                 <ReactMarkdown>{draft || "*Empty document...*"}</ReactMarkdown>
               </div>
             ) : (
-              /* Source editor (CodeMirror 6) */
+              /* CodeMirror 6 editor — "live" renders Obsidian-style inline formatting
+                 with syntax hidden except on the active line; "source" shows raw markdown. */
               <MarkdownEditor
                 key={activeTabId}
                 value={draft}
                 onChange={(content) => setDraftContent(panel, content)}
+                livePreview={viewMode === "live"}
               />
             )}
           </div>

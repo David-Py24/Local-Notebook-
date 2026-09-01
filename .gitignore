@@ -9,3 +9,6 @@ src-tauri/gen/
 *.log
 .DS_Store
 Thumbs.db
+.vscode/
+.claude/
+*.session.sql

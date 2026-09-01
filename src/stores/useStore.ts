@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getThemeById, applyThemeToDocument } from "../themes";
 import type { Project } from "../types";
 
-export type ViewMode = "edit" | "preview";
+export type ViewMode = "source" | "live" | "preview";
 export type SaveStatus = "saved" | "saving" | "unsaved";
 export type SidePanelId = "assistant" | "sources";
 
@@ -257,8 +257,8 @@ export const useStore = create<AppState>((set, get) => {
     activeRightTabId: null,
     leftDraft: "",
     rightDraft: "",
-    leftViewMode: "edit",
-    rightViewMode: "edit",
+    leftViewMode: "live",
+    rightViewMode: "live",
     leftSaveStatus: "saved",
     rightSaveStatus: "saved",
     leftLivePreviewActive: false,
