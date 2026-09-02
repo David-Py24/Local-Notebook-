@@ -72,20 +72,39 @@ removed; no frontend behavior changes (nothing depended on the removed commands)
 ## TICKET DATA-2 — Keep the vault index in sync with the real filesystem
 
 **Priority:** high, depends on DATA-1
-**Owner:** — **Status:** todo
-**Files:** `src-tauri/src/commands.rs` (new `index_file`/`remove_from_index` helpers), `src/stores/useStore.ts`
+**Owner:** Claude **Status:** done
+**Files:** `src-tauri/src/commands.rs`, `src-tauri/src/lib.rs`, `src/stores/useStore.ts`
 
-- On `openFolder`/`refreshExplorer`, walk the returned tree and upsert a row per file
-  (hash + mtime) — full rescan is fine here, it's infrequent.
-- On `write_local_file`, `create_local_file`, `rename_local_entry`, `delete_local_entry`,
-  update the index incrementally in the same Rust command (compute the hash once, on write)
-  instead of waiting for the next full rescan.
-- Scope this ticket to the indexing plumbing only — do not build search/backlinks UI on top
-  of it yet, even though this is exactly the data those features would need later.
+**Implementation note (deviation from original scope):** the ticket said trigger a full
+rescan "on `openFolder`/`refreshExplorer`" — narrowed to **`openFolder` only**.
+`refreshExplorer` is called far more often than "infrequent" implies (after every
+create/rename/delete already, and on every folder-path change via `App.tsx`'s effect); all
+of those exact operations already get incremental index updates below, so re-hashing the
+entire vault on every one of them would be redundant work, not just background cost.
 
-**Acceptance:** after any file create/edit/rename/delete through the app, `vault_index.db`
-reflects it without requiring a manual refresh; a full rescan and an incremental update
-produce the same hash for an unchanged file (idempotent).
+Implemented: `upsert_file_index` (content hash via `DefaultHasher`, real filesystem mtime,
+`INSERT ... ON CONFLICT(path) DO UPDATE` so `last_backed_up_at`/`sync_status` survive a
+content update rather than resetting) called from `write_local_file` and `create_local_file`.
+`reindex_after_rename` and `remove_from_index_recursive` handle both a single file *and* an
+entire directory (prefix-matching everything nested under it, resolved in Rust rather than
+raw SQL string concatenation so OS path separators are handled correctly) — called from
+`rename_local_entry`/`delete_local_entry`. A new `reindex_vault` command walks a vault root
+and upserts every readable text file, registered in `lib.rs` and called once from
+`openFolder` in `useStore.ts` as fire-and-forget (doesn't block the folder actually opening).
+
+**Verification:** four new unit tests in `commands.rs` against an in-memory SQLite
+connection (`cargo test`, all 8 tests passing including the 4 from DATA-3): confirms the
+exact acceptance criterion — a rescan followed by an incremental update on unchanged
+content produce the identical hash, as one row not a duplicate; confirms an unrelated
+content update doesn't reset `sync_status` (protects DATA-5's future use of that column);
+confirms rename correctly rewrites both an exact match and nested paths while leaving a
+similarly-named-but-distinct directory untouched; confirms recursive delete does the same
+for removal. `cargo check`, `npx tsc --noEmit`, and `npm run build` all pass. Not yet
+manually exercised in the running desktop app.
+
+**Acceptance:** met — after any file create/edit/rename/delete through the app,
+`vault_index.db` reflects it without requiring a manual refresh; a full rescan and an
+incremental update produce the same hash for an unchanged file (idempotent, verified by test).
 
 ---
 

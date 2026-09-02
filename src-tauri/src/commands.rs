@@ -51,6 +51,129 @@ fn snapshot_previous_version(history_root: &std::path::Path, valid_path: &std::p
     prune_history(&history_dir)
 }
 
+// Vault index sync (DATA-2): keeps the `files` table's content_hash/size/mtime current
+// incrementally on every create/write/rename/delete, plus a full rescan (`reindex_vault`)
+// triggered once when a vault is opened. `refreshExplorer` (called far more often — after
+// every file op already, and on every folder-path change) deliberately does NOT trigger a
+// rescan itself, since those exact operations already get incremental updates below; a full
+// re-hash on every refresh would be redundant work, not just "infrequent" background cost.
+
+fn content_hash(content: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn format_system_time(time: std::time::SystemTime) -> String {
+    let datetime: chrono::DateTime<chrono::Local> = time.into();
+    datetime.format("%Y-%m-%dT%H:%M:%S%.3f").to_string()
+}
+
+fn now_iso() -> String {
+    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string()
+}
+
+fn upsert_file_index(conn: &rusqlite::Connection, path: &std::path::Path, content: &str) -> Result<(), String> {
+    let path_str = path.to_string_lossy();
+    let hash = content_hash(content);
+    let size = content.len() as i64;
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(format_system_time)
+        .unwrap_or_else(|_| now_iso());
+
+    conn.execute(
+        "INSERT INTO files (path, content_hash, size_bytes, mtime, last_indexed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(path) DO UPDATE SET
+             content_hash = excluded.content_hash,
+             size_bytes = excluded.size_bytes,
+             mtime = excluded.mtime,
+             last_indexed_at = excluded.last_indexed_at",
+        params![path_str.as_ref(), hash, size, mtime, now_iso()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn remove_from_index_recursive(conn: &rusqlite::Connection, path_str: &str) -> Result<(), String> {
+    // Covers both a single file (exact match) and a directory (prefix match on everything
+    // nested under it) with one statement, rather than needing the caller to know which.
+    let prefix_pattern = format!("{}{}%", path_str, std::path::MAIN_SEPARATOR);
+    conn.execute(
+        "DELETE FROM files WHERE path = ?1 OR path LIKE ?2",
+        params![path_str, prefix_pattern],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn reindex_after_rename(conn: &rusqlite::Connection, old_str: &str, new_str: &str) -> Result<(), String> {
+    // A rename can be a single file or an entire directory (rewriting every nested path's
+    // prefix) — resolved in Rust rather than raw SQL string surgery so OS path separators
+    // are handled correctly instead of assuming '/'.
+    let prefix_pattern = format!("{}{}%", old_str, std::path::MAIN_SEPARATOR);
+    let mut stmt = conn
+        .prepare("SELECT path FROM files WHERE path = ?1 OR path LIKE ?2")
+        .map_err(|e| e.to_string())?;
+    let matching_paths: Vec<String> = stmt
+        .query_map(params![old_str, prefix_pattern], |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect();
+    drop(stmt);
+
+    for old_file_path in matching_paths {
+        let new_file_path = if old_file_path == old_str {
+            new_str.to_string()
+        } else {
+            format!("{}{}", new_str, &old_file_path[old_str.len()..])
+        };
+        conn.execute(
+            "UPDATE files SET path = ?1 WHERE path = ?2",
+            params![new_file_path, old_file_path],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn reindex_dir_recursive(conn: &rusqlite::Connection, dir: &std::path::Path, depth: usize) -> Result<usize, String> {
+    if depth > 8 {
+        return Ok(0);
+    }
+    let mut count = 0;
+    let read_entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in read_entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            count += reindex_dir_recursive(conn, &path, depth + 1)?;
+        } else if let Ok(content) = std::fs::read_to_string(&path) {
+            // Binary/non-UTF8 files are silently skipped — this index is for note content.
+            if upsert_file_index(conn, &path, &content).is_ok() {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+pub fn reindex_vault(state: State<DbState>, vault_root: String) -> Result<usize, String> {
+    let root = std::path::Path::new(&vault_root);
+    if !root.is_dir() {
+        return Err("Not a directory".to_string());
+    }
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    reindex_dir_recursive(&conn, root, 0)
+}
+
 pub fn extract_links(source_path: &str, content: &str) -> Vec<LinkItem> {
     let mut links = Vec::new();
     for (line_idx, line) in content.lines().enumerate() {
@@ -332,12 +455,18 @@ pub fn write_local_file(
     let canon_str = valid_path.to_string_lossy();
     if let Ok(conn) = state.vault_index.lock() {
         let _ = sync_links_internal(&conn, &canon_str, &content);
+        let _ = upsert_file_index(&conn, &valid_path, &content);
     }
     Ok(())
 }
 
 #[tauri::command]
-pub fn create_local_file(dir_path: String, name: String, vault_root: Option<String>) -> Result<String, String> {
+pub fn create_local_file(
+    state: State<DbState>,
+    dir_path: String,
+    name: String,
+    vault_root: Option<String>,
+) -> Result<String, String> {
     // Trim and guard against empty names
     let base = name.trim();
     if base.is_empty() {
@@ -365,6 +494,11 @@ pub fn create_local_file(dir_path: String, name: String, vault_root: Option<Stri
     }
 
     std::fs::write(&valid_file_path, "").map_err(|e| e.to_string())?;
+
+    if let Ok(conn) = state.vault_index.lock() {
+        let _ = upsert_file_index(&conn, &valid_file_path, "");
+    }
+
     Ok(valid_file_path.to_string_lossy().into_owned())
 }
 
@@ -419,6 +553,7 @@ pub fn rename_local_entry(
             "UPDATE links SET target_path = ?1 WHERE target_path = ?2",
             params![new_str.as_ref(), old_str.as_ref()],
         );
+        let _ = reindex_after_rename(&conn, old_str.as_ref(), new_str.as_ref());
     }
     Ok(())
 }
@@ -456,8 +591,152 @@ pub fn delete_local_entry(
             "DELETE FROM links WHERE source_path = ?1 OR target_path = ?2",
             params![path_str.as_ref(), path_str.as_ref()],
         );
+        let _ = remove_from_index_recursive(&conn, path_str.as_ref());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (
+                path            TEXT PRIMARY KEY,
+                content_hash    TEXT NOT NULL,
+                size_bytes      INTEGER NOT NULL,
+                mtime           TEXT NOT NULL,
+                last_indexed_at TEXT NOT NULL,
+                last_backed_up_at TEXT,
+                sync_status     TEXT NOT NULL DEFAULT 'not_tracked'
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn upsert_is_idempotent_for_unchanged_content() {
+        let dir = std::env::temp_dir().join("lsn_test_index_idempotent");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("note.md");
+        std::fs::write(&file_path, "unchanged content").unwrap();
+
+        let conn = test_conn();
+        // Simulates a full rescan followed by an incremental update for the same file
+        // with the same content — the acceptance criterion this ticket specifies.
+        upsert_file_index(&conn, &file_path, "unchanged content").unwrap();
+        let hash_after_rescan: String = conn
+            .query_row("SELECT content_hash FROM files WHERE path = ?1", params![file_path.to_string_lossy().as_ref()], |r| r.get(0))
+            .unwrap();
+
+        upsert_file_index(&conn, &file_path, "unchanged content").unwrap();
+        let hash_after_incremental: String = conn
+            .query_row("SELECT content_hash FROM files WHERE path = ?1", params![file_path.to_string_lossy().as_ref()], |r| r.get(0))
+            .unwrap();
+
+        assert_eq!(hash_after_rescan, hash_after_incremental, "hash must be identical for unchanged content");
+
+        // Also confirms the ON CONFLICT path really is an update, not a duplicate row.
+        let row_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(row_count, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_preserves_sync_status_on_update() {
+        let dir = std::env::temp_dir().join("lsn_test_index_sync_status");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("note.md");
+        std::fs::write(&file_path, "v1").unwrap();
+
+        let conn = test_conn();
+        upsert_file_index(&conn, &file_path, "v1").unwrap();
+        conn.execute(
+            "UPDATE files SET sync_status = 'synced' WHERE path = ?1",
+            params![file_path.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+
+        std::fs::write(&file_path, "v2").unwrap();
+        upsert_file_index(&conn, &file_path, "v2").unwrap();
+
+        let sync_status: String = conn
+            .query_row("SELECT sync_status FROM files WHERE path = ?1", params![file_path.to_string_lossy().as_ref()], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync_status, "synced", "an unrelated content update must not reset sync_status");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_updates_exact_and_nested_paths() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let conn = test_conn();
+        let old_dir = format!("C:{sep}vault{sep}Notes");
+        let new_dir = format!("C:{sep}vault{sep}Renamed");
+        let nested_old = format!("{old_dir}{sep}inner.md");
+        let unrelated = format!("C:{sep}vault{sep}NotesButNotReally{sep}other.md");
+
+        for p in [&old_dir, &nested_old, &unrelated] {
+            conn.execute(
+                "INSERT INTO files (path, content_hash, size_bytes, mtime, last_indexed_at) VALUES (?1, 'h', 0, 't', 't')",
+                params![p],
+            )
+            .unwrap();
+        }
+
+        reindex_after_rename(&conn, &old_dir, &new_dir).unwrap();
+
+        let remaining_old: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files WHERE path = ?1", params![old_dir], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining_old, 0, "old directory path must no longer exist");
+
+        let nested_new = format!("{new_dir}{sep}inner.md");
+        let nested_moved: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files WHERE path = ?1", params![nested_new], |r| r.get(0))
+            .unwrap();
+        assert_eq!(nested_moved, 1, "nested file must have its path prefix rewritten");
+
+        let unrelated_untouched: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files WHERE path = ?1", params![unrelated], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unrelated_untouched, 1, "a similarly-named but distinct directory must not be affected");
+    }
+
+    #[test]
+    fn remove_from_index_recursive_removes_nested_but_not_unrelated() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let conn = test_conn();
+        let dir_path = format!("C:{sep}vault{sep}ToDelete");
+        let nested = format!("{dir_path}{sep}child.md");
+        let unrelated = format!("C:{sep}vault{sep}ToDeleteButNotReally{sep}other.md");
+
+        for p in [&dir_path, &nested, &unrelated] {
+            conn.execute(
+                "INSERT INTO files (path, content_hash, size_bytes, mtime, last_indexed_at) VALUES (?1, 'h', 0, 't', 't')",
+                params![p],
+            )
+            .unwrap();
+        }
+
+        remove_from_index_recursive(&conn, &dir_path).unwrap();
+
+        let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 1, "only the unrelated path should survive");
+
+        let unrelated_survives: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files WHERE path = ?1", params![unrelated], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unrelated_survives, 1);
+    }
 }
 
 #[cfg(test)]

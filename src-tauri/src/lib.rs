@@ -24,6 +24,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_backlinks,
             commands::get_outgoing_links,
+            commands::reindex_vault,
             commands::read_local_dir,
             commands::read_local_file,
             commands::write_local_file,

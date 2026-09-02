@@ -322,6 +322,12 @@ export const useStore = create<AppState>((set, get) => {
       set({ currentFolderPath: path });
       localStorage.setItem("lsn_last_folder", path);
       await get().refreshExplorer();
+      // Full vault-index rescan (DATA-2) — fire-and-forget so a large vault's content
+      // hashing doesn't delay the folder actually opening; incremental updates from
+      // individual file operations keep the index current the rest of the time.
+      invoke("reindex_vault", { vaultRoot: path }).catch((err) => {
+        console.error("Failed to reindex vault:", err);
+      });
     },
 
     closeFolder: () => {
