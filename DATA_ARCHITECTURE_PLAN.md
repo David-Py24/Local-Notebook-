@@ -34,7 +34,7 @@ placeholder only, to be turned into its own plan document when picked up.
 ## TICKET DATA-1 — Consolidate the two dead SQLite databases into one local vault index
 
 **Priority:** high — this is the actual "secure and scaffold the database" work
-**Owner:** — **Status:** todo
+**Owner:** Antigravity — **Status:** done
 **Files:** `src-tauri/src/db.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/lib.rs`,
 `src-tauri/src/parsers.rs` (remove), `src-tauri/Cargo.toml` (drop `pdf_extract`/`docx_rs` if
 nothing else uses them)
@@ -93,27 +93,44 @@ produce the same hash for an unchanged file (idempotent).
 
 **Priority:** high — this is the one that pays off immediately, independent of any future
 cloud phase, and directly answers "blackout, laptop dying, need to secure data now"
-**Owner:** — **Status:** todo
-**Files:** `src-tauri/src/commands.rs`, `src/stores/useStore.ts` (`saveFile`)
+**Owner:** Claude **Status:** done
+**Files:** `src-tauri/src/commands.rs`
 
-Before every successful `write_local_file` for a tracked note, copy the file's *previous*
-content into a hidden history folder (e.g. `<app_data_dir>/history/<hash-of-path>/<timestamp>.md`,
-keyed off the index from DATA-1/DATA-2 so lookups don't require parsing the vault tree).
-Keep the last N versions per file (e.g. 20, or size-capped) and prune older ones on write.
-This is pure local disk I/O — no network, no accounts — and gives an actual undo/recovery
-path today: if a save goes wrong, a file gets corrupted, or the user wants to look at what a
-note said yesterday, there's a real answer.
+**Implementation note (deviation from original scope):** keyed history folders off a hash
+of the file's own path (`DefaultHasher` over the canonical path string) rather than "the
+index from DATA-1/DATA-2" as originally written — DATA-2 (incremental index sync) is still
+`todo`, and making this depend on it would have blocked a save's history behavior on an
+unrelated, unfinished ticket. A save works identically whether or not the index is in sync.
 
-**Acceptance:** editing and saving a note several times leaves recoverable prior versions on
-disk; a manual "restore this version" isn't required for this ticket (that's a small UI
-follow-up) but the versions must exist and be inspectable.
+Before every `write_local_file` overwrite, the previous on-disk content (if the file already
+existed) is copied into `<app_data_dir>/history/<hash-of-path>/<timestamp>.<ext>` before the
+new content is written. Capped at `MAX_HISTORY_VERSIONS = 20` per file, pruning the oldest
+first (filenames are fixed-width zero-padded timestamps, so lexical sort is chronological
+sort). A snapshot failure is logged but never blocks the actual save — losing history is
+recoverable, losing the save itself would not be. New files correctly produce no snapshot
+(nothing to snapshot yet). No frontend changes needed — `AppHandle` is injected by Tauri
+automatically for a command that declares it as a parameter; `useStore.ts`'s existing
+`invoke("write_local_file", {...})` call is untouched.
+
+**Verification:** three new unit tests in `commands.rs` (`cargo test`, all passing):
+confirms a snapshot holds the *previous* content (not the new one) after one overwrite,
+confirms a never-existing file produces no history directory at all, and confirms 25 writes
+against `MAX_HISTORY_VERSIONS = 20` leaves exactly 20 files behind. `cargo check`,
+`npx tsc --noEmit`, and `npm run build` all pass. Not yet manually exercised in the running
+desktop app (same sandboxing limits as other backend-only changes this session) — worth a
+quick real check (edit a note a few times, look in `%APPDATA%\...\history\`) before fully
+trusting it, though the unit tests cover the actual logic directly.
+
+**Acceptance:** met — editing and saving a note several times leaves recoverable prior
+versions on disk (verified by test, pending a real-app spot check). A manual "restore this
+version" UI remains a small follow-up, not required for this ticket.
 
 ---
 
 ## TICKET DATA-4 — SQLite durability settings on the new index DB
 
 **Priority:** low, quick win, do alongside DATA-1
-**Owner:** — **Status:** todo
+**Owner:** Antigravity — **Status:** done
 **Files:** `src-tauri/src/db.rs`
 
 Explicitly set `PRAGMA journal_mode=WAL;` and `PRAGMA synchronous=NORMAL;` when opening
@@ -143,6 +160,32 @@ from this stub.
 
 ---
 
+## TICKET DATA-6 — Backlinks & Knowledge Graph Indexing (`links` table)
+
+**Priority:** medium, depends on DATA-1 & DATA-2
+**Owner:** Antigravity — **Status:** done
+**Files:** `src-tauri/src/db.rs`, `src-tauri/src/commands.rs`
+
+Add a `links` table to `vault_index.db` to parse and track wiki links (`[[Note]]`) and markdown links (`[text](note.md)`):
+
+```sql
+CREATE TABLE links (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_path   TEXT NOT NULL,
+    target_path   TEXT NOT NULL,
+    link_text     TEXT NOT NULL,
+    line_number   INTEGER NOT NULL DEFAULT 1,
+    FOREIGN KEY(source_path) REFERENCES files(path) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_links_source ON links(source_path);
+CREATE INDEX idx_links_target ON links(target_path);
+```
+
+On file save (`DATA-2`), extract links from note contents, delete prior entries for `source_path`, and insert updated links. Expose Tauri commands `get_backlinks(target)` and `get_outgoing_links(source)`.
+
+---
+
 ## Suggested order
 
 1. DATA-1 (consolidate DBs, remove dead code) — do this first, everything else depends on
@@ -151,4 +194,6 @@ from this stub.
 3. DATA-2 (keep index live).
 4. DATA-3 (version history) — can actually be built in parallel with DATA-2 once DATA-1
    lands, since it only needs the index to *exist*, not necessarily be perfectly live yet.
-5. DATA-5 — leave alone until explicitly picked up later.
+5. DATA-6 (backlinks indexing — build once DATA-1 & DATA-2 are live).
+6. DATA-5 — leave alone until explicitly picked up later.
+

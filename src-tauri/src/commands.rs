@@ -1,6 +1,55 @@
 use crate::db::{DbState, LinkItem};
 use rusqlite::params;
-use tauri::State;
+use tauri::{Manager, State};
+
+// Local version history (DATA-3): before overwriting a tracked file, the previous content
+// is copied into <app_data_dir>/history/<hash-of-path>/<timestamp>.<ext>, capped at the
+// last MAX_HISTORY_VERSIONS per file. This is deliberately keyed off a hash of the path
+// itself rather than the vault_index `files` table (DATA-2), so it doesn't depend on that
+// still-unfinished ticket — a save works the same whether or not the index is in sync.
+const MAX_HISTORY_VERSIONS: usize = 20;
+
+fn path_history_key(path: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn prune_history(history_dir: &std::path::Path) -> Result<(), String> {
+    let mut entries: Vec<_> = std::fs::read_dir(history_dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .collect();
+    // Filenames are fixed-width zero-padded timestamps, so lexical sort == chronological.
+    entries.sort_by_key(|e| e.file_name());
+    if entries.len() > MAX_HISTORY_VERSIONS {
+        let excess = entries.len() - MAX_HISTORY_VERSIONS;
+        for entry in entries.into_iter().take(excess) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_previous_version(history_root: &std::path::Path, valid_path: &std::path::Path) -> Result<(), String> {
+    if !valid_path.exists() {
+        return Ok(()); // brand-new file — nothing to snapshot yet
+    }
+    let previous_content = std::fs::read(valid_path).map_err(|e| e.to_string())?;
+
+    let key = path_history_key(&valid_path.to_string_lossy());
+    let history_dir = history_root.join(key);
+    std::fs::create_dir_all(&history_dir).map_err(|e| e.to_string())?;
+
+    let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S%3f");
+    let ext = valid_path.extension().and_then(|e| e.to_str()).unwrap_or("md");
+    let snapshot_path = history_dir.join(format!("{timestamp}.{ext}"));
+    std::fs::write(&snapshot_path, &previous_content).map_err(|e| e.to_string())?;
+
+    prune_history(&history_dir)
+}
 
 pub fn extract_links(source_path: &str, content: &str) -> Vec<LinkItem> {
     let mut links = Vec::new();
@@ -262,12 +311,22 @@ pub fn read_local_file(path: String, vault_root: Option<String>) -> Result<Strin
 
 #[tauri::command]
 pub fn write_local_file(
+    app_handle: tauri::AppHandle,
     state: State<DbState>,
     path: String,
     content: String,
     vault_root: Option<String>,
 ) -> Result<(), String> {
     let valid_path = validate_vault_path(&path, vault_root.as_deref())?;
+
+    if let Ok(app_dir) = app_handle.path().app_data_dir() {
+        let history_root = app_dir.join("history");
+        if let Err(e) = snapshot_previous_version(&history_root, &valid_path) {
+            // Never let a history-snapshot failure block the actual save.
+            eprintln!("Failed to snapshot previous version of {:?}: {e}", valid_path);
+        }
+    }
+
     std::fs::write(&valid_path, &content).map_err(|e| e.to_string())?;
 
     let canon_str = valid_path.to_string_lossy();
@@ -399,4 +458,70 @@ pub fn delete_local_entry(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn snapshots_previous_content_before_overwrite() {
+        let dir = std::env::temp_dir().join("lsn_test_history_basic");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let history_root = dir.join("history");
+        let file_path = dir.join("note.md");
+
+        std::fs::write(&file_path, "version one").unwrap();
+        snapshot_previous_version(&history_root, &file_path).unwrap();
+        std::fs::write(&file_path, "version two").unwrap();
+
+        let key = path_history_key(&file_path.to_string_lossy());
+        let versions_dir = history_root.join(&key);
+        let entries: Vec<_> = std::fs::read_dir(&versions_dir).unwrap().collect();
+        assert_eq!(entries.len(), 1, "expected exactly one snapshot after one overwrite");
+
+        let snapshot_content = std::fs::read_to_string(entries[0].as_ref().unwrap().path()).unwrap();
+        assert_eq!(snapshot_content, "version one", "snapshot must hold the PREVIOUS content, not the new one");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_file_produces_no_snapshot() {
+        let dir = std::env::temp_dir().join("lsn_test_history_newfile");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let history_root = dir.join("history");
+        let file_path = dir.join("brand-new.md");
+
+        // File doesn't exist yet — nothing to snapshot.
+        snapshot_previous_version(&history_root, &file_path).unwrap();
+        assert!(!history_root.exists(), "no history directory should be created for a file that never existed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prunes_to_max_history_versions() {
+        let dir = std::env::temp_dir().join("lsn_test_history_prune");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let history_root = dir.join("history");
+        let file_path = dir.join("note.md");
+
+        std::fs::write(&file_path, "v0").unwrap();
+        for i in 1..=(MAX_HISTORY_VERSIONS + 5) {
+            snapshot_previous_version(&history_root, &file_path).unwrap();
+            std::fs::write(&file_path, format!("v{i}")).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let key = path_history_key(&file_path.to_string_lossy());
+        let versions_dir = history_root.join(&key);
+        let count = std::fs::read_dir(&versions_dir).unwrap().count();
+        assert_eq!(count, MAX_HISTORY_VERSIONS, "history must be capped at MAX_HISTORY_VERSIONS");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
