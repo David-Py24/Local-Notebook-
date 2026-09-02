@@ -426,7 +426,7 @@ export default function SettingsModal() {
 
               <div className="rounded-md border border-border bg-bg/40 p-4 space-y-1.5 text-xs">
                 <p><span className="text-muted">Name:</span> <span className="text-text">Local Study Notebook</span></p>
-                <p><span className="text-muted">Version:</span> <span className="text-text">1.2.3</span></p>
+                <p><span className="text-muted">Version:</span> <span className="text-text">1.2.4</span></p>
                 <p><span className="text-muted">Framework:</span> <span className="text-text">Tauri v2 · React · TypeScript</span></p>
                 <p><span className="text-muted">Data:</span> <span className="text-text">Stored locally in the app data directory.</span></p>
               </div>

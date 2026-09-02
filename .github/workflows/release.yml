@@ -41,7 +41,13 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - uses: tauri-apps/tauri-action@v0
+      # v0 (resolves to the 0.6.x line) has a confirmed bug where latest.json generation
+      # silently skips with "Signature not found for the updater JSON. Skipping upload..."
+      # even when .sig files were correctly created on disk — reproduced twice (v1.2.2,
+      # v1.2.3) against action-v0.6.2. v1.0.0's release notes describe an internal rewrite
+      # of exactly the asset-detection logic latest.json generation depends on. None of
+      # this workflow's `with:` inputs were renamed/removed by v1's breaking changes.
+      - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

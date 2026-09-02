@@ -2,6 +2,11 @@
 
 All notable changes to the Local Study Notebook are documented in this file.
 
+## [1.2.4] - 2026-09-02
+
+### Fixed
+- **1.2.3's `--bundles nsis` CLI-arg fix did not fix it either**: the release still hit "Signature not found for the updater JSON. Skipping upload..." even with a confirmed clean single-bundle (NSIS-only) build — ruling out the MSI-ambiguity theory entirely. Root cause: a confirmed upstream bug in `tauri-apps/tauri-action`'s 0.x line (see [tauri-apps/tauri-action#983](https://github.com/tauri-apps/tauri-action/issues/983) and related issues) in the logic that locates signature files to build the update manifest — reproduced on the latest available 0.6.2. Fixed by switching the release workflow from `tauri-apps/tauri-action@v0` to `@v1`, whose 1.0.0 release notes describe an internal rewrite of exactly this asset-detection logic. No workflow inputs needed to change — none of v1's breaking changes touched fields this project uses. 1.2.2 and 1.2.3 were both caught as broken drafts before publishing — no user was ever exposed to either.
+
 ## [1.2.3] - 2026-09-02
 
 ### Fixed
