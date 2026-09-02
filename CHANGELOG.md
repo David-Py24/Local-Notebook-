@@ -2,6 +2,11 @@
 
 All notable changes to the Local Study Notebook are documented in this file.
 
+## [1.2.5] - 2026-09-02
+
+### Fixed
+- **Found the actual root cause of the missing `latest.json`** (1.2.1 through 1.2.4 were all chasing red herrings — MSI/NSIS target ambiguity, `tauri-action`'s version — neither was it): Tauri v2 requires an explicit opt-in, `bundle.createUpdaterArtifacts: true` in `tauri.conf.json`, to generate signed update packages and `.sig` files at all. It defaults to `false`. Without it, `tauri build` produces installers normally but never creates any updater signature — which is exactly why `tauri-action` correctly reported "Signature not found" every single time, regardless of which installer format or action version was used. Confirmed directly from the installed `@tauri-apps/cli` package's own changelog and config schema. Added the missing flag; this is expected to be the real fix.
+
 ## [1.2.4] - 2026-09-02
 
 ### Fixed
