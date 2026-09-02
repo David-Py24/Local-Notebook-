@@ -20,7 +20,12 @@ jobs:
       matrix:
         include:
           - platform: "windows-latest"
-            args: ""
+            # Explicit CLI flag, not just tauri.conf.json's bundle.targets — v1.2.2's
+            # release still produced an MSI alongside the NSIS installer despite the
+            # config-only restriction, which is what breaks latest.json generation
+            # (tauri-action can't disambiguate which installer the updater manifest
+            # should reference). Forcing it here is the belt-and-suspenders fix.
+            args: "--bundles nsis"
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4

@@ -2,6 +2,11 @@
 
 All notable changes to the Local Study Notebook are documented in this file.
 
+## [1.2.3] - 2026-09-02
+
+### Fixed
+- **1.2.2's `bundle.targets: ["nsis"]` config fix did not actually work**: the release build still produced an MSI installer alongside the NSIS one (confirmed in the workflow logs), so `latest.json` was skipped again for the same reason as 1.2.1. `tauri-action` does not appear to fully respect `tauri.conf.json`'s `bundle.targets` on its own. Fixed by forcing `--bundles nsis` as an explicit CLI argument in `.github/workflows/release.yml`, in addition to the config setting. 1.2.2 was never published (caught as a draft before release) — no user was affected by it.
+
 ## [1.2.2] - 2026-09-02
 
 ### Fixed
