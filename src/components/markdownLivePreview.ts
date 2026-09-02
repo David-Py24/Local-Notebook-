@@ -73,12 +73,25 @@ class HorizontalRuleWidget extends WidgetType {
 function buildDecorations(state: EditorState, visibleRanges: readonly { from: number; to: number }[]): DecorationSet {
   const cursorLine = state.doc.lineAt(state.selection.main.head).number;
   const ranges: Range<Decoration>[] = [];
+  // Line-level decorations (e.g. table-row/codeblock backgrounds) must be added in document
+  // order and separately from the mark/replace ranges above, per CodeMirror's RangeSet rules.
+  const lineRanges: Range<Decoration>[] = [];
 
   const hide = (from: number, to: number) => {
     if (to > from) ranges.push(Decoration.replace({}).range(from, to));
   };
   const style = (from: number, to: number, cls: string) => {
     if (to > from) ranges.push(Decoration.mark({ class: cls }).range(from, to));
+  };
+  const lineClasses = new Map<number, Set<string>>();
+  const styleLine = (pos: number, cls: string) => {
+    const line = state.doc.lineAt(pos);
+    let classes = lineClasses.get(line.from);
+    if (!classes) {
+      classes = new Set();
+      lineClasses.set(line.from, classes);
+    }
+    classes.add(cls);
   };
 
   for (const { from, to } of visibleRanges) {
@@ -165,13 +178,58 @@ function buildDecorations(state: EditorState, visibleRanges: readonly { from: nu
           ranges.push(Decoration.replace({ widget: new HorizontalRuleWidget() }).range(node.from, node.to));
           return;
         }
+
+        // Fenced code blocks: keep the body monospaced/backgrounded at all times (like
+        // Obsidian), but only hide the ``` fence markers and language label off the active line.
+        if (node.name === "CodeText") {
+          for (let l = state.doc.lineAt(node.from).number; l <= state.doc.lineAt(node.to).number; l++) {
+            styleLine(state.doc.line(l).from, "cm-md-codeblock-line");
+          }
+          return;
+        }
+        if ((node.name === "CodeMark" || node.name === "CodeInfo") && !isActiveLine) {
+          const parentName = node.node.parent?.name;
+          if (parentName === "FencedCode") hide(node.from, node.to);
+          return;
+        }
+
+        // GFM tables: give header/body rows a CSS `table-row` so cells line up in columns;
+        // hide the raw `|` separators and the `---|---` alignment row off the active line.
+        // The active line is deliberately left out of the `table-row` grouping (not just
+        // left with its marks visible) — otherwise its one giant raw-text cell forces the
+        // shared column widths to stretch around it, skewing every other row while typing.
+        if ((node.name === "TableHeader" || node.name === "TableRow") && !isActiveLine) {
+          styleLine(node.from, "cm-md-table-row");
+          return;
+        }
+        if (node.name === "TableCell" && !isActiveLine) {
+          const inHeader = node.node.parent?.name === "TableHeader";
+          style(node.from, node.to, inHeader ? "cm-md-table-header-cell" : "cm-md-table-cell");
+          return;
+        }
+        if (node.name === "TableDelimiter") {
+          const isAlignmentRow = node.to - node.from > 1;
+          if (isAlignmentRow) {
+            if (!isActiveLine) {
+              styleLine(node.from, "cm-md-table-row cm-md-table-delim-row");
+              hide(node.from, node.to);
+            }
+          } else if (!isActiveLine) {
+            hide(node.from, node.to);
+          }
+          return;
+        }
       },
     });
   }
 
+  for (const [linePos, classes] of lineClasses) {
+    lineRanges.push(Decoration.line({ class: Array.from(classes).join(" ") }).range(linePos));
+  }
+
   // RangeSet.of sorts (and validates nesting order) for us — safer than manually driving
   // RangeSetBuilder, which requires the caller to get from/startSide ordering exactly right.
-  return RangeSet.of(ranges, true);
+  return RangeSet.of([...ranges, ...lineRanges], true);
 }
 
 export const livePreviewExtension = ViewPlugin.fromClass(

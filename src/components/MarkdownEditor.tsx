@@ -2,10 +2,12 @@ import { useEffect, useRef } from "react";
 import { Compartment, EditorState, Prec } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-import { indentUnit } from "@codemirror/language";
+import { HighlightStyle, indentUnit, syntaxHighlighting } from "@codemirror/language";
 import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
-import { markdown } from "@codemirror/lang-markdown";
+import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { languages as codeLanguages } from "@codemirror/language-data";
 import { GFM } from "@lezer/markdown";
+import { tags } from "@lezer/highlight";
 import { livePreviewExtension } from "./markdownLivePreview";
 import { continueListOnEnter } from "./markdownListContinuation";
 import { useStore } from "../stores/useStore";
@@ -77,7 +79,49 @@ const editorTheme = EditorView.theme({
     borderTop: "1px solid var(--color-border)",
     margin: "0.5em 0",
   },
+  ".cm-md-codeblock-line": {
+    backgroundColor: "var(--color-bg)",
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+  },
+  ".cm-md-table-row": {
+    display: "table-row",
+  },
+  ".cm-md-table-delim-row": {
+    borderTop: "1px solid var(--color-border)",
+  },
+  ".cm-md-table-cell": {
+    display: "table-cell",
+    padding: "2px 12px",
+    borderBottom: "1px solid var(--color-border)",
+  },
+  ".cm-md-table-header-cell": {
+    display: "table-cell",
+    padding: "2px 12px",
+    fontWeight: "700",
+    borderBottom: "1px solid var(--color-border)",
+  },
 });
+
+// Fixed syntax-highlighting palette for fenced code blocks — deliberately not themed per
+// dark-preset (Obsidian/Nord/Dracula/etc.), same approach as the hardcoded heading color
+// above, since token colors need to stay distinguishable across all five presets.
+const codeHighlightStyle = HighlightStyle.define([
+  { tag: tags.keyword, color: "#c792ea" },
+  { tag: [tags.name, tags.deleted, tags.character, tags.propertyName, tags.macroName], color: "#f07178" },
+  { tag: [tags.function(tags.variableName), tags.labelName], color: "#82aaff" },
+  { tag: [tags.color, tags.constant(tags.name), tags.standard(tags.name)], color: "#f78c6c" },
+  { tag: [tags.definition(tags.name), tags.separator], color: "#eeffff" },
+  { tag: [tags.typeName, tags.className, tags.number, tags.changed, tags.annotation, tags.modifier, tags.self, tags.namespace], color: "#ffcb6b" },
+  { tag: [tags.operator, tags.operatorKeyword], color: "#89ddff" },
+  { tag: [tags.url, tags.escape, tags.regexp, tags.link], color: "#89ddff" },
+  { tag: tags.meta, color: "#ffcb6b" },
+  { tag: tags.comment, color: "#697098", fontStyle: "italic" },
+  { tag: tags.strong, fontWeight: "700" },
+  { tag: tags.emphasis, fontStyle: "italic" },
+  { tag: tags.string, color: "#c3e88d" },
+  { tag: tags.bool, color: "#f78c6c" },
+  { tag: tags.invalid, color: "#ff5370" },
+]);
 
 interface MarkdownEditorProps {
   value: string;
@@ -111,7 +155,8 @@ export default function MarkdownEditor({ value, onChange, livePreview = false }:
         history(),
         Prec.highest(keymap.of([{ key: "Enter", run: continueListOnEnter }])),
         keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap]),
-        markdown({ extensions: [GFM] }),
+        markdown({ base: markdownLanguage, codeLanguages, extensions: [GFM] }),
+        syntaxHighlighting(codeHighlightStyle),
         livePreviewCompartmentRef.current.of(livePreview ? livePreviewExtension : []),
         tabSizeCompartmentRef.current.of(indentUnit.of(" ".repeat(tabSize))),
         lineNumbersCompartmentRef.current.of(showLineNumbers ? [lineNumbers()] : []),

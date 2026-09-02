@@ -232,12 +232,72 @@ position).
 ### TICKET-A4 — Stretch: fenced-code language highlighting, table rendering, checkbox click-to-toggle
 
 **Priority:** low / stretch, do only after A1–A3 are solid
-**Owner:** — **Status:** todo
-**Files:** `MarkdownEditor.tsx`
+**Owner:** Claude **Status:** done
+**Files:** `MarkdownEditor.tsx`, `markdownLivePreview.ts`, `package.json` (added
+`@codemirror/language-data`, `remark-gfm`). **Scope expanded beyond the listed files** (see
+note below): also touched `StudyBoard.tsx` and `index.css`.
+
+Checkbox click-to-toggle was already delivered under TICKET-A2 (`TaskCheckboxWidget`) — not
+re-done here. Implemented the other two:
+
+- **Fenced-code language highlighting:** passed `codeLanguages` (from the newly-added
+  `@codemirror/language-data`, which lazily code-splits one chunk per grammar — confirmed in
+  the build output, not a bundle-size regression) into `markdown({ base: markdownLanguage,
+  codeLanguages, extensions: [GFM] })`, plus a permanent `syntaxHighlighting(codeHighlightStyle)`
+  extension using a hand-picked palette (not themed per dark-preset — same reasoning as the
+  existing hardcoded heading color: token colors need to stay mutually distinguishable across
+  all five presets, which per-preset theming would fight). In Live Preview, the fence
+  ` ``` ` marks and the language label (`CodeInfo`) hide off the active line like every other
+  mark in this file; the code body (`CodeText`) keeps a monospace/background line style at all
+  times (matches Obsidian; unlike headings/bold this isn't a "marker to hide", so it isn't
+  gated on the active line).
+- **Table rendering:** real column alignment, not just padded plain text — `TableHeader`/
+  `TableRow` lines get a `display: table-row` line decoration and `TableCell` nodes get
+  `display: table-cell`, relying on the browser's CSS anonymous-table box generation for a
+  contiguous run of `table-row` siblings (no wrapping `display: table` parent needed/possible,
+  since CodeMirror's line divs are already fixed siblings under `.cm-content`). Per-cell `|`
+  separators and the `---|---` alignment row are hidden off the active line, matching the rest
+  of the file's mark-hiding convention.
+  - **Bug found and fixed during verification:** the active line was originally kept in the
+    `table-row` grouping (to avoid visually breaking the grid when editing one row). That
+    backfired: the active line's raw, un-cellified text becomes one giant single-cell row, and
+    since CSS anonymous-table column widths are shared across all rows in the same grouping,
+    that oversized cell forced every other row's first column to stretch to match it — visible
+    as the whole table skewing/indenting on click. Fixed by excluding the active line's row
+    entirely from the `table-row` class (not just leaving its cells raw), so it drops out of
+    the grid while being edited and the remaining rows keep their own correct widths. Confirmed
+    via a DOM check (`getBoundingClientRect()` on each `.cm-md-table-row`) before and after.
+
+**Scope note (per this doc's own rule):** the full-document "preview" mode (`StudyBoard.tsx`'s
+`ReactMarkdown`) had no table support at all — no `remark-gfm` was installed, so react-markdown
+silently didn't parse table syntax as GFM (nor strikethrough/task-lists, though those already
+happened to work via CommonMark-adjacent paths tables don't have). Since Live Preview and
+"preview" are supposed to show the same document consistently, and TICKET-A2's own acceptance
+criteria requires "toggling to preview still gives the current full-document rendered view,"
+left this un-fixed would mean toggling out of Live Preview loses the table entirely. Added
+`remark-gfm` (small, standard, already a peer of `react-markdown` in this ecosystem) and basic
+`<table>/<th>/<td>` CSS in `index.css`'s `.markdown-preview` block, matching the existing
+code/blockquote styling there.
 
 Don't build wiki-link (`[[note]]`) autocomplete or backlinks speculatively — that's a
 bigger feature (needs a notes index) and should get its own ticket if/when the user asks
 for cross-note linking specifically.
+
+**Verification:** `npx tsc --noEmit`, `npm run build`, and `cargo check` (in `src-tauri/`)
+all pass. Live-tested `MarkdownEditor` standalone in a browser (temporarily swapped
+`main.tsx` to mount it directly with sample markdown covering headings/bold/italic/
+strikethrough/inline-code/checkboxes/bullets/hr/a fenced JS code block/a 3-column GFM table
+— reverted `main.tsx` back to `<App />` afterward, not committed): confirmed syntax
+highlighting renders (keywords/strings/comments distinctly colored, no console errors);
+confirmed the table renders as real aligned columns for header + 2 body rows + delimiter
+row; confirmed clicking into the header row correctly reverts only that line to raw text
+without skewing the other rows (the bug above, verified fixed). Not yet tested inside the
+actual Tauri desktop shell with a real vault — same standing caveat as every other Track A
+ticket in this doc.
+
+**Acceptance:** met — fenced code blocks show language-aware syntax highlighting; GFM tables
+render as real aligned columns in Live Preview and (via the `remark-gfm` addition) in full
+preview mode; task-list checkboxes were already click-to-toggle from TICKET-A2.
 
 ---
 

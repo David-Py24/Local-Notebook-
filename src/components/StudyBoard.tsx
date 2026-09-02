@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useStore, Tab, ViewMode } from "../stores/useStore";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import MarkdownEditor from "./MarkdownEditor";
 
 export const TAB_DRAG_MIME = "application/x-lsn-tab";
@@ -409,7 +410,7 @@ function EditorPanel({ panel }: EditorPanelProps) {
             {viewMode === "preview" ? (
               /* Full Document Preview */
               <div className="markdown-preview leading-relaxed tracking-normal">
-                <ReactMarkdown>{draft || "*Empty document...*"}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{draft || "*Empty document...*"}</ReactMarkdown>
               </div>
             ) : (
               /* CodeMirror 6 editor — "live" renders Obsidian-style inline formatting
