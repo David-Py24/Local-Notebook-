@@ -1,282 +1,141 @@
-use crate::db::{DbState, Note, Source};
-use crate::parsers::parse_file;
-use rusqlite::{params, OptionalExtension};
+use crate::db::{DbState, LinkItem};
+use rusqlite::params;
 use tauri::State;
 
-fn now() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+pub fn extract_links(source_path: &str, content: &str) -> Vec<LinkItem> {
+    let mut links = Vec::new();
+    for (line_idx, line) in content.lines().enumerate() {
+        let line_num = (line_idx + 1) as i64;
+
+        // 1. Match [[WikiLink]] or [[WikiLink|Alias]]
+        let mut start_search = 0;
+        while let Some(start) = line[start_search..].find("[[") {
+            let abs_start = start_search + start + 2;
+            if let Some(end) = line[abs_start..].find("]]") {
+                let inner = &line[abs_start..abs_start + end];
+                let (target, alias) = if let Some(pipe_idx) = inner.find('|') {
+                    (&inner[..pipe_idx], &inner[pipe_idx + 1..])
+                } else {
+                    (inner, inner)
+                };
+                let target_trimmed = target.trim();
+                let alias_trimmed = alias.trim();
+                if !target_trimmed.is_empty() {
+                    links.push(LinkItem {
+                        id: None,
+                        source_path: source_path.to_string(),
+                        target_path: target_trimmed.to_string(),
+                        link_text: alias_trimmed.to_string(),
+                        line_number: line_num,
+                    });
+                }
+                start_search = abs_start + end + 2;
+            } else {
+                break;
+            }
+        }
+
+        // 2. Match standard markdown links [text](target.md)
+        let bytes = line.as_bytes();
+        let mut idx = 0;
+        while idx < bytes.len() {
+            if bytes[idx] == b'[' {
+                if let Some(close_bracket) = line[idx + 1..].find(']') {
+                    let bracket_end = idx + 1 + close_bracket;
+                    if bracket_end + 1 < bytes.len() && bytes[bracket_end + 1] == b'(' {
+                        if let Some(close_paren) = line[bracket_end + 2..].find(')') {
+                            let paren_end = bracket_end + 2 + close_paren;
+                            let link_text = &line[idx + 1..bracket_end];
+                            let target = &line[bracket_end + 2..paren_end];
+
+                            let target_trimmed = target.trim();
+                            if !target_trimmed.starts_with("http://")
+                                && !target_trimmed.starts_with("https://")
+                                && !target_trimmed.starts_with('#')
+                                && !target_trimmed.is_empty()
+                            {
+                                links.push(LinkItem {
+                                    id: None,
+                                    source_path: source_path.to_string(),
+                                    target_path: target_trimmed.to_string(),
+                                    link_text: link_text.trim().to_string(),
+                                    line_number: line_num,
+                                });
+                            }
+                            idx = paren_end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            idx += 1;
+        }
+    }
+    links
 }
 
-fn source_from_row(row: &rusqlite::Row) -> rusqlite::Result<Source> {
-    Ok(Source {
-        id: row.get(0)?,
-        title: row.get(1)?,
-        file_type: row.get(2)?,
-        file_path: row.get(3)?,
-        raw_content: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-    })
-}
+fn sync_links_internal(conn: &rusqlite::Connection, source_path: &str, content: &str) -> Result<(), String> {
+    let parsed_links = extract_links(source_path, content);
 
-fn note_from_row(row: &rusqlite::Row) -> rusqlite::Result<Note> {
-    Ok(Note {
-        id: row.get(0)?,
-        source_id: row.get(1)?,
-        title: row.get(2)?,
-        content: row.get(3)?,
-        pinned: row.get(4)?,
-        tags: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
-    })
-}
-
-#[tauri::command]
-pub fn add_source(state: State<DbState>, title: String, file_path: String) -> Result<Source, String> {
-    let content = parse_file(&file_path)?;
-    let file_type = file_path
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-
-    let conn = state.sources.lock().map_err(|e| e.to_string())?;
     conn.execute(
-        "INSERT INTO sources (title, file_type, file_path, raw_content, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![title, file_type, file_path, content, now()],
+        "DELETE FROM links WHERE source_path = ?1",
+        params![source_path],
     )
     .map_err(|e| e.to_string())?;
-    let id = conn.last_insert_rowid();
-    fetch_source(&conn, id)
-}
 
-fn fetch_source(conn: &rusqlite::Connection, id: i64) -> Result<Source, String> {
-    conn.query_row(
-        "SELECT * FROM sources WHERE id = ?1",
-        params![id],
-        source_from_row,
-    )
-    .optional()
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| format!("Source {id} not found"))
+    for link in parsed_links {
+        conn.execute(
+            "INSERT INTO links (source_path, target_path, link_text, line_number) VALUES (?1, ?2, ?3, ?4)",
+            params![link.source_path, link.target_path, link.link_text, link.line_number],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
-pub fn get_sources(state: State<DbState>) -> Result<Vec<Source>, String> {
-    let conn = state.sources.lock().map_err(|e| e.to_string())?;
+pub fn get_backlinks(state: State<DbState>, target_path: String) -> Result<Vec<LinkItem>, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
-        .prepare("SELECT * FROM sources ORDER BY created_at DESC")
+        .prepare("SELECT id, source_path, target_path, link_text, line_number FROM links WHERE target_path = ?1 OR target_path LIKE ?2 ORDER BY source_path, line_number")
         .map_err(|e| e.to_string())?;
+
+    let pattern = format!("%{}", target_path);
     let rows = stmt
-        .query_map([], source_from_row)
+        .query_map(params![target_path, pattern], |row| {
+            Ok(LinkItem {
+                id: Some(row.get(0)?),
+                source_path: row.get(1)?,
+                target_path: row.get(2)?,
+                link_text: row.get(3)?,
+                line_number: row.get(4)?,
+            })
+        })
         .map_err(|e| e.to_string())?;
+
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_source(state: State<DbState>, id: i64) -> Result<Source, String> {
-    let conn = state.sources.lock().map_err(|e| e.to_string())?;
-    fetch_source(&conn, id)
-}
-
-#[tauri::command]
-pub fn get_source_content(state: State<DbState>, id: i64) -> Result<String, String> {
-    let conn = state.sources.lock().map_err(|e| e.to_string())?;
-    conn.query_row(
-        "SELECT raw_content FROM sources WHERE id = ?1",
-        params![id],
-        |r| r.get::<_, String>(0),
-    )
-    .optional()
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| format!("Source {id} not found"))
-}
-
-#[tauri::command]
-pub fn update_source(state: State<DbState>, id: i64, title: Option<String>) -> Result<Source, String> {
-    let conn = state.sources.lock().map_err(|e| e.to_string())?;
-    if let Some(t) = title {
-        conn.execute(
-            "UPDATE sources SET title = ?1, updated_at = ?2 WHERE id = ?3",
-            params![t, now(), id],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    fetch_source(&conn, id)
-}
-
-#[tauri::command]
-pub fn delete_source(state: State<DbState>, id: i64) -> Result<bool, String> {
-    let sources = state.sources.lock().map_err(|e| e.to_string())?;
-    sources
-        .execute("DELETE FROM sources WHERE id = ?1", params![id])
+pub fn get_outgoing_links(state: State<DbState>, source_path: String) -> Result<Vec<LinkItem>, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, source_path, target_path, link_text, line_number FROM links WHERE source_path = ?1 ORDER BY line_number")
         .map_err(|e| e.to_string())?;
 
-    // cascade delete notes referencing this source in notes.db
-    let notes = state.notes.lock().map_err(|e| e.to_string())?;
-    notes
-        .execute("DELETE FROM notes WHERE source_id = ?1", params![id])
+    let rows = stmt
+        .query_map(params![source_path], |row| {
+            Ok(LinkItem {
+                id: Some(row.get(0)?),
+                source_path: row.get(1)?,
+                target_path: row.get(2)?,
+                link_text: row.get(3)?,
+                line_number: row.get(4)?,
+            })
+        })
         .map_err(|e| e.to_string())?;
 
-    Ok(true)
-}
-
-#[tauri::command]
-pub fn copy_source_to_note(state: State<DbState>, source_id: i64) -> Result<Note, String> {
-    let content = {
-        let conn = state.sources.lock().map_err(|e| e.to_string())?;
-        conn.query_row(
-            "SELECT raw_content FROM sources WHERE id = ?1",
-            params![source_id],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Source {source_id} not found"))?
-    };
-
-    let title = first_heading(&content).unwrap_or_else(|| "Untitled note".to_string());
-
-    let conn = state.notes.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT INTO notes (source_id, title, content, pinned, tags, updated_at) VALUES (?1, ?2, ?3, 0, 'knowledge-base', ?4)",
-        params![source_id, title, content, now()],
-    )
-    .map_err(|e| e.to_string())?;
-    let id = conn.last_insert_rowid();
-    fetch_note(&conn, id)
-}
-
-fn first_heading(content: &str) -> Option<String> {
-    content
-        .lines()
-        .map(str::trim)
-        .find(|l| l.starts_with('#'))
-        .map(|l| l.trim_start_matches('#').trim().to_string())
-}
-
-// ---------- Notes ----------
-
-#[tauri::command]
-pub fn add_note(
-    state: State<DbState>,
-    source_id: Option<i64>,
-    title: Option<String>,
-    content: String,
-    pinned: Option<bool>,
-    tags: Option<String>,
-) -> Result<Note, String> {
-    let conn = state.notes.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT INTO notes (source_id, title, content, pinned, tags, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            source_id,
-            title.unwrap_or_else(|| first_heading(&content).unwrap_or_else(|| "Untitled".to_string())),
-            content,
-            pinned.unwrap_or(false) as i64,
-            tags.unwrap_or_default(),
-            now()
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    let id = conn.last_insert_rowid();
-    fetch_note(&conn, id)
-}
-
-fn fetch_note(conn: &rusqlite::Connection, id: i64) -> Result<Note, String> {
-    conn.query_row(
-        "SELECT * FROM notes WHERE id = ?1",
-        params![id],
-        note_from_row,
-    )
-    .optional()
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| format!("Note {id} not found"))
-}
-
-#[tauri::command]
-pub fn get_notes(state: State<DbState>, source_id: Option<i64>) -> Result<Vec<Note>, String> {
-    let conn = state.notes.lock().map_err(|e| e.to_string())?;
-    let sql = match source_id {
-        Some(_) => "SELECT * FROM notes WHERE source_id = ?1 ORDER BY created_at DESC",
-        None => "SELECT * FROM notes ORDER BY created_at DESC",
-    };
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-    let rows = if let Some(sid) = source_id {
-        stmt.query_map(params![sid], note_from_row)
-            .map_err(|e| e.to_string())?
-    } else {
-        stmt.query_map([], note_from_row).map_err(|e| e.to_string())?
-    };
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn get_note(state: State<DbState>, id: i64) -> Result<Note, String> {
-    let conn = state.notes.lock().map_err(|e| e.to_string())?;
-    fetch_note(&conn, id)
-}
-
-#[tauri::command]
-pub fn update_note(
-    state: State<DbState>,
-    id: i64,
-    title: Option<String>,
-    content: Option<String>,
-    pinned: Option<bool>,
-    tags: Option<String>,
-) -> Result<Note, String> {
-    let conn = state.notes.lock().map_err(|e| e.to_string())?;
-    if let Some(t) = title {
-        conn.execute(
-            "UPDATE notes SET title = ?1, updated_at = ?2 WHERE id = ?3",
-            params![t, now(), id],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    if let Some(c) = content {
-        let derived = first_heading(&c).unwrap_or_else(|| "Untitled".to_string());
-        conn.execute(
-            "UPDATE notes SET content = ?1, title = ?2, updated_at = ?3 WHERE id = ?4",
-            params![c, derived, now(), id],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    if let Some(p) = pinned {
-        conn.execute(
-            "UPDATE notes SET pinned = ?1, updated_at = ?2 WHERE id = ?3",
-            params![p as i64, now(), id],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    if let Some(t) = tags {
-        conn.execute(
-            "UPDATE notes SET tags = ?1, updated_at = ?2 WHERE id = ?3",
-            params![t, now(), id],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    fetch_note(&conn, id)
-}
-
-#[tauri::command]
-pub fn pin_note(state: State<DbState>, id: i64, pinned: bool) -> Result<Note, String> {
-    let conn = state.notes.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE notes SET pinned = ?1, updated_at = ?2 WHERE id = ?3",
-        params![pinned as i64, now(), id],
-    )
-    .map_err(|e| e.to_string())?;
-    fetch_note(&conn, id)
-}
-
-#[tauri::command]
-pub fn delete_note(state: State<DbState>, id: i64) -> Result<bool, String> {
-    let conn = state.notes.lock().map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM notes WHERE id = ?1", params![id])
-        .map_err(|e| e.to_string())?;
-    Ok(true)
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -402,9 +261,20 @@ pub fn read_local_file(path: String, vault_root: Option<String>) -> Result<Strin
 }
 
 #[tauri::command]
-pub fn write_local_file(path: String, content: String, vault_root: Option<String>) -> Result<(), String> {
+pub fn write_local_file(
+    state: State<DbState>,
+    path: String,
+    content: String,
+    vault_root: Option<String>,
+) -> Result<(), String> {
     let valid_path = validate_vault_path(&path, vault_root.as_deref())?;
-    std::fs::write(valid_path, content).map_err(|e| e.to_string())
+    std::fs::write(&valid_path, &content).map_err(|e| e.to_string())?;
+
+    let canon_str = valid_path.to_string_lossy();
+    if let Ok(conn) = state.vault_index.lock() {
+        let _ = sync_links_internal(&conn, &canon_str, &content);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -463,7 +333,12 @@ pub fn create_local_dir(parent_path: String, name: String, vault_root: Option<St
 }
 
 #[tauri::command]
-pub fn rename_local_entry(old_path: String, new_path: String, vault_root: Option<String>) -> Result<(), String> {
+pub fn rename_local_entry(
+    state: State<DbState>,
+    old_path: String,
+    new_path: String,
+    vault_root: Option<String>,
+) -> Result<(), String> {
     let valid_old = validate_vault_path(&old_path, vault_root.as_deref())?;
     let valid_new = validate_vault_path(&new_path, vault_root.as_deref())?;
 
@@ -471,11 +346,30 @@ pub fn rename_local_entry(old_path: String, new_path: String, vault_root: Option
         return Err("Target to rename does not exist".to_string());
     }
 
-    std::fs::rename(valid_old, valid_new).map_err(|e| e.to_string())
+    let old_str = valid_old.to_string_lossy();
+    let new_str = valid_new.to_string_lossy();
+
+    std::fs::rename(&valid_old, &valid_new).map_err(|e| e.to_string())?;
+
+    if let Ok(conn) = state.vault_index.lock() {
+        let _ = conn.execute(
+            "UPDATE links SET source_path = ?1 WHERE source_path = ?2",
+            params![new_str.as_ref(), old_str.as_ref()],
+        );
+        let _ = conn.execute(
+            "UPDATE links SET target_path = ?1 WHERE target_path = ?2",
+            params![new_str.as_ref(), old_str.as_ref()],
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
-pub fn delete_local_entry(path: String, vault_root: Option<String>) -> Result<(), String> {
+pub fn delete_local_entry(
+    state: State<DbState>,
+    path: String,
+    vault_root: Option<String>,
+) -> Result<(), String> {
     let valid_path = validate_vault_path(&path, vault_root.as_deref())?;
     if !valid_path.exists() {
         return Err("Path to delete does not exist".to_string());
@@ -490,9 +384,19 @@ pub fn delete_local_entry(path: String, vault_root: Option<String>) -> Result<()
         }
     }
 
+    let path_str = valid_path.to_string_lossy();
+
     if valid_path.is_dir() {
-        std::fs::remove_dir_all(valid_path).map_err(|e| e.to_string())
+        std::fs::remove_dir_all(&valid_path).map_err(|e| e.to_string())?;
     } else {
-        std::fs::remove_file(valid_path).map_err(|e| e.to_string())
+        std::fs::remove_file(&valid_path).map_err(|e| e.to_string())?;
     }
+
+    if let Ok(conn) = state.vault_index.lock() {
+        let _ = conn.execute(
+            "DELETE FROM links WHERE source_path = ?1 OR target_path = ?2",
+            params![path_str.as_ref(), path_str.as_ref()],
+        );
+    }
+    Ok(())
 }
