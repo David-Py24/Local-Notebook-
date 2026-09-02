@@ -12,3 +12,8 @@ Thumbs.db
 .vscode/
 .claude/
 *.session.sql
+
+# Tauri updater signing key — must never be committed; the real copy lives outside this
+# repo (see the release-signing note below) and as GitHub Actions secrets.
+*.key
+*.key.pub

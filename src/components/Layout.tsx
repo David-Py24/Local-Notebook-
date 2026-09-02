@@ -16,36 +16,44 @@ interface EdgeResizerProps {
 
 function EdgeResizer({ onResize }: EdgeResizerProps) {
   const isDragging = useRef(false);
-  const startX = useRef(0);
+  const lastX = useRef(0);
 
-  const handleMouseDown = (e: React.MouseEvent) => {
+  // Pointer Capture (not window-level mousemove/mouseup listeners) so the drag can't get
+  // stuck: with plain mouse events, releasing the button outside the app window never
+  // fires "mouseup" there, leaving isDragging permanently true and making the panel keep
+  // resizing on unrelated later mouse movement. setPointerCapture guarantees this element
+  // keeps receiving pointermove/pointerup for this gesture regardless of where the pointer
+  // physically ends up.
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     isDragging.current = true;
-    startX.current = e.clientX;
+    lastX.current = e.clientX;
+    e.currentTarget.setPointerCapture(e.pointerId);
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
+  };
 
-    const handleMouseMove = (ev: MouseEvent) => {
-      if (!isDragging.current) return;
-      const delta = ev.clientX - startX.current;
-      startX.current = ev.clientX;
-      onResize(delta);
-    };
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isDragging.current) return;
+    const delta = e.clientX - lastX.current;
+    lastX.current = e.clientX;
+    onResize(delta);
+  };
 
-    const handleMouseUp = () => {
-      isDragging.current = false;
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
-    };
-
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
+  const endDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    isDragging.current = false;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
   };
 
   return (
     <div
-      onMouseDown={handleMouseDown}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
       className="group relative flex w-1 shrink-0 cursor-col-resize items-center justify-center transition-colors hover:bg-accent/80 active:bg-accent z-10"
       title="Drag panel border to resize"
     >

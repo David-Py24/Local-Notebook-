@@ -1,8 +1,11 @@
 import { useState } from "react";
 import { useStore } from "../stores/useStore";
 import { THEMES } from "../themes";
+import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 
 type SettingSection = "general" | "appearance" | "editor" | "files" | "project" | "about";
+type UpdateStatus = "idle" | "checking" | "up-to-date" | "available" | "downloading" | "error";
 
 export default function SettingsModal() {
   const showSettings = useStore((s) => s.showSettings);
@@ -11,6 +14,41 @@ export default function SettingsModal() {
   const updateSettings = useStore((s) => s.updateSettings);
 
   const [activeSection, setActiveSection] = useState<SettingSection>("general");
+
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
+  const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
+  const handleCheckForUpdates = async () => {
+    setUpdateStatus("checking");
+    setUpdateError(null);
+    try {
+      const update = await checkForUpdate();
+      if (update?.available) {
+        setPendingUpdate(update);
+        setUpdateStatus("available");
+      } else {
+        setPendingUpdate(null);
+        setUpdateStatus("up-to-date");
+      }
+    } catch (err) {
+      setUpdateError(String(err));
+      setUpdateStatus("error");
+    }
+  };
+
+  const handleInstallUpdate = async () => {
+    if (!pendingUpdate) return;
+    setUpdateStatus("downloading");
+    setUpdateError(null);
+    try {
+      await pendingUpdate.downloadAndInstall();
+      await relaunch();
+    } catch (err) {
+      setUpdateError(String(err));
+      setUpdateStatus("error");
+    }
+  };
 
   if (!showSettings) return null;
 
@@ -391,6 +429,51 @@ export default function SettingsModal() {
                 <p><span className="text-muted">Version:</span> <span className="text-text">1.2.0</span></p>
                 <p><span className="text-muted">Framework:</span> <span className="text-text">Tauri v2 · React · TypeScript</span></p>
                 <p><span className="text-muted">Data:</span> <span className="text-text">Stored locally in the app data directory.</span></p>
+              </div>
+
+              <div className="rounded-md border border-border bg-bg/40 p-4 space-y-2.5 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="font-medium text-text">Software Updates</span>
+                  {updateStatus !== "available" && (
+                    <button
+                      onClick={handleCheckForUpdates}
+                      disabled={updateStatus === "checking"}
+                      className="rounded bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-hover disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed transition-colors"
+                    >
+                      {updateStatus === "checking" ? "Checking…" : "Check for Updates"}
+                    </button>
+                  )}
+                </div>
+
+                {updateStatus === "up-to-date" && (
+                  <p className="text-muted">You're on the latest version.</p>
+                )}
+
+                {updateStatus === "available" && pendingUpdate && (
+                  <div className="space-y-2">
+                    <p className="text-text">
+                      Version <span className="font-semibold text-accent">{pendingUpdate.version}</span> is available.
+                    </p>
+                    {pendingUpdate.body && (
+                      <p className="text-muted whitespace-pre-line max-h-20 overflow-y-auto">{pendingUpdate.body}</p>
+                    )}
+                    <button
+                      onClick={handleInstallUpdate}
+                      disabled={updateStatus !== "available"}
+                      className="rounded bg-accent px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-hover cursor-pointer transition-colors"
+                    >
+                      Download &amp; Restart to Install
+                    </button>
+                  </div>
+                )}
+
+                {updateStatus === "downloading" && (
+                  <p className="text-muted">Downloading update, the app will restart automatically…</p>
+                )}
+
+                {updateStatus === "error" && (
+                  <p className="text-red-400">Update check failed: {updateError}</p>
+                )}
               </div>
 
               <p className="text-[10px] text-muted">

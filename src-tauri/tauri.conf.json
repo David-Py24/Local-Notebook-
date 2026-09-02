@@ -38,6 +38,13 @@
   "plugins": {
     "fs": {
       "requireLiteralLeadingDot": false
+    },
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/David-Py24/Local-Notebook-/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY3NEVDNTVBRUNBRkIzRjIKUldUeXM2L3NXc1ZPWjBXRUpEemUvWi96QStUZEpYNkdxaGtZYUUxZ0lCRTZpV29VOVlBbElLcFoK"
     }
   }
 }

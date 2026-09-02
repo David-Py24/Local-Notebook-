@@ -509,24 +509,27 @@ export const useStore = create<AppState>((set, get) => {
         }
       }
 
-      // Find unique name
-      let index = 0;
-      let name = "Untitled.md";
-      let fullPath = `${targetDir}/${name}`;
-      const exists = (p: string) => get().explorerEntries.some((e) => e.path === p);
-      
-      while (exists(fullPath)) {
-        index++;
-        name = `Untitled ${index}.md`;
-        fullPath = `${targetDir}/${name}`;
+      // Try "Untitled", "Untitled 1", "Untitled 2", ... letting the backend's actual
+      // filesystem check decide what already exists, rather than predicting it here —
+      // `explorerEntries` is a flat, top-level-only, possibly-stale list, and comparing
+      // its paths against a JS-joined `${dir}/${name}` string breaks on Windows anyway
+      // (backend paths use `\`, this join always uses `/`), so a real pre-existing
+      // "Untitled.md" was never detected and every click hit the backend's own
+      // "File already exists" rejection instead of picking the next available name.
+      const MAX_ATTEMPTS = 200;
+      let lastErr: unknown = null;
+      for (let index = 0; index <= MAX_ATTEMPTS; index++) {
+        const name = index === 0 ? "Untitled" : `Untitled ${index}`;
+        try {
+          const path = await get().createFile(targetDir, name);
+          await get().openFile(path);
+          return;
+        } catch (err) {
+          lastErr = err;
+          if (!String(err).toLowerCase().includes("already exists")) break;
+        }
       }
-
-      try {
-        const path = await get().createFile(targetDir, name.replace(/\.md$/, ""));
-        await get().openFile(path);
-      } catch (err) {
-        alert("Failed to create new file: " + err);
-      }
+      alert("Failed to create new file: " + lastErr);
     },
 
     closeTab: async (panel, path) => {
