@@ -7,6 +7,17 @@ export type ViewMode = "source" | "live" | "preview";
 export type SaveStatus = "saved" | "saving" | "unsaved";
 export type SidePanelId = "assistant" | "sources";
 
+export interface CustomLayout {
+  id: string;
+  name: string;
+  panelOrder: SidePanelId[];
+  showAssistantPanel: boolean;
+  showSourcesPanel: boolean;
+  assistantWidth: number;
+  sourcePanelWidth: number;
+  splitActive: boolean;
+}
+
 export interface FileEntry {
   name: string;
   path: string;
@@ -202,6 +213,12 @@ interface AppState {
   setShowPanelLayoutModal: (show: boolean) => void;
   applyPanelPreset: (preset: "default" | "focus" | "assistant" | "explorer") => void;
   scaffoldWorkspaceTemplate: (folderPath: string) => Promise<void>;
+
+  // Custom saved layouts (TICKET-B4)
+  customLayouts: CustomLayout[];
+  saveCustomLayout: (name: string) => void;
+  applyCustomLayout: (id: string) => void;
+  deleteCustomLayout: (id: string) => void;
 }
 
 export const useStore = create<AppState>((set, get) => {
@@ -221,6 +238,8 @@ export const useStore = create<AppState>((set, get) => {
     parsedPanelOrder.includes("assistant") &&
     parsedPanelOrder.includes("sources");
   const initialPanelOrder: SidePanelId[] = isValidPanelOrder ? parsedPanelOrder! : ["assistant", "sources"];
+  const localCustomLayouts = localStorage.getItem("lsn_custom_layouts");
+  const initialCustomLayouts: CustomLayout[] = localCustomLayouts ? JSON.parse(localCustomLayouts) : [];
 
   // Apply the persisted theme immediately (live colors)
   const themeColors = getThemeById(initialSettings.theme).colors;
@@ -292,6 +311,7 @@ export const useStore = create<AppState>((set, get) => {
     showLauncherModal: false,
     showPanelLayoutModal: false,
     panelPreset: "default",
+    customLayouts: initialCustomLayouts,
 
     // Settings
     showSettings: false,
@@ -943,6 +963,43 @@ export const useStore = create<AppState>((set, get) => {
       } else if (preset === "explorer") {
         set({ showAssistantPanel: false, showSourcesPanel: true, sourcePanelWidth: 240, splitActive: false });
       }
+    },
+
+    saveCustomLayout: (name) => {
+      const layout: CustomLayout = {
+        id: "layout-" + Date.now(),
+        name,
+        panelOrder: get().panelOrder,
+        showAssistantPanel: get().showAssistantPanel,
+        showSourcesPanel: get().showSourcesPanel,
+        assistantWidth: get().assistantWidth,
+        sourcePanelWidth: get().sourcePanelWidth,
+        splitActive: get().splitActive,
+      };
+      const customLayouts = [...get().customLayouts, layout];
+      set({ customLayouts, panelPreset: "custom" });
+      localStorage.setItem("lsn_custom_layouts", JSON.stringify(customLayouts));
+    },
+
+    applyCustomLayout: (id) => {
+      const layout = get().customLayouts.find((l) => l.id === id);
+      if (!layout) return;
+      set({
+        panelOrder: layout.panelOrder,
+        showAssistantPanel: layout.showAssistantPanel,
+        showSourcesPanel: layout.showSourcesPanel,
+        assistantWidth: layout.assistantWidth,
+        sourcePanelWidth: layout.sourcePanelWidth,
+        splitActive: layout.splitActive,
+        panelPreset: "custom",
+      });
+      localStorage.setItem("lsn_panel_order", JSON.stringify(layout.panelOrder));
+    },
+
+    deleteCustomLayout: (id) => {
+      const customLayouts = get().customLayouts.filter((l) => l.id !== id);
+      set({ customLayouts });
+      localStorage.setItem("lsn_custom_layouts", JSON.stringify(customLayouts));
     },
 
     scaffoldWorkspaceTemplate: async (folderPath: string) => {

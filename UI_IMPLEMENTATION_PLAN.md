@@ -331,13 +331,44 @@ content); dragging to a non-split single pane creates the split automatically.
 ### TICKET-B4 — Real "Save Layout" persistence
 
 **Priority:** low, quick win once B1 lands
-**Owner:** — **Status:** todo
+**Owner:** Claude **Status:** done (browser-verified save/apply; delete verified by code
+pattern, not by exercising the confirm() dialog — see verification note)
 **Files:** `PanelLayoutModal.tsx`, `src/stores/useStore.ts`
 
-Replace the `alert(...)` stub with actually saving the current `layout` (TICKET-B1) +
-panel widths + `splitActive` as a named entry in `localStorage` (`lsn_custom_layouts`,
-an array of `{ name, layout, assistantWidth, sourcePanelWidth, splitActive }`). Show saved
-custom layouts alongside the four built-in presets in the same grid, with a delete affordance.
+**Note:** this ticket's original text says save "the current `layout` (TICKET-B1)" — but
+TICKET-B1 deliberately did *not* create a `layout` struct (see its own note); the real
+fields are `panelOrder`, `showAssistantPanel`, `showSourcesPanel`, `assistantWidth`,
+`sourcePanelWidth`, and `splitActive`. Saved that actual set instead.
+
+Implemented: a `CustomLayout` type and `customLayouts: CustomLayout[]` array in the store,
+persisted to `localStorage` under `lsn_custom_layouts` (loaded on init like the other
+persisted state). Three new actions — `saveCustomLayout(name)` snapshots the current panel
+state into a new entry (id `"layout-" + Date.now()`); `applyCustomLayout(id)` restores all
+six fields from a saved entry and also re-persists `panelOrder` to its own separate
+`lsn_panel_order` key so the two persistence mechanisms (TICKET-B1's live panel order vs.
+this ticket's named snapshots) stay consistent after an apply; `deleteCustomLayout(id)`
+filters it out. `PanelLayoutModal.tsx`'s stub `handleSaveCustomLayout` now calls
+`prompt()` for a name (same pattern `SourcesPanel.tsx` already uses for new file/folder
+names) instead of just showing an alert; a new "Custom Layouts" grid section (same card
+style as the built-in presets) renders saved layouts between the presets and the fine-tune
+controls, each with a hover-revealed delete button gated behind `confirm()` (matching
+`SourcesPanel.tsx`'s existing delete-confirmation pattern).
+
+**Verification:** `npx tsc --noEmit` and `npm run build` pass. Live-tested in a browser
+(this ticket needed no vault/file access at all, unlike the editor tickets, so this was
+testable in the real `App` — bypassed the workspace launcher, which force-opens with no
+folder set, by seeding `lsn_last_folder` in `localStorage` before load): confirmed toggling
+panels/split and saving produces a correct `lsn_custom_layouts` entry, the saved layout
+appears in a new "Custom Layouts" section on reopening the modal, and clicking it correctly
+restores every field (verified `splitActive` specifically, since it's the one most likely to
+have a wiring bug). **Two real blockers hit along the way, both environment limitations, not
+code bugs:** `prompt()` and `confirm()` both hang synchronously in this sandbox's headless
+browser instead of returning `null`/`false` — confirmed by temporarily replacing the
+`prompt()` call with a hardcoded value to exercise the rest of the flow, which then worked
+end-to-end. Delete's logic was therefore verified by code inspection (it's a one-line
+filter+persist, identical in shape to the already-working `deleteProject`) rather than by
+actually clicking through a `confirm()` dialog. A real click-through of the delete button in
+`npm run tauri dev` (a real, non-headless window) is the one remaining gap.
 
 **Acceptance:** "Save Layout" prompts for a name, persists it, and it reappears (and is
 selectable/applies correctly) after an app restart.

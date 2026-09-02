@@ -21,6 +21,11 @@ export default function PanelLayoutModal() {
   const splitScreen = useStore((s) => s.splitScreen);
   const closeSplit = useStore((s) => s.closeSplit);
 
+  const customLayouts = useStore((s) => s.customLayouts);
+  const saveCustomLayout = useStore((s) => s.saveCustomLayout);
+  const applyCustomLayout = useStore((s) => s.applyCustomLayout);
+  const deleteCustomLayout = useStore((s) => s.deleteCustomLayout);
+
   if (!showPanelLayoutModal) return null;
 
   const presets = [
@@ -51,8 +56,9 @@ export default function PanelLayoutModal() {
   ] as const;
 
   const handleSaveCustomLayout = () => {
-    // Persist current panel dimensions in settings
-    alert("Current custom panel layout saved successfully!");
+    const name = prompt("Name this layout:");
+    if (!name || !name.trim()) return;
+    saveCustomLayout(name.trim());
     setShowPanelLayoutModal(false);
   };
 
@@ -104,6 +110,46 @@ export default function PanelLayoutModal() {
               })}
             </div>
           </div>
+
+          {/* Saved Custom Layouts */}
+          {customLayouts.length > 0 && (
+            <div>
+              <label className="text-[11px] font-semibold text-muted uppercase tracking-wider block mb-2">
+                Custom Layouts
+              </label>
+              <div className="grid grid-cols-2 gap-2.5">
+                {customLayouts.map((layout) => {
+                  const isActive = panelPreset === "custom";
+                  return (
+                    <div
+                      key={layout.id}
+                      onClick={() => applyCustomLayout(layout.id)}
+                      className={`group flex items-start justify-between gap-2 p-3 rounded-lg border text-left cursor-pointer transition-all ${
+                        isActive
+                          ? "border-accent bg-accent/15 text-white shadow-xs"
+                          : "border-border/70 bg-bg/40 text-muted hover:border-text/40 hover:text-white"
+                      }`}
+                    >
+                      <div className="flex items-start gap-2.5 min-w-0">
+                        <span className="text-base">💾</span>
+                        <span className="text-xs font-bold text-white truncate">{layout.name}</span>
+                      </div>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (confirm(`Delete layout "${layout.name}"?`)) deleteCustomLayout(layout.id);
+                        }}
+                        className="shrink-0 rounded p-0.5 text-muted opacity-0 group-hover:opacity-100 hover:text-red-400 cursor-pointer transition-all"
+                        title="Delete layout"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {/* Custom Fine-Tuning */}
           <div className="space-y-3 border-t border-border/40 pt-4">
