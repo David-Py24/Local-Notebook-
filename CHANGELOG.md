@@ -2,6 +2,11 @@
 
 All notable changes to the Local Study Notebook are documented in this file.
 
+## [1.2.2] - 2026-09-02
+
+### Fixed
+- **Auto-updater was silently non-functional in 1.2.1**: `bundle.targets: "all"` produced both an NSIS and an MSI installer for Windows, which left the release workflow unable to decide which one to reference in the signed update manifest (`latest.json`), so it skipped uploading it entirely — `.sig` files were generated correctly, only the manifest was missing. Restricted Windows builds to NSIS only (the format Tauri's updater plugin actually supports for silent in-place installs), which resolves the ambiguity. 1.2.1's release remains available as a manual download; its in-app update check does not work — install 1.2.2 manually once, and updates from there on should work normally.
+
 ## [1.2.1] - 2026-09-02
 
 ### Added
