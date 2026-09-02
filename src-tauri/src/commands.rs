@@ -265,16 +265,31 @@ fn sync_links_internal(conn: &rusqlite::Connection, source_path: &str, content: 
     Ok(())
 }
 
+// A wiki-link `[[Foo]]` or markdown link `[text](Foo.md)` stores a short, user-authored
+// target string in `links.target_path` — not a resolved filesystem path. A real caller of
+// get_backlinks passes the currently-open note's full canonical path, which is never a
+// suffix of that short string (the previous `target_path LIKE '%' || ?1` query had the
+// comparison backwards, so it could never match anything). Resolved instead by comparing
+// basenames without extension, case-insensitively — matching Obsidian's own default
+// wiki-link resolution (by filename/title anywhere in the vault, not by exact path).
+fn link_target_basename(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let last_segment = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let without_ext = last_segment.strip_suffix(".md").unwrap_or(last_segment);
+    without_ext.to_lowercase()
+}
+
 #[tauri::command]
 pub fn get_backlinks(state: State<DbState>, target_path: String) -> Result<Vec<LinkItem>, String> {
     let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    let normalized_target = link_target_basename(&target_path);
+
     let mut stmt = conn
-        .prepare("SELECT id, source_path, target_path, link_text, line_number FROM links WHERE target_path = ?1 OR target_path LIKE ?2 ORDER BY source_path, line_number")
+        .prepare("SELECT id, source_path, target_path, link_text, line_number FROM links ORDER BY source_path, line_number")
         .map_err(|e| e.to_string())?;
 
-    let pattern = format!("%{}", target_path);
-    let rows = stmt
-        .query_map(params![target_path, pattern], |row| {
+    let rows: Vec<LinkItem> = stmt
+        .query_map([], |row| {
             Ok(LinkItem {
                 id: Some(row.get(0)?),
                 source_path: row.get(1)?,
@@ -283,9 +298,12 @@ pub fn get_backlinks(state: State<DbState>, target_path: String) -> Result<Vec<L
                 line_number: row.get(4)?,
             })
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .filter(|link| link_target_basename(&link.target_path) == normalized_target)
+        .collect();
 
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    Ok(rows)
 }
 
 #[tauri::command]
@@ -594,6 +612,37 @@ pub fn delete_local_entry(
         let _ = remove_from_index_recursive(&conn, path_str.as_ref());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod backlink_tests {
+    use super::*;
+
+    #[test]
+    fn matches_bare_wikilink_target_against_full_path() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let full_path = format!("C:{sep}vault{sep}Notes{sep}Foo.md");
+        // [[Foo]] stores target_path = "Foo"
+        assert_eq!(link_target_basename("Foo"), link_target_basename(&full_path));
+    }
+
+    #[test]
+    fn matches_markdown_link_target_with_extension_and_relative_prefix() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let full_path = format!("C:{sep}vault{sep}Notes{sep}Foo.md");
+        // [text](../Foo.md) stores target_path = "../Foo.md"
+        assert_eq!(link_target_basename("../Foo.md"), link_target_basename(&full_path));
+    }
+
+    #[test]
+    fn is_case_insensitive() {
+        assert_eq!(link_target_basename("FOO"), link_target_basename("foo.md"));
+    }
+
+    #[test]
+    fn distinguishes_different_notes() {
+        assert_ne!(link_target_basename("Foo"), link_target_basename("Bar.md"));
+    }
 }
 
 #[cfg(test)]

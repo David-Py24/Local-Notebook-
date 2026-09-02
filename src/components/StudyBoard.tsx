@@ -3,6 +3,7 @@ import { useStore, Tab, ViewMode } from "../stores/useStore";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import MarkdownEditor from "./MarkdownEditor";
+import BacklinksPanel from "./BacklinksPanel";
 
 export const TAB_DRAG_MIME = "application/x-lsn-tab";
 
@@ -425,6 +426,8 @@ function EditorPanel({ panel }: EditorPanelProps) {
           </div>
         )}
       </div>
+
+      <BacklinksPanel activeTabId={activeTabId} panel={panel} />
 
       {/* Editor Status Bar (Word count, char count, mode indicator) */}
       {activeTabId && (

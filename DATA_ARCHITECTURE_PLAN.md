@@ -205,6 +205,46 @@ On file save (`DATA-2`), extract links from note contents, delete prior entries 
 
 ---
 
+## TICKET DATA-7 — Surface backlinks in the UI, and fix `get_backlinks`' matching bug
+
+**Priority:** medium — closes the gap DATA-6 left ("backend only — no panel surfaces this
+yet"); no ticket previously promised the UI half of this feature, so this is new scope,
+not a re-opened ticket.
+**Owner:** Claude **Status:** done
+**Files:** `src-tauri/src/commands.rs`, new `src/components/BacklinksPanel.tsx`,
+`src/components/StudyBoard.tsx`
+
+**Bug found while building the first real consumer of `get_backlinks`:** its query matched
+`target_path LIKE '%' || ?1` — checking whether the *stored* value (a short, user-authored
+string like `"Foo"` from `[[Foo]]`, never a resolved path) ends with the *query* (which any
+real caller passes as the currently-open note's full canonical path). That comparison is
+backwards and could never match in practice — the command has been silently non-functional
+since DATA-6 landed, despite compiling and running without error. Fixed by matching on
+basename without extension, case-insensitively (`link_target_basename`), which is also how
+Obsidian itself resolves wiki-links by default — by filename/title anywhere in the vault,
+not by exact path. Covered by four new unit tests testing the matching function directly
+(bare wiki-link target, relative markdown-link target with extension, case-insensitivity,
+and that distinct notes don't collide) — `get_outgoing_links` needed no fix, since
+`source_path` is already stored as a full canonical path from `write_local_file`, so exact
+match there was always correct.
+
+Added `BacklinksPanel.tsx`: a collapsed-by-default "Linked Mentions (N)" section between
+the editor and the status bar, fetching `get_backlinks` for the active tab on tab change,
+hidden entirely when there are none. Clicking an entry opens that source note in the same
+pane via the existing `openFile` action. Deliberately did not build an outgoing-links UI or
+any graph/network visualization — not asked for, and backlinks ("what links here") is the
+Obsidian-equivalent feature actually valuable on its own.
+
+**Verification:** `cargo check`, `cargo test` (12 tests passing, 4 new — directly covering
+the fixed matching logic), `npx tsc --noEmit`, and `npm run build` all pass. **Not verified
+in a live browser or the Tauri app** — no dev server was running to attach to at
+implementation time, and starting one risked colliding with another active session. The
+core logic fix is unit-tested directly; the UI wiring itself follows the same
+invoke-in-useEffect-with-cleanup pattern already used elsewhere in this codebase, but
+hasn't been visually confirmed rendering real backlink data end to end.
+
+---
+
 ## Suggested order
 
 1. DATA-1 (consolidate DBs, remove dead code) — do this first, everything else depends on
