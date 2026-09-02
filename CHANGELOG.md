@@ -2,6 +2,28 @@
 
 All notable changes to the Local Study Notebook are documented in this file.
 
+## [1.2.1] - 2026-09-02
+
+### Added
+- **Real markdown editor**: replaced the hand-rolled per-line `<input>` editor with CodeMirror 6 — proper multi-line editing, native undo/redo, correct multi-line paste, and cross-line Backspace/arrow-key navigation.
+- **Obsidian-style Live Preview mode**: headings, bold/italic, strikethrough, and inline code render styled with their markdown markers hidden — except on whichever line the cursor is on, which stays raw and editable. Bulleted lists render as real bullets, task checkboxes (`- [ ]` / `- [x]`) render as clickable checkboxes, horizontal rules (`---`) render as an actual line, and fenced code blocks / GFM tables render with proper formatting. A new Source / Live / Preview cycle button replaces the old two-way edit/preview toggle.
+- **List editing automation**: pressing Enter inside a bullet item continues the list with the same marker on the next line (resetting a task checkbox to unchecked rather than duplicating its checked state); pressing Enter on an empty item exits the list instead of creating an endless empty bullet.
+- **Editor settings actually apply live now**: tab size, line numbers, and auto-bracket-pairing are wired through CodeMirror and take effect immediately when changed in Settings, with no editor restart needed.
+- **Drag-to-reorder side panels**: drag the Assistant/Explorer panel by its top-edge handle to swap their left-right order; persists across restarts.
+- **Drag tabs between split panes**: drag a note's tab from one editor pane to the other (or to the pane edge, which auto-creates the split) to move it, preserving unsaved content.
+- **Named custom layouts**: "Save Layout" in the Panel Layout Manager now actually saves your current panel arrangement (order, widths, split state) under a name you choose, selectable alongside the built-in presets, with a delete option.
+- **In-app software updates**: a "Check for Updates" section in Settings → About checks for, downloads, and installs signed new releases, restarting the app automatically when done.
+- **Wiki-style and markdown link tracking**: `[[links]]` and `[text](target.md)` links in notes are now indexed on save/rename/delete, powering backlink lookups (backend only — no panel surfaces this yet).
+
+### Fixed
+- **New Note creation** no longer fails with "File already exists" after the first note in a folder — the previous check compared a forward-slash-joined path against backend paths that use native OS separators, so it never actually detected an existing "Untitled.md" and always hit the same collision instead of picking the next available name.
+- **Panel resize dragging** no longer gets stuck: the resizer used window-level mouse listeners that never received `mouseup` if the button was released outside the app window, leaving the drag permanently active and reacting to unrelated later mouse movement. Rebuilt on Pointer Capture, which is immune to this.
+- **`excludedFolders` setting** (Files & Links settings) is now actually applied when listing a vault's contents — previously saved but silently ignored.
+
+### Backend
+- Consolidated the two unused SQLite databases (`study_notes.db`, `notes.db` — dead code, never called from the frontend) into a single `vault_index.db` with `files` and `links` tables; WAL journal mode enabled for durability. Removed the dead PDF/DOCX source-import command set and its `pdf-extract`/`docx-rs` dependencies, since files remain the single source of truth (see `DATA_ARCHITECTURE_PLAN.md`).
+- All local-file commands (`create_local_file`, `write_local_file`, `rename_local_entry`, `delete_local_entry`, etc.) now validate the target path stays within the open vault root, rejecting path-traversal attempts.
+
 ## [1.2.0] - 2026-09-01
 
 ### Fixed
