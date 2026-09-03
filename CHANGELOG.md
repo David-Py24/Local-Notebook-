@@ -2,6 +2,20 @@
 
 All notable changes to the Local Study Notebook are documented in this file.
 
+## [1.3.0] - 2026-09-03
+
+### Added
+- **OpenCode Agent tab**: a new, opt-in "🤖 OpenCode Agent" mode alongside the existing Study Assistant chat, for agentic coding/file-editing/shell/git tasks powered by [OpenCode](https://opencode.ai). Spawns `opencode serve` as a local sidecar scoped to the current vault, authenticated with a random per-session password (`OPENCODE_SERVER_PASSWORD`, held only in memory) that is never written to disk. Your existing BYOK API key is injected into the sidecar's environment under OpenCode's own provider variable names (e.g. `GOOGLE_GENERATIVE_AI_API_KEY` for Gemini) — never duplicated into any OpenCode config file. Tool activity (file edits, shell commands) streams live via Server-Sent Events and automatically triggers a vault reindex so the file explorer stays in sync with changes the agent makes directly on disk.
+- New Settings → AI & BYOK → **OpenCode Agent** section: install detection with platform-correct instructions, server port, and an auto-start toggle.
+
+### Fixed
+- **BYOK connection errors were shown as raw JSON dumps** (e.g. OpenRouter 402 "insufficient credits") instead of a readable message; provider errors are now parsed and given status-specific guidance (401/402/429).
+- **"Test Connection: Successful!" was a false positive**: it only checked the public, keyless `/models` endpoint, so it reported success even with an invalid API key. It now also probes `/chat/completions` with the configured model.
+- **Google Gemini connections were broken by two compounding bugs**: the default Base URL pointed at Gemini's native API (which has no `/chat/completions` route) instead of its OpenAI-compatibility endpoint, and the default model (`gemini-1.5-flash`) had been fully retired by Google. Both defaults are corrected, and a pre-flight check now catches a native Gemini URL before making a doomed request.
+- **Gemini 3.x tool-calling failed with "Function call is missing a thought_signature"**: recognized as a known tool-support incompatibility and now falls back to a non-tool request — and that fallback now also strips leftover tool-call artifacts from the conversation *history*, not just the current request, since a poisoned earlier turn was continuing to trigger the same error on retry.
+- **A successful-but-empty AI response** (e.g. silently blocked by a safety filter) now shows an explanatory message instead of leaving the chat bubble blank.
+- Retired the default Anthropic model (`claude-3-5-sonnet-20241022`) in favor of a current one.
+
 ## [1.2.5] - 2026-09-02
 
 ### Fixed
