@@ -70,7 +70,8 @@ npm run tauri build
   2. **localStorage** on the frontend — app settings (`lsn_settings`), themes, pinned vault paths (`lsn_pinned`), and projects (`lsn_projects`).
 - **Local file vault** (the "explorer") is read/written through Rust commands in `commands.rs`:
   - Read: `read_local_dir`, `read_local_file`
-  - Write: `write_local_file`, `create_local_file`, `create_local_dir`, `rename_local_entry`, `delete_local_entry`
+  - Write: `write_local_file`, `create_local_file`, `create_local_dir`, `rename_local_entry`, `delete_local_entry
+  - `
 - **Note editing model**: the Study Board editor auto-saves on debounce. The note title is derived from the first heading (`# Title`). Editing a **source** creates an editable copy as a note (`copy_source_to_note`) — the original source is never modified.
 - **Projects** are a frontend/localStorage concept that map a named `Project` (id, name, path, pinned?, lastOpened) onto the existing vault-folder model. Opening a project calls the existing `openFolder` flow.
 

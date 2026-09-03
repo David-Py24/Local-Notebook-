@@ -2,6 +2,8 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { getThemeById, applyThemeToDocument } from "../themes";
 import type { Project } from "../types";
+import { streamAIResponse, ChatMessagePayload, fetchAvailableModels } from "../services/aiProvider";
+
 
 export type ViewMode = "source" | "live" | "preview";
 export type SaveStatus = "saved" | "saving" | "unsaved";
@@ -79,6 +81,19 @@ export interface Settings {
   reduceMotion: boolean;
   autoPairBrackets: boolean;
   showWordCount: boolean;
+
+  // BYOK AI Engine Settings
+  aiEnabled: boolean;
+  aiProvider: string; // "ollama_hermes" | "openai" | "anthropic" | "gemini" | "custom"
+  aiBaseUrl: string;
+  aiApiKey: string;
+  aiModelName: string;
+  aiEnableWorkspaceTools: boolean;
+  aiSystemPrompt: string;
+
+  // OpenCode Agent Settings
+  opencodePort: number;       // default 4096 (OpenCode's own default for `opencode serve`)
+  opencodeAutoStart: boolean; // auto-start server when switching to OpenCode Agent tab
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -100,6 +115,19 @@ const DEFAULT_SETTINGS: Settings = {
   reduceMotion: false,
   autoPairBrackets: true,
   showWordCount: true,
+
+  // BYOK AI Defaults
+  aiEnabled: true,
+  aiProvider: "ollama_hermes",
+  aiBaseUrl: "http://localhost:11434/v1",
+  aiApiKey: "",
+  aiModelName: "hermes3:8b",
+  aiEnableWorkspaceTools: true,
+  aiSystemPrompt: "You are an intelligent study assistant for Local Study Notebook. Use workspace tools and context to provide accurate study summaries.",
+
+  // OpenCode Agent defaults
+  opencodePort: 4096,        // OpenCode's actual documented default port for `opencode serve`
+  opencodeAutoStart: true,
 };
 
 interface AppState {
@@ -185,6 +213,16 @@ interface AppState {
   selectedModel: string;
   assistantTopicTitle: string;
   filterQuery: string;
+  isAssistantStreaming: boolean;
+  assistantStatusText: string;
+  availableModels: string[];                              // dynamically fetched from provider
+
+  // OpenCode Agent runtime state (never persisted to localStorage)
+  assistantMode: "study" | "opencode";                   // which tab is active
+  opencodeInstalled: boolean;                            // result of check_opencode_installed
+  opencodeServerPid: number | null;                      // PID of running opencode serve
+  opencodeServerPassword: string | null;                 // in-memory only, never persisted
+
   sendAssistantMessage: (text: string) => Promise<void>;
   clearAssistantMessages: () => void;
   setAssistantWidth: (w: number) => void;
@@ -192,6 +230,13 @@ interface AppState {
   setSelectedModel: (m: string) => void;
   setAssistantTopicTitle: (t: string) => void;
   setFilterQuery: (q: string) => void;
+  fetchAndSetAvailableModels: () => Promise<void>;        // fetches live models from provider
+
+  // OpenCode Agent actions
+  setAssistantMode: (mode: "study" | "opencode") => void;
+  checkOpencodeInstalled: () => Promise<void>;
+  startOpencodeServer: () => Promise<void>;
+  stopOpencodeServer: () => Promise<void>;
 
   // Session & Account States & Actions (TopBar)
   sessions: SessionTab[];
@@ -888,41 +933,123 @@ export const useStore = create<AppState>((set, get) => {
     },
     setShowProjectsPanel: (show) => set({ showProjectsPanel: show }),
 
-    // Assistant Actions
+    isAssistantStreaming: false,
+    assistantStatusText: "",
+    availableModels: [],
+
+    // OpenCode Agent runtime state — never persisted (no localStorage)
+    assistantMode: "study",
+    opencodeInstalled: false,
+    opencodeServerPid: null,
+    opencodeServerPassword: null,
+
+
     sendAssistantMessage: async (text: string) => {
       if (!text.trim()) return;
+      const store = get();
+
       const userMsg: AssistantMessage = {
         id: "msg-" + Date.now(),
         role: "user",
         content: text.trim(),
         timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       };
-      
-      const newMessages = [...get().assistantMessages, userMsg];
-      set({ assistantMessages: newMessages });
 
-      // Generate realistic study notebook assistant reply
-      const promptLower = text.toLowerCase();
-      let reply = "I have analyzed your notes and workspace structure. Everything is synced locally.";
-      if (promptLower.includes("plan") || promptLower.includes("task")) {
-        reply = "Here is the summary of current workspace tasks:\n- Explorer is configured to browse local files\n- Study board active with document live preview\n- Auto-save is active across all open tabs.";
-      } else if (promptLower.includes("theme") || promptLower.includes("color")) {
-        reply = "Theme configuration updated. You can tweak color tokens and corner radius in Settings.";
-      } else if (promptLower.includes("file") || promptLower.includes("note")) {
-        reply = `Found **${get().explorerEntries.length}** root entries in active workspace. Click any \`.md\` file in the tree to open.`;
-      } else {
-        reply = `Processing with **${get().selectedModel}**:\n\nYour request: *"${text}"* has been recorded. Working on the study notes workspace.`;
-      }
+      const updatedMessages = [...store.assistantMessages, userMsg];
+      set({ assistantMessages: updatedMessages, isAssistantStreaming: true, assistantStatusText: "Thinking..." });
 
-      setTimeout(() => {
-        const assistantMsg: AssistantMessage = {
+      if (!store.settings.aiEnabled) {
+        const disabledMsg: AssistantMessage = {
           id: "msg-" + (Date.now() + 1),
           role: "assistant",
-          content: reply,
+          content: "AI Study Assistant is currently disabled. You can enable it in **Settings -> AI & BYOK Model**.",
           timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
         };
-        set({ assistantMessages: [...get().assistantMessages, assistantMsg] });
-      }, 400);
+        set({ assistantMessages: [...updatedMessages, disabledMsg], isAssistantStreaming: false, assistantStatusText: "" });
+        return;
+      }
+
+      // Build context attachments if present
+      let contextPrefix = "";
+      const activePath = store.activeLeftTabId || store.activeRightTabId;
+      if (activePath && (text.includes("@") || text.includes("active"))) {
+        const activeContent = store.activePanel === "left" ? store.leftDraft : store.rightDraft;
+        const noteName = activePath.split(/[\\/]/).pop() || "Active Note";
+        contextPrefix += `[Attached Context - Note: ${noteName}]\n${activeContent}\n\n`;
+      }
+
+      // Prepare conversation payload for AI
+      const systemMessage: ChatMessagePayload = {
+        role: "system",
+        content: store.settings.aiSystemPrompt || "You are an intelligent study assistant for Local Study Notebook.",
+      };
+
+      const historyPayload: ChatMessagePayload[] = [
+        systemMessage,
+        ...updatedMessages.slice(-10).map((m) => ({
+          role: m.role as "user" | "assistant",
+          content: m.role === "user" && m.id === userMsg.id ? `${contextPrefix}${m.content}` : m.content,
+        })),
+      ];
+
+      const assistantMsgId = "msg-" + (Date.now() + 1);
+      const assistantMsg: AssistantMessage = {
+        id: assistantMsgId,
+        role: "assistant",
+        content: "",
+        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      };
+
+      set({ assistantMessages: [...updatedMessages, assistantMsg] });
+
+      try {
+        const finalText = await streamAIResponse({
+          messages: historyPayload,
+          settings: store.settings,
+          onChunk: (accumulatedText) => {
+            set((state) => ({
+              assistantMessages: state.assistantMessages.map((m) =>
+                m.id === assistantMsgId ? { ...m, content: accumulatedText } : m
+              ),
+            }));
+          },
+          onStatusChange: (status) => {
+            set({ assistantStatusText: status });
+          },
+        });
+
+        // A successful request with no visible text usually means the provider blocked or
+        // filtered the output (e.g. Gemini safety filters) rather than the app failing —
+        // surface that instead of leaving a permanently blank chat bubble.
+        if (!finalText.trim()) {
+          set((state) => ({
+            assistantMessages: state.assistantMessages.map((m) =>
+              m.id === assistantMsgId
+                ? {
+                    ...m,
+                    content:
+                      "⚠️ The AI provider returned an empty response. This can happen when a safety/content filter blocks the output, or the model produced nothing for this prompt. Try rephrasing your message.",
+                  }
+                : m
+            ),
+          }));
+        }
+      } catch (err) {
+        set((state) => ({
+          assistantMessages: state.assistantMessages.map((m) =>
+            m.id === assistantMsgId
+              ? {
+                  ...m,
+                  content:
+                    m.content ||
+                    `⚠️ Unable to connect to AI server at \`${store.settings.aiBaseUrl}\` (${String(err)}).\n\nCheck your endpoint configuration in **Settings -> AI & BYOK Model**.`,
+                }
+              : m
+          ),
+        }));
+      } finally {
+        set({ isAssistantStreaming: false, assistantStatusText: "" });
+      }
     },
     clearAssistantMessages: () => set({ assistantMessages: [] }),
     setAssistantWidth: (w) => set({ assistantWidth: w }),
@@ -930,6 +1057,83 @@ export const useStore = create<AppState>((set, get) => {
     setSelectedModel: (m) => set({ selectedModel: m }),
     setAssistantTopicTitle: (t) => set({ assistantTopicTitle: t }),
     setFilterQuery: (q) => set({ filterQuery: q }),
+
+    fetchAndSetAvailableModels: async () => {
+      const { settings } = get();
+      const baseUrl = (settings.aiBaseUrl || "").replace(/\/+$/, "");
+      if (!baseUrl) return;
+      const models = await fetchAvailableModels(baseUrl, settings.aiApiKey || "");
+      if (models.length > 0) {
+        set({ availableModels: models });
+      }
+    },
+
+    // ---------------------------------------------------------------------------
+    // OpenCode Agent actions
+    // ---------------------------------------------------------------------------
+
+    setAssistantMode: (mode) => set({ assistantMode: mode }),
+
+    checkOpencodeInstalled: async () => {
+      try {
+        const installed = await invoke<boolean>("check_opencode_installed");
+        set({ opencodeInstalled: installed });
+      } catch {
+        set({ opencodeInstalled: false });
+      }
+    },
+
+    startOpencodeServer: async () => {
+      const { settings, currentFolderPath, opencodeServerPid } = get();
+      if (opencodeServerPid !== null) return; // already running
+
+      const workspace = currentFolderPath || ".";
+      // Generate a per-session random password (never persisted to disk).
+      const password = Array.from(crypto.getRandomValues(new Uint8Array(24)))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+
+      // Build BYOK credential env-var map with correct OpenCode variable names.
+      // (spec §"Corrected: Secrets Handling" — note GOOGLE_GENERATIVE_AI_API_KEY,
+      // NOT GEMINI_API_KEY, per OpenCode's own documented env var name for Gemini)
+      const providerEnv: Record<string, string> = {};
+      if (settings.aiApiKey?.trim()) {
+        if (settings.aiProvider === "openai") {
+          providerEnv["OPENAI_API_KEY"] = settings.aiApiKey.trim();
+        } else if (settings.aiProvider === "anthropic") {
+          providerEnv["ANTHROPIC_API_KEY"] = settings.aiApiKey.trim();
+        } else if (settings.aiProvider === "gemini") {
+          providerEnv["GOOGLE_GENERATIVE_AI_API_KEY"] = settings.aiApiKey.trim();
+        } else if (settings.aiProvider === "openrouter") {
+          providerEnv["OPENROUTER_API_KEY"] = settings.aiApiKey.trim();
+        }
+        // ollama_hermes / custom: no API key env var needed
+      }
+
+      try {
+        const pid = await invoke<number>("spawn_opencode_server", {
+          port: settings.opencodePort,
+          workspacePath: workspace,
+          serverPassword: password,
+          providerEnv,
+        });
+        set({ opencodeServerPid: pid, opencodeServerPassword: password });
+      } catch (err) {
+        console.error("[OpenCode] Failed to start server:", err);
+      }
+    },
+
+    stopOpencodeServer: async () => {
+      const { opencodeServerPid } = get();
+      if (opencodeServerPid === null) return;
+      try {
+        await invoke("kill_opencode_server", { pid: opencodeServerPid });
+      } catch (err) {
+        console.error("[OpenCode] Failed to stop server:", err);
+      } finally {
+        set({ opencodeServerPid: null, opencodeServerPassword: null });
+      }
+    },
 
     // Session Actions
     createSession: (title) => {

@@ -1,16 +1,25 @@
 import { useState, useRef, useEffect } from "react";
 import { useStore } from "../stores/useStore";
 import ReactMarkdown from "react-markdown";
+import OpenCodeView from "./OpenCodeView";
 
 export default function AssistantPanel() {
   const assistantMessages = useStore((s) => s.assistantMessages);
   const sendAssistantMessage = useStore((s) => s.sendAssistantMessage);
   const clearAssistantMessages = useStore((s) => s.clearAssistantMessages);
-  const selectedModel = useStore((s) => s.selectedModel);
-  const setSelectedModel = useStore((s) => s.setSelectedModel);
+  const isAssistantStreaming = useStore((s) => s.isAssistantStreaming);
+  const assistantStatusText = useStore((s) => s.assistantStatusText);
+  const settings = useStore((s) => s.settings);
+  const updateSettings = useStore((s) => s.updateSettings);
   const assistantTopicTitle = useStore((s) => s.assistantTopicTitle);
   const setAssistantTopicTitle = useStore((s) => s.setAssistantTopicTitle);
   const toggleAssistantPanel = useStore((s) => s.toggleAssistantPanel);
+  const assistantMode = useStore((s) => s.assistantMode);
+  const setAssistantMode = useStore((s) => s.setAssistantMode);
+  const checkOpencodeInstalled = useStore((s) => s.checkOpencodeInstalled);
+  const startOpencodeServer = useStore((s) => s.startOpencodeServer);
+  const stopOpencodeServer = useStore((s) => s.stopOpencodeServer);
+  const opencodeServerPid = useStore((s) => s.opencodeServerPid);
 
   const [inputVal, setInputVal] = useState("");
   const [showModelDropdown, setShowModelDropdown] = useState(false);
@@ -26,10 +35,12 @@ export default function AssistantPanel() {
   const attachMenuRef = useRef<HTMLDivElement | null>(null);
 
   const modelsList = [
-    { id: "Big Pickle", icon: "🥒", desc: "Fast & detailed reasoning" },
-    { id: "Study AI 3.7", icon: "⚡", desc: "High precision notebook tutor" },
-    { id: "Local Assistant", icon: "🧠", desc: "Offline private model" },
-    { id: "Claude Sonnet", icon: "✨", desc: "Deep writing assistant" },
+    { id: "ollama_hermes", model: "hermes3:8b", name: "Nous Hermes 3 (Local)", icon: "🦙", desc: "Offline function tool calling agent" },
+    { id: "openrouter", model: "nousresearch/hermes-3-llama-3.1-405b", name: "Nous Hermes 3 (OpenRouter)", icon: "🌐", desc: "Online 405B reasoning & synthesis" },
+    { id: "openai", model: "gpt-4o-mini", name: "OpenAI GPT-4o Mini", icon: "⚡", desc: "Fast & lightweight cloud reasoning" },
+    { id: "anthropic", model: "claude-sonnet-5", name: "Claude Sonnet 5", icon: "✨", desc: "Deep study & synthesis model" },
+    { id: "gemini", model: "gemini-2.0-flash", name: "Google Gemini", icon: "💎", desc: "Multimodal study tutor — Hermes tools compatible" },
+    { id: "custom", model: settings.aiModelName || "custom-model", name: "Custom Endpoint", icon: "⚙️", desc: "vLLM / LM Studio / Local Proxy" },
   ];
 
   // Auto-scroll on new messages
@@ -100,26 +111,61 @@ export default function AssistantPanel() {
       {/* Top Header */}
       <div className="flex shrink-0 items-center justify-between border-b border-border/40 px-3.5 py-2.5 bg-bg/20">
         <div className="flex items-center gap-2 min-w-0 flex-1">
-          {isEditingTitle ? (
-            <input
-              autoFocus
-              value={titleDraft}
-              onChange={(e) => setTitleDraft(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleTitleSubmit()}
-              onBlur={handleTitleSubmit}
-              className="min-w-0 flex-1 rounded border border-border bg-bg/80 px-2 py-0.5 text-xs text-white outline-none"
-            />
-          ) : (
-            <h2
-              onDoubleClick={() => {
-                setTitleDraft(assistantTopicTitle);
-                setIsEditingTitle(true);
+          {/* Mode Toggle Tabs */}
+          <div className="flex items-center rounded-md border border-border/60 bg-bg/40 p-0.5 shrink-0">
+            <button
+              onClick={() => {
+                setAssistantMode("study");
+                if (opencodeServerPid !== null) stopOpencodeServer();
               }}
-              title="Double click to rename topic"
-              className="truncate text-xs font-semibold text-text select-none cursor-pointer hover:text-white"
+              className={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors cursor-pointer ${
+                assistantMode === "study"
+                  ? "bg-accent text-white"
+                  : "text-muted hover:text-white"
+              }`}
             >
-              {assistantTopicTitle}
-            </h2>
+              💬 Study
+            </button>
+            <button
+              onClick={() => {
+                setAssistantMode("opencode");
+                checkOpencodeInstalled();
+                if (opencodeServerPid === null) startOpencodeServer();
+              }}
+              className={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors cursor-pointer ${
+                assistantMode === "opencode"
+                  ? "bg-accent text-white"
+                  : "text-muted hover:text-white"
+              }`}
+            >
+              🤖 Agent
+            </button>
+          </div>
+
+          {assistantMode === "study" && (
+            <>
+              {isEditingTitle ? (
+                <input
+                  autoFocus
+                  value={titleDraft}
+                  onChange={(e) => setTitleDraft(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleTitleSubmit()}
+                  onBlur={handleTitleSubmit}
+                  className="min-w-0 flex-1 rounded border border-border bg-bg/80 px-2 py-0.5 text-xs text-white outline-none"
+                />
+              ) : (
+                <h2
+                  onDoubleClick={() => {
+                    setTitleDraft(assistantTopicTitle);
+                    setIsEditingTitle(true);
+                  }}
+                  title="Double click to rename topic"
+                  className="truncate text-xs font-semibold text-text select-none cursor-pointer hover:text-white"
+                >
+                  {assistantTopicTitle}
+                </h2>
+              )}
+            </>
           )}
         </div>
 
@@ -179,8 +225,15 @@ export default function AssistantPanel() {
         </div>
       </div>
 
-      {/* Messages Stream */}
-      <div className="flex-1 space-y-4 overflow-y-auto p-4 scrollbar-thin">
+      {/* Content: Study Assistant or OpenCode Agent */}
+      {assistantMode === "opencode" ? (
+        <div className="flex-1 overflow-hidden">
+          <OpenCodeView />
+        </div>
+      ) : (
+        <>
+          {/* Messages Stream */}
+          <div className="flex-1 space-y-4 overflow-y-auto p-4 scrollbar-thin">
         {assistantMessages.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center text-center p-6 text-muted select-none">
             <div className="h-10 w-10 rounded-full border border-border bg-bg/50 flex items-center justify-center mb-3">
@@ -212,6 +265,12 @@ export default function AssistantPanel() {
               )}
             </div>
           ))
+        )}
+        {assistantStatusText && (
+          <div className="flex items-center gap-2 rounded-full border border-accent/40 bg-accent/10 px-3 py-1.5 text-[11px] text-accent font-medium animate-pulse w-fit">
+            <span className="text-[10px]">✨</span>
+            <span>{assistantStatusText}</span>
+          </div>
         )}
         <div ref={messagesEndRef} />
       </div>
@@ -277,30 +336,47 @@ export default function AssistantPanel() {
                   onClick={() => setShowModelDropdown(!showModelDropdown)}
                   className="flex items-center gap-1 rounded-md border border-border/70 bg-card/80 px-2 py-1 text-[11px] font-medium text-text/90 hover:border-accent/60 hover:text-white cursor-pointer transition-colors"
                 >
-                  <span className="text-[10px] text-accent font-bold">⚡</span>
-                  <span>{selectedModel}</span>
-                  <svg className="w-3 h-3 text-muted" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <span className="text-[10px] text-accent font-bold">
+                    {modelsList.find((m) => m.id === settings.aiProvider)?.icon || "🦙"}
+                  </span>
+                  <span className="truncate max-w-[100px]">{settings.aiModelName || "hermes3:8b"}</span>
+                  <svg className="w-3 h-3 text-muted shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <polyline points="6 9 12 15 18 9" />
                   </svg>
                 </button>
 
                 {showModelDropdown && (
-                  <div className="absolute bottom-8 left-0 z-30 flex w-48 flex-col rounded-md border border-border bg-card p-1 text-xs text-text shadow-xl">
-                    <div className="px-2 py-1 text-[10px] font-semibold uppercase text-muted">Select Model</div>
+                  <div className="absolute bottom-8 left-0 z-30 flex w-56 flex-col rounded-md border border-border bg-card p-1 text-xs text-text shadow-xl">
+                    <div className="px-2 py-1 text-[10px] font-semibold uppercase text-muted">AI Engine & Model</div>
                     {modelsList.map((m) => (
                       <button
                         key={m.id}
                         onClick={() => {
-                          setSelectedModel(m.id);
+                          let defaultUrl = settings.aiBaseUrl;
+                          if (m.id === "ollama_hermes") defaultUrl = "http://localhost:11434/v1";
+                          else if (m.id === "openrouter") defaultUrl = "https://openrouter.ai/api/v1";
+                          else if (m.id === "openai") defaultUrl = "https://api.openai.com/v1";
+                          else if (m.id === "anthropic") defaultUrl = "https://api.anthropic.com/v1";
+                          else if (m.id === "gemini") defaultUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
+
+
+                          updateSettings({
+                            aiProvider: m.id,
+                            aiModelName: m.model,
+                            aiBaseUrl: defaultUrl,
+                          });
                           setShowModelDropdown(false);
                         }}
                         className={`flex items-center justify-between rounded px-2.5 py-1.5 text-left cursor-pointer transition-colors ${
-                          selectedModel === m.id ? "bg-accent text-white font-medium" : "hover:bg-bg/80 text-text/90"
+                          settings.aiProvider === m.id ? "bg-accent text-white font-medium" : "hover:bg-bg/80 text-text/90"
                         }`}
                       >
-                        <div className="flex items-center gap-1.5">
-                          <span>{m.icon}</span>
-                          <span>{m.id}</span>
+                        <div className="flex flex-col min-w-0">
+                          <div className="flex items-center gap-1.5 font-medium truncate">
+                            <span>{m.icon}</span>
+                            <span className="truncate">{m.name}</span>
+                          </div>
+                          <span className="text-[10px] text-muted leading-tight truncate">{m.desc}</span>
                         </div>
                       </button>
                     ))}
@@ -328,6 +404,9 @@ export default function AssistantPanel() {
           </div>
         </div>
       </div>
+        </>
+      )}
     </div>
   );
 }
+

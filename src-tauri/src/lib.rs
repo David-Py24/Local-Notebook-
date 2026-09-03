@@ -9,6 +9,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
@@ -31,8 +32,14 @@ pub fn run() {
             commands::create_local_file,
             commands::create_local_dir,
             commands::rename_local_entry,
-            commands::delete_local_entry
+            commands::delete_local_entry,
+            commands::search_vault,
+            // OpenCode Agent process management
+            commands::check_opencode_installed,
+            commands::spawn_opencode_server,
+            commands::kill_opencode_server
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+

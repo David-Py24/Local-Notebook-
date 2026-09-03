@@ -25,7 +25,7 @@ Study board:
 
 Left panel
 - Replace sources with an explorer where the system asks to open a folder or create a new one 
-
+- 
 
 
 

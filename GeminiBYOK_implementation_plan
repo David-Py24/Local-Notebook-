@@ -1,0 +1,90 @@
+# Implementation Plan: Google Gemini API Stabilization & Hermes Agent Integration
+
+Stabilize Google Gemini API integration within Local Study Notebook, implement dynamic model discovery (supporting current and future Google models from 1.5/2.0/2.5 to 3.5+), and ensure 100% tool-calling compatibility between the **Hermes Agent Workspace Tool Suite** and Google Gemini models.
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Hermes Agent Compatibility with Google Gemini Models**:  
+> **YES, Google Gemini models work exceptionally well with the Hermes Agent!**  
+> Modern Gemini models (`gemini-2.0-flash`, `gemini-1.5-pro`, `gemini-2.5-flash`) possess top-tier function-calling capabilities. When selected as the active model provider, Gemini can seamlessly execute all Hermes workspace tools (`search_vault`, `read_current_note`, `get_note_backlinks`, `create_summary_note`) to perform multi-note RAG and study synthesis.
+
+> [!TIP]
+> **Dynamic Model Discovery via Google API**:  
+> When a user enters a Google API key, the app will dynamically query Google's `/v1beta/openai/models` endpoint to list all live, non-deprecated chat models available to that key. Users can select from the fetched list or manually enter any custom/preview model ID (e.g. `gemini-3.5-flash`).
+
+> [!WARNING]
+> **Safety Filter Interception**:  
+> Gemini API returns HTTP 200 OK with empty text content when safety/recitation filters trigger (`finish_reason: "SAFETY"`). We will update the stream decoder to parse `finish_reason` and `promptFeedback` to give users clear safety notifications instead of silent empty message bubbles.
+
+---
+
+## Open Questions
+
+> [!NOTE]
+> 1. **Auto-Fetch Models on Key Entry**: Should the app automatically fetch available models from Google as soon as an API key is entered/validated in Settings? (Our proposed plan implements auto-fetch on connection test + manual refresh button for best UX).
+
+---
+
+## Technical Specifications: Hermes Agent + Google Gemini Integration
+
+### How Hermes Agent Operates with Google Gemini:
+1. **Workspace Tool Injection**: When `aiEnableWorkspaceTools` is enabled, `src/services/aiProvider.ts` attaches OpenAI-style function definitions (`WORKSPACE_TOOLS`) to the completion request sent to Google's OpenAI-compatible endpoint (`/v1beta/openai/chat/completions`).
+2. **Gemini Tool Execution Loop**:
+   - Google Gemini evaluates the prompt and returns a structured tool call delta (`delta.tool_calls`).
+   - The app intercepts the tool call, executes the corresponding Rust SQLite query (`search_vault` or `get_backlinks`), and returns the tool output (`role: "tool"`).
+   - Google Gemini synthesizes the final response with full context from the vault.
+3. **Gemini Schema Strictness Adjustments**:
+   - Ensure all `WORKSPACE_TOOLS` parameter schemas strictly adhere to OpenAPI 3.0 / JSON Schema specifications (Google's endpoint rejects loose or untyped schema definitions).
+   - Ensure `tool_call_id` mapping and history payload format remain strictly compliant with Google's OpenAI translation layer.
+   - Maintain seamless tool fallback retry logic if an experimental model endpoint rejects function calling.
+
+---
+
+## Proposed Code Changes
+
+### AI Service Layer (`src/services/`)
+
+#### [MODIFY] [aiProvider.ts](file:///c:/Users/Ghing/Documents/Mini%20project%20practice/Local%20Study%20Notebook/src/services/aiProvider.ts)
+- **Dynamic Model Fetching (`fetchAvailableModels`)**: Implement helper to query `${cleanUrl}/models` and filter active Google Gemini chat completion models.
+- **Hermes Tool Calling Compliance**: Audit and refine `WORKSPACE_TOOLS` payload formatting to ensure strict compatibility with Google's `/v1beta/openai/chat/completions` function parser.
+- **Endpoint URL Normalization**: Automatically check and rewrite native Gemini base URLs missing `/openai`.
+- **Enhanced SSE Stream Parser**: Capture `finish_reason` (`SAFETY`, `RECITATION`, `MAX_TOKENS`) and `promptFeedback` from stream chunks to provide explicit safety notifications.
+- **Tool Calling Fallback**: Refine `isLikelyToolIncompatibility()` to catch Gemini-specific tool error signatures and retry smoothly if tool execution is restricted.
+
+---
+
+### UI & Model Selector (`src/components/`)
+
+#### [MODIFY] [SettingsModal.tsx](file:///c:/Users/Ghing/Documents/Mini%20project%20practice/Local%20Study%20Notebook/src/components/SettingsModal.tsx)
+- Add **"Fetch Available Models"** button for Google Gemini to dynamically pull live non-deprecated models.
+- Display a dynamic selector dropdown alongside an editable model ID field (supporting custom tags like `gemini-3.5-flash`).
+
+#### [MODIFY] [AssistantPanel.tsx](file:///c:/Users/Ghing/Documents/Mini%20project%20practice/Local%20Study%20Notebook/src/components/AssistantPanel.tsx)
+- Update model options list so Google Gemini presets dynamically reflect live fetched models.
+- Surface explicit safety block banners in the chat UI when Gemini safety filters block output.
+
+---
+
+### State Management (`src/stores/`)
+
+#### [MODIFY] [useStore.ts](file:///c:/Users/Ghing/Documents/Mini%20project%20practice/Local%20Study%20Notebook/src/stores/useStore.ts)
+- Add `availableModels: string[]` state and `fetchAndSetAvailableModels()` store action.
+- Update `sendAssistantMessage()` to surface explicit status and safety error descriptions.
+
+---
+
+## Verification Plan
+
+### Automated Tests
+- Type checking: `npx tsc --noEmit`
+- Production bundle build: `npm run build`
+- Rust/Tauri compilation check: `cargo check --manifest-path src-tauri/Cargo.toml`
+
+### Manual Verification
+1. **Hermes Agent Tool Calling with Gemini**: Enable workspace tools, select Google Gemini (`gemini-2.0-flash`), ask "Search my vault for notes on physics", and verify Gemini successfully triggers `search_vault` and synthesizes the note content.
+2. **Dynamic Model Fetching**: Enter Google Gemini API key, click "Fetch Models", and verify live models list populates from Google's API.
+3. **Custom Model Tag Override**: Enter a custom model tag (e.g. `gemini-3.5-flash`) and verify requests are issued with that exact model ID.
+4. **Safety Filter Interception**: Test safety filter prompt and verify explicit warning banner appears instead of an empty chat response.

@@ -1,0 +1,219 @@
+# Implementation Plan: OpenCode Integration into AI Assistant Panel
+
+Integrate **OpenCode** — an open-source, model-agnostic AI coding agent ([opencode.ai](https://opencode.ai)) — as a selectable **Agent Mode** inside the existing AI Assistant Panel in Local Study Notebook. This is a deliberate part of the app's vision: the assistant should be able to help with coding and research tasks, not just study-note chat. OpenCode natively supports 75+ LLM providers and exposes a documented HTTP API, making its provider-routing layer reusable here without hand-maintaining vendor quirks ourselves.
+
+**Revision note:** this supersedes the original draft. Six corrections were made after fact-checking OpenCode's actual docs and reviewing the draft for security/integrity gaps — each is called out inline below with a "Corrected:" marker.
+
+---
+
+## Background: What is OpenCode?
+
+OpenCode is a terminal-native AI coding agent designed for agentic, multi-step tasks:
+- **Model-agnostic**: Works with OpenAI, Anthropic, Google Gemini, Ollama (Hermes), and 70+ others — its provider-adapter layer is the thing we want to borrow, so the routing bugs fixed this session (Gemini endpoint shape, `thought_signature`, model deprecation) don't need to be re-litigated for this second assistant mode.
+- **BYOK**: Full "Bring Your Own Key" support.
+- **Interfaces**: Terminal TUI, desktop app, IDE extension, and a documented **HTTP server API** (`opencode serve`).
+- **Agentic tools**: File editing, code search, git operations, LSP integration, shell execution.
+- **Installation**: standalone binaries for Windows/macOS/Linux — **no Node.js required** (see below).
+
+---
+
+## Relationship to the existing "Study Assistant" tab
+
+This is an **additive, opt-in mode**, not a replacement:
+- **💬 Study Assistant** (existing, hardened this session) stays the default — plain BYOK chat, read-only workspace tools, no shell/git access. Lowest risk, always available.
+- **🤖 OpenCode Agent** (new) — a separate, explicitly-entered mode with materially more capability (file editing, shell, git) and its own security posture. Keeping these as distinct tabs, not a single merged chat, is the right shape precisely because the two modes have very different risk profiles.
+
+---
+
+## Corrected: Installation Strategy (no Node.js dependency)
+
+The original draft assumed `npm install -g opencode-ai`, requiring a Node.js runtime most students won't have. Confirmed OpenCode ships standalone binaries:
+
+- **Windows**: `winget install OpenCode.OpenCode`, or the signed MSI, or a portable binary release — none require Node.js.
+- **macOS/Linux**: `curl -fsSL https://opencode.ai/install | bash` — downloads a standalone binary, no Node.js required either.
+
+`check_opencode_installed()` should run `opencode --version` regardless of *how* it was installed — detection doesn't change, only the install-guidance copy shown to the user does (point at winget/MSI on Windows, the curl script elsewhere, not `npm install -g`).
+
+---
+
+## Corrected: Embed Mechanism (no iframe — `serve` is a headless API, not a UI)
+
+Fact-checked against OpenCode's own docs: `opencode serve` exposes a **headless OpenAPI 3.1 HTTP server** (spec viewable at `/doc`) — there is no web UI to point an `<iframe>` at. The original draft's "spawn `opencode serve`, embed in an iframe" step doesn't work as written.
+
+**Chosen approach: build a custom chat/agent UI in React against OpenCode's documented HTTP API.**
+- Pros: stays visually consistent with the rest of the app, avoids embedding a third-party web app's DOM/JS inside the Tauri webview (smaller security surface than an iframe of code we don't control), full control over how tool-call activity (file edits, shell commands, git ops) is surfaced to the user for approval/visibility.
+- Cons: more UI implementation work than an iframe would have been — `OpenCodeView.tsx` now needs to actually implement a streaming chat view against the API, not just host a frame.
+
+**Rejected alternative:** using OpenCode's own separate browser-launch feature (opens a system browser tab on a random port). This works but breaks the "stays inside the app panel" goal, so it's not the primary path — worth keeping as a manual fallback link ("Open in browser instead") if the embedded API client has problems.
+
+---
+
+## Corrected: Secrets Handling (no duplicate plaintext key file)
+
+**Spike resolved — confirmed via OpenCode's own docs.** OpenCode natively supports per-provider environment variables for credentials, *and* its `opencode.json` config format supports `{env:VARIABLE_NAME}` substitution — meaning even non-secret config (model choice, workspace settings) can reference an env var name rather than embedding a literal key, if a config file turns out to be needed for anything else. Confirmed exact variable names for the providers this app already supports:
+
+| This app's `aiProvider` value | OpenCode env var |
+|---|---|
+| `openai` | `OPENAI_API_KEY` |
+| `anthropic` | `ANTHROPIC_API_KEY` |
+| `gemini` | `GOOGLE_GENERATIVE_AI_API_KEY` — **not** `GEMINI_API_KEY` |
+
+**Flagging that Gemini mapping explicitly** because this session's entire debugging arc was exactly this class of bug (a plausible-looking env/variable/endpoint name that's subtly wrong). `settings.aiProvider === "gemini"` must map to `GOOGLE_GENERATIVE_AI_API_KEY` when building the spawn env, not to a same-named-as-our-field guess — get this wrong and OpenCode will silently fail to authenticate with Gemini the same way our own app's requests did earlier this session.
+
+**Design, now confirmed feasible:**
+- Inject the user's existing BYOK keys as env vars when spawning the `opencode serve` sidecar process (via `tauri-plugin-shell`'s sidecar env option), scoped to that process's lifetime only.
+- Never write them to disk in OpenCode's own config format.
+- Local Ollama (`ollama_hermes`) needs no key at all — OpenCode talks to it the same way this app does, no env var required.
+
+---
+
+## Corrected: Vault Integrity Reconciliation (reuse existing infrastructure)
+
+The original draft didn't address what happens when OpenCode's file-editing/shell tools modify vault files directly, bypassing this app's own save pipeline (`write_local_file`), local version history, and vault index.
+
+**Fix: reuse infrastructure that already exists in this codebase** (per recent commits — vault index sync and local version history are already implemented):
+- Subscribe to the `/event` SSE stream (see Spike Results below) and invoke the existing `reindex_vault` command reactively whenever a `part.updated` event indicates a file-editing tool ran — no polling or guessing when a session ended.
+- Whether agent edits also get their own version-history entries is a separate product decision — see Spike Results item 3.
+
+---
+
+## Corrected: Local Server Authentication
+
+The original draft didn't mention securing the spawned local server at all. OpenCode's server supports `OPENCODE_SERVER_PASSWORD` (HTTP basic auth, username defaults to `opencode`) and CORS configuration.
+
+- Generate a random password per session when spawning the sidecar; pass it via `OPENCODE_SERVER_PASSWORD`.
+- Hold that credential only in memory in the frontend (Zustand state, not persisted to `localStorage` or written to disk) for the lifetime of the session.
+- Never spawn the server without a password — an unauthenticated local HTTP endpoint with file/shell/git tool access is a meaningfully worse local attack surface than anything in the Study Assistant tab.
+
+---
+
+## Corrected: Process Lifecycle via Tauri's Sidecar API
+
+The original draft's `spawn_opencode_server` / `kill_opencode_server` commands implied hand-rolled PID tracking. `src-tauri/capabilities/default.json` currently has no shell/sidecar plugin permission at all (only `core:default`, `dialog:*`, `updater:default`, `process:default`).
+
+- Add `tauri-plugin-shell` as a dependency and register its `sidecar` capability in `default.json` (per this project's own CLAUDE.md rule: new plugins need a capability entry).
+- Use the plugin's sidecar API for spawn/kill instead of raw process handling — this gets auto-kill-on-app-exit and more predictable crash/lifecycle behavior for free, rather than reimplementing it.
+
+---
+
+## Proposed Changes
+
+### New Tauri Backend (`src-tauri/`)
+
+#### [MODIFY] `Cargo.toml` / `src-tauri/capabilities/default.json`
+- Add `tauri-plugin-shell` dependency.
+- Add its sidecar permission to `default.json`.
+
+#### [MODIFY] `src-tauri/src/commands.rs`
+- **`check_opencode_installed() -> bool`** — runs `opencode --version`.
+- **`spawn_opencode_server(port: u16, workspace_path: String, server_password: String, provider_env: HashMap<String,String>) -> Result<u32, String>`** — spawns `opencode serve` via the shell plugin's sidecar API, with `OPENCODE_SERVER_PASSWORD` and provider credential env vars set on the child process only (pending the secrets spike above).
+- **`kill_opencode_server(pid: u32)`** — stops the sidecar.
+- Trigger point for `reindex_vault` after agent-session tool activity (exact wiring depends on whether OpenCode's API exposes tool-call events we can subscribe to, or whether we poll/reconcile on session end — to confirm during implementation).
+
+#### [MODIFY] `src-tauri/src/lib.rs`
+- Register new commands and the shell plugin in the Tauri builder.
+
+---
+
+### State Management (`src/stores/useStore.ts`)
+
+- **New state**:
+  - `assistantMode: "study" | "opencode"`
+  - `opencodePort: number`
+  - `opencodeServerPid: number | null`
+  - `opencodeInstalled: boolean`
+  - `opencodeServerPassword: string | null` — in-memory only, never persisted
+- **New actions**:
+  - `setAssistantMode(mode)`
+  - `startOpencodeServer()` — generates a random password, gathers provider env vars from existing BYOK settings, invokes `spawn_opencode_server`
+  - `stopOpencodeServer()`
+  - `checkOpencodeInstalled()`
+- **New Settings fields**: `opencodePort: number`, `opencodeAutoStart: boolean` (added to `Settings` type and `DEFAULT_SETTINGS`, same pattern as existing `aiBaseUrl` etc.)
+
+---
+
+### UI (`src/components/`)
+
+#### [MODIFY] `AssistantPanel.tsx`
+- Two-tab toggle in the panel header: `💬 Study Assistant` / `🤖 OpenCode Agent`.
+- Install-guidance card (winget/MSI/curl script per platform) when `opencodeInstalled` is false.
+- Auto-start/stop server on mode switch (if `opencodeAutoStart` is on).
+
+#### [NEW] `src/components/OpenCodeView.tsx`
+- A real chat/agent UI (not an iframe) built against OpenCode's HTTP API: sends requests with the in-memory session password, streams responses, and surfaces tool-call activity (file edits, shell commands, git operations) to the user as it happens — this is the natural place to show "OpenCode wants to run: `git commit ...`" style visibility, given the elevated capability.
+- Server status badge, start/stop controls, port conflict handling.
+
+---
+
+### Settings (`src/components/SettingsModal.tsx`)
+
+- New **OpenCode Agent** subsection under AI & BYOK:
+  - Server port (default per OpenCode's own default, not a fixed guess).
+  - Auto-start toggle.
+  - Install status + version, with platform-correct install instructions (winget/MSI/curl).
+  - No BYOK-key-sync UI here — credentials are injected at spawn time (per the secrets fix above), not configured separately.
+
+---
+
+## Architecture Diagram
+
+```
++------------------------------------------------------+
+|           AI Assistant Panel (AssistantPanel.tsx)     |
+|  [💬 Study Assistant Tab] | [🤖 OpenCode Agent Tab]  |
++----------------------+-------------------------------+
+         |                           |
+         v                           v
+  Hermes / Gemini Chat         OpenCodeView.tsx
+  (existing streaming chat,     (custom chat UI, built
+   read-only workspace tools)    against OpenCode's HTTP
+                                  API — no iframe)
+                                       |
+                                       v
+                     Tauri (tauri-plugin-shell sidecar):
+                     spawn_opencode_server()
+                     opencode serve --port <port>
+                       --dir <workspace>
+                       env: OPENCODE_SERVER_PASSWORD=<random>
+                            <PROVIDER>_API_KEY=<from BYOK settings>
+                                       |
+                                       v
+                     On session end / tool-call activity:
+                     invoke("reindex_vault", ...) to reconcile
+                     vault index with files OpenCode touched
+```
+
+---
+
+## Spike Results
+
+**1. Env-var credential support — CONFIRMED.** See the Secrets Handling section above; exact variable names identified per provider.
+
+**2. Tool-call event visibility — CONFIRMED.** OpenCode's server broadcasts Server-Sent Events at `/event` (default port **4096**, not the `4242` guessed in the original draft — use OpenCode's actual default unless the user overrides it in Settings): `session.created`, `session.updated`, `session.status`, `message.updated`, `part.updated`, `todo.updated`. Tool invocations (file edits, shell commands, git operations) surface as `part.updated` events on a message — this is the same "parts" terminology that showed up in the Gemini `thought_signature` error text earlier this session (`"function call ... position 3"`), suggesting OpenCode's internal message-part model is consistent with how it talks to providers like Gemini.
+
+This resolves the open design question from before: `OpenCodeView.tsx` can be a genuinely thin client — subscribe to `/event`, render `part.updated` events as they arrive (including tool-call parts, for the "OpenCode wants to run: `git commit ...`" visibility), and trigger `reindex_vault` reactively whenever a `part.updated` event indicates a file-editing tool ran, rather than polling or guessing when a session ended.
+
+**3. Version-history semantics — still a product decision, not a research question.** Two options once implementation starts:
+   - **(a) Treat OpenCode edits as external changes**: `reindex_vault` picks them up, but no version-history entry is created — same as if the user edited the file in another program while the app was closed.
+   - **(b) Give OpenCode edits their own version-history entries**, tagged distinctly from the editor's own auto-save entries (e.g. "Edited by OpenCode Agent") so the history view can distinguish human edits from agent edits.
+
+   Recommendation: start with (a) — it's simpler, and reindex-on-change already gives basic safety (nothing is silently lost from the index). Revisit (b) only if agent-made edits turn out to need the same undo/rollback granularity as manual edits.
+
+---
+
+## Verification Plan
+
+### Automated Tests
+- TypeScript: `npx tsc --noEmit`
+- Build: `npm run build`
+- Rust: `cargo check --manifest-path src-tauri/Cargo.toml`
+
+### Manual Verification
+1. **Install Detection**: with OpenCode installed via winget/MSI (no Node.js on the machine), verify the panel shows "OpenCode Ready."
+2. **Server Spawn + Auth**: switch to the OpenCode Agent tab, verify the sidecar spawns with a random `OPENCODE_SERVER_PASSWORD`, and that the custom UI successfully authenticates against it.
+3. **No Plaintext Secret Duplication**: after spawning, confirm no BYOK API key was written to `~/.config/opencode/config.json` or any other file on disk — only present in the spawned process's environment.
+4. **Workspace Context**: verify the server starts scoped to the currently open workspace folder.
+5. **Vault Reconciliation**: have the OpenCode agent edit a note file directly; verify `reindex_vault` runs afterward and the app's file explorer/index reflects the change without a manual refresh.
+6. **Mode Switching**: switch back to Study Assistant; verify the sidecar is killed cleanly (check the process is actually gone, not orphaned — this project already has a documented gotcha about orphaned processes locking build outputs).
+7. **Fallback (not installed)**: verify the install-guidance card shows the correct platform-specific command (winget on Windows, curl script on macOS/Linux) — not the old `npm install -g` instruction.
+8. **Port Conflict**: verify changing the port in Settings and reconnecting works cleanly.

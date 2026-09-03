@@ -10,14 +10,20 @@ up a ticket.
 - Before starting a ticket, edit this file: set `Owner:` to your agent name and `Status:`
   to `in progress`, then commit that alone (`docs: claim TICKET-N`) so the other agent sees
   it on next pull/rebase.
+  
 - Work one ticket at a time per agent. Most tickets touch `src/stores/useStore.ts` — **do
-  not have both agents editing that file concurrently**; check its ticket's status first.
+    not have both agents editing that file concurrently**; check its ticket's status first.
+  
 - Prefer small, focused commits/PRs per ticket over one big change, so review and conflict
-  resolution stay manageable.
+    resolution stay manageable.
+
+  
 - When done: run `npx tsc --noEmit`, `npm run build`, and `cargo check` (inside
-  `src-tauri/`) before marking a ticket `done`. Update Status here in the same PR.
+  ` src-tauri/`) before marking a ticket `done`. Update Status here in the same PR.
+
+  
 - If a ticket turns out to require changes outside its listed files, note that in this doc
-  instead of silently expanding scope — the other agent may be relying on the file list.
+    instead of silently expanding scope — the other agent may be relying on the file list.
 
 Status values: `todo` / `in progress` / `blocked` / `done`.
 
@@ -52,7 +58,7 @@ Each sub-item is independently shippable; do them as separate commits within thi
    `currentFolderPath` is already restored from `lsn_last_folder`, call `openFolder`.
 3. `newNoteLocation` — `openNewNote` in `useStore.ts:438` should create the new file under
    `settings.newNoteLocation` (resolved relative to the vault root) when non-empty, falling
-   back to vault root otherwise.
+    back to vault root otherwise.
 4. `excludedFolders` — parse as a comma-separated list and pass to `read_local_dir` (add a
    parameter to the Rust command, or filter client-side in `refreshExplorer`); apply it in
    `read_local_dir_internal` (`commands.rs`) alongside the existing dotfile skip.
@@ -163,6 +169,39 @@ separately asks for a real model integration.
 build an import UI for. If PDF/DOCX import is wanted later, see the note in DATA-1 of
 `DATA_ARCHITECTURE_PLAN.md` for the much simpler shape that fits the files-as-SSOT decision
 (extract text, write it as a plain new `.md` file — no database involved).
+
+---
+
+## Post-launch fix — "New Note" spuriously failing with "File already exists"
+
+**Reported by:** user, screenshot of the real Tauri app showing the error dialog.
+**Fixed by:** Claude
+
+**Root cause:** `openNewNote` (`useStore.ts`) picked a unique filename by checking
+`get().explorerEntries.some((e) => e.path === p)` against a hand-built path
+`` `${targetDir}/${name}` ``. Two independent problems made this check useless: (1)
+`explorerEntries` is only the current folder's flat, top-level listing — it doesn't see into
+subfolders at all, so any `newNoteLocation` setting pointing at a subfolder meant the check
+never looked in the right place; and (2) on Windows, backend-returned paths use `\`, but the
+JS join always used `/`, so even a same-folder comparison was a string mismatch and never
+matched a real existing file. Net effect: the app always attempted `Untitled.md` first no
+matter what actually existed on disk, and once a real `Untitled.md` existed, the backend
+(correctly) rejected the duplicate and the JS-side pre-check never caught it beforehand to
+try `Untitled 1.md` instead.
+
+**Fix:** stopped predicting filesystem state in JS entirely. `openNewNote` now just tries
+`Untitled`, `Untitled 1`, `Untitled 2`, ... directly against the backend, stopping at the
+first one that succeeds; it only keeps retrying while the backend's error specifically says
+"already exists" (any other error — e.g. a permissions problem — surfaces immediately
+instead of retrying 200 times pointlessly).
+
+**Verification:** `npx tsc --noEmit` and `npm run build` pass. This sandbox has no real
+Tauri filesystem, so the success/retry-on-collision path itself couldn't be exercised
+end-to-end here — confirmed instead that the failure path is correct: `invoke()` rejects
+immediately in this environment with an unrelated error (no Tauri runtime), the new code
+correctly does *not* match it as "already exists" and stops after one attempt (not a
+200-iteration spin), and surfaces that real error via the same `alert(...)` as before. The
+actual duplicate-name scenario needs a real vault to confirm fully.
 
 ---
 

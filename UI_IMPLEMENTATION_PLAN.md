@@ -95,8 +95,7 @@ undo/paste correctness in a real vault needs a manual pass via `npm run tauri de
 this is fully signed off. Acceptance criteria below are otherwise met by construction
 (CodeMirror's default keymap + `history()` provide all of this natively).
 
-**Acceptance:** typing, selection, arrow-key navigation, Backspace across line boundaries,
-multi-line paste, and Ctrl+Z/Ctrl+Y all behave like a normal editor. Existing autosave debounce,
+- **Acceptance:** typing, selection, arrow-key navigation, Backspace across line boundaries,multi-line paste, and Ctrl+Z/Ctrl+Y all behave like a normal editor. Existing autosave debounce,
 tab switching, and split-pane behavior still work unchanged from the outside.
 
 ### TICKET-A2 — Obsidian-style Live Preview mode
@@ -432,6 +431,48 @@ actually clicking through a `confirm()` dialog. A real click-through of the dele
 
 **Acceptance:** "Save Layout" prompts for a name, persists it, and it reappears (and is
 selectable/applies correctly) after an app restart.
+
+---
+
+## Post-launch fix — Panel resize (`EdgeResizer`) getting stuck / "glitchy"
+
+**Reported by:** user, after trying the app in the real Tauri window. Not part of B1–B4 —
+this is `Layout.tsx`'s pre-existing border-drag-to-resize handle (the border between side
+panels, not the B2 reorder-handle or B3 tab-drag), unrelated to any ticket above but
+reported while testing this plan's other drag work, so logged here rather than in the main
+plan.
+
+**Root cause:** `EdgeResizer` tracked dragging with plain `mousedown` + `window`-level
+`mousemove`/`mouseup` listeners, added fresh on every `mousedown` and removed on `mouseup`.
+If the mouse button is released outside the app's own window (easy to do when dragging a
+resize handle near a window edge, or just from any imprecision), `mouseup` never reaches
+that window's listener at all — `isDragging` stays `true` forever, and the (still-attached)
+`mousemove` listener keeps firing `onResize` on *any* later mouse movement anywhere in the
+app, not just intentional drags on that handle. That matches the reported symptoms exactly:
+"only glitches" and "can't continue to resize a specified panel" — once stuck, the panel
+reacts to unrelated mouse movement instead of behaving like a normal drag.
+
+**Fix:** switched to the Pointer Events API with explicit capture
+(`element.setPointerCapture(pointerId)` on pointer-down, `releasePointerCapture` on
+pointer-up/cancel). Capture guarantees `pointermove`/`pointerup` keep targeting the handle
+element for the duration of that pointer's gesture regardless of where the cursor
+physically ends up — including outside the window — so this specific stuck-drag failure
+mode isn't reachable anymore. Also switched the delta calculation from an accumulating
+`startX` (reset every move) to the same relative-delta approach, unchanged in behavior for
+a normal drag.
+
+**Verification:** `npx tsc --noEmit` and `npm run build` pass. Unlike the tab/panel-reorder
+drag features (native HTML5 drag-and-drop, unverifiable in this sandbox), this is plain
+pointer-event dragging, so it **was** directly testable here. Confirmed via
+`computer.left_click_drag` against the resizer's actual `getBoundingClientRect()` center
+(needed exact coordinates — this sandbox's drag action turned out to scale input
+coordinates to an 800-wide reference frame, a ~1.6x mismatch against the real 1280px-wide
+page, discovered by logging `pointerdown`/`pointermove` events during a test drag and
+comparing their `clientX` to what was requested): dragging the Assistant↔Explorer border
+resized the Assistant panel correctly in both directions, repeated drags worked with no
+leftover stuck state, and no new console errors appeared. The specific "released outside
+the window" edge case itself isn't reproducible in this pane-only sandbox, but Pointer
+Capture is the standard, spec-guaranteed fix for exactly that failure mode.
 
 ---
 

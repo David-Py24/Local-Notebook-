@@ -9,6 +9,9 @@
     "dialog:allow-save",
     "dialog:default",
     "updater:default",
-    "process:default"
+    "process:default",
+    "shell:allow-spawn",
+    "shell:allow-kill",
+    "shell:allow-execute"
   ]
 }
