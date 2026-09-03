@@ -6,17 +6,19 @@ function App() {
   const currentFolderPath = useStore((s) => s.currentFolderPath);
   const refreshExplorer = useStore((s) => s.refreshExplorer);
   const reduceMotion = useStore((s) => s.settings.reduceMotion);
+  const onboardingComplete = useStore((s) => s.onboardingComplete);
 
   const startupFolder = useStore((s) => s.settings.startupFolder);
   const openFolder = useStore((s) => s.openFolder);
 
   useEffect(() => {
+    if (!onboardingComplete) return;
     if (!currentFolderPath && startupFolder) {
       openFolder(startupFolder);
     } else if (currentFolderPath) {
       refreshExplorer();
     }
-  }, [currentFolderPath, startupFolder, openFolder, refreshExplorer]);
+  }, [currentFolderPath, startupFolder, openFolder, refreshExplorer, onboardingComplete]);
 
   // Apply reduce motion preference globally
   useEffect(() => {

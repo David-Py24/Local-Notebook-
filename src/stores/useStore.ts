@@ -37,6 +37,7 @@ export interface SessionTab {
   id: string;
   title: string;
   active: boolean;
+  openTabs: Tab[];
 }
 
 export interface UserAccount {
@@ -250,6 +251,10 @@ interface AppState {
   setShowSearchModal: (show: boolean) => void;
   setTopbarViewMode: (mode: "grid" | "split" | "single") => void;
 
+  // Onboarding
+  onboardingComplete: boolean;
+  completeOnboarding: () => void;
+
   // Launcher & Panel Arrangement States & Actions (Iteration 3)
   showLauncherModal: boolean;
   showPanelLayoutModal: boolean;
@@ -285,6 +290,12 @@ export const useStore = create<AppState>((set, get) => {
   const initialPanelOrder: SidePanelId[] = isValidPanelOrder ? parsedPanelOrder! : ["assistant", "sources"];
   const localCustomLayouts = localStorage.getItem("lsn_custom_layouts");
   const initialCustomLayouts: CustomLayout[] = localCustomLayouts ? JSON.parse(localCustomLayouts) : [];
+  const onboardingComplete = localStorage.getItem("lsn_onboarding_complete") === "true";
+  const localSessions = localStorage.getItem("lsn_sessions");
+  const initialSessions: SessionTab[] = localSessions
+    ? JSON.parse(localSessions)
+    : [{ id: "sess-default", title: "Default Session", active: true, openTabs: [] }];
+  const initialActiveSessionId = initialSessions.find((s) => s.active)?.id || initialSessions[0].id;
 
   // Apply the persisted theme immediately (live colors)
   const themeColors = getThemeById(initialSettings.theme).colors;
@@ -338,11 +349,8 @@ export const useStore = create<AppState>((set, get) => {
     filterQuery: "",
 
     // Session & Account States
-    sessions: [
-      { id: "sess-1", title: "Local Study Notebook impl", active: true },
-      { id: "sess-2", title: "New session - 2026-08-31T14", active: false }
-    ],
-    activeSessionId: "sess-1",
+    sessions: initialSessions,
+    activeSessionId: initialActiveSessionId,
     userAccount: {
       name: "Developer Workspace",
       email: "developer@localnotebook.app",
@@ -357,6 +365,9 @@ export const useStore = create<AppState>((set, get) => {
     showPanelLayoutModal: false,
     panelPreset: "default",
     customLayouts: initialCustomLayouts,
+
+    // Onboarding
+    onboardingComplete: onboardingComplete,
 
     // Settings
     showSettings: false,
@@ -1140,8 +1151,9 @@ export const useStore = create<AppState>((set, get) => {
       const id = "sess-" + Date.now();
       const newTitle = title || `New session - ${new Date().toISOString().slice(0, 16)}`;
       const sessions = get().sessions.map((s) => ({ ...s, active: false }));
-      sessions.push({ id, title: newTitle, active: true });
+      sessions.push({ id, title: newTitle, active: true, openTabs: [] });
       set({ sessions, activeSessionId: id });
+      localStorage.setItem("lsn_sessions", JSON.stringify(sessions));
     },
     closeSession: (id) => {
       const current = get().sessions;
@@ -1153,10 +1165,12 @@ export const useStore = create<AppState>((set, get) => {
       }
       const updated = filtered.map((s) => ({ ...s, active: s.id === activeId }));
       set({ sessions: updated, activeSessionId: activeId });
+      localStorage.setItem("lsn_sessions", JSON.stringify(updated));
     },
     selectSession: (id) => {
       const updated = get().sessions.map((s) => ({ ...s, active: s.id === id }));
       set({ sessions: updated, activeSessionId: id });
+      localStorage.setItem("lsn_sessions", JSON.stringify(updated));
     },
     setShowSearchModal: (show) => set({ showSearchModal: show }),
     setTopbarViewMode: (mode) => set({ topbarViewMode: mode }),
@@ -1164,6 +1178,12 @@ export const useStore = create<AppState>((set, get) => {
     // Launcher & Panel Arrangement Actions (Iteration 3)
     setShowLauncherModal: (show) => set({ showLauncherModal: show }),
     setShowPanelLayoutModal: (show) => set({ showPanelLayoutModal: show }),
+
+    // Onboarding
+    completeOnboarding: () => {
+      set({ onboardingComplete: true });
+      localStorage.setItem("lsn_onboarding_complete", "true");
+    },
 
     applyPanelPreset: (preset) => {
       set({ panelPreset: preset });

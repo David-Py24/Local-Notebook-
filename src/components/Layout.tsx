@@ -7,6 +7,7 @@ import StudyBoard from "./StudyBoard";
 import SettingsModal from "./SettingsModal";
 import WorkspaceLauncherModal from "./WorkspaceLauncherModal";
 import PanelLayoutModal from "./PanelLayoutModal";
+import WelcomeOnboarding from "./WelcomeOnboarding";
 import PanelDragHandle, { PANEL_DRAG_MIME } from "./PanelDragHandle";
 import { useStore, SidePanelId } from "../stores/useStore";
 
@@ -156,6 +157,9 @@ export default function Layout() {
 
       {/* Panel Layout Customizer Modal */}
       <PanelLayoutModal />
+
+      {/* Welcome / Onboarding Overlay */}
+      <WelcomeOnboarding />
     </div>
   );
 }
