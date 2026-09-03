@@ -29,7 +29,7 @@ This is an **additive, opt-in mode**, not a replacement:
 
 The original draft assumed `npm install -g opencode-ai`, requiring a Node.js runtime most students won't have. Confirmed OpenCode ships standalone binaries:
 
-- **Windows**: `winget install OpenCode.OpenCode`, or the signed MSI, or a portable binary release — none require Node.js.
+- **Windows**: `winget install SST.opencode` (verified against `winget search opencode` — the ID `OpenCode.OpenCode` used in an earlier draft does not exist; `SST.OpenCodeDesktop` is a separate GUI app, not the CLI this integration needs), or the signed MSI, or a portable binary release — none require Node.js.
 - **macOS/Linux**: `curl -fsSL https://opencode.ai/install | bash` — downloads a standalone binary, no Node.js required either.
 
 `check_opencode_installed()` should run `opencode --version` regardless of *how* it was installed — detection doesn't change, only the install-guidance copy shown to the user does (point at winget/MSI on Windows, the curl script elsewhere, not `npm install -g`).

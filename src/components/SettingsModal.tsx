@@ -718,7 +718,7 @@ export default function SettingsModal() {
                       {(() => {
                         // Detect platform for the correct install command
                         const isWin = navigator.userAgent.toLowerCase().includes("windows");
-                        return isWin ? "Install: winget install OpenCode.OpenCode" : "Install: curl -fsSL https://opencode.ai/install | bash";
+                        return isWin ? "Install: winget install SST.opencode" : "Install: curl -fsSL https://opencode.ai/install | bash";
                       })()}
                     </span>
                   </div>

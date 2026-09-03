@@ -58,7 +58,7 @@ interface OpenCodeSSEEvent {
 
 // Platform-specific install commands (spec: no npm install -g, use winget/curl)
 const INSTALL_INSTRUCTIONS = {
-  windows: "winget install OpenCode.OpenCode",
+  windows: "winget install SST.opencode",
   other: "curl -fsSL https://opencode.ai/install | bash",
 };
 
