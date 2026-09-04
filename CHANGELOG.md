@@ -2,6 +2,36 @@
 
 All notable changes to the Local Study Notebook are documented in this file.
 
+## [1.4.0] - 2026-09-04
+
+### Added
+- **AI Agent Panel** (`AgentPanel.tsx`): dedicated panel for AI agent interactions.
+- **Artifacts Panel** (`ArtifactsPanel.tsx`): view and manage AI-generated artifacts.
+- **Editor Context Menu** (`EditorContextMenu.tsx`): right-click context menu in the markdown editor for quick formatting actions.
+- **Move Confirm Modal** (`MoveConfirmModal.tsx`): confirmation dialog when moving files between folders.
+- **Edge Resizer** (`EdgeResizer.tsx`): draggable edge component for panel resizing.
+- **Provider Presets** (`providerPresets.ts`): pre-configured AI provider settings for common services.
+
+### Changed
+- **SourcesPanel**: significantly expanded with richer file/folder management and context menu support.
+- **StudyBoard**: major expansion with improved editor integration and note handling.
+- **WelcomeOnboarding**: expanded onboarding flow with additional guidance.
+- **AssistantPanel**: refactored and improved AI assistant integration.
+- **Layout**: restructured panel layout with improved resizer behavior.
+- **TopBar**: updated action bar with new controls.
+- **Navbar**: added new navigation items.
+- **SettingsModal**: updated with new settings sections.
+
+### Improved
+- AI provider service hardened with provider presets and better error handling.
+- Zustand store extended with new state slices and actions for expanded functionality.
+
+### Documentation
+- Added OpenRouter hardening report.
+- Added sources table SQL schema reference.
+
+---
+
 ## [1.3.0] - 2026-09-03
 
 ### Added
