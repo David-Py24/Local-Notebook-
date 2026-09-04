@@ -4,6 +4,7 @@ import { THEMES } from "../themes";
 import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { testAIConnection } from "../services/aiProvider";
+import { getProviderPreset } from "../services/providerPresets";
 
 type SettingSection = "general" | "appearance" | "editor" | "files" | "project" | "ai_byok" | "about";
 type UpdateStatus = "idle" | "checking" | "up-to-date" | "available" | "downloading" | "error";
@@ -494,31 +495,9 @@ export default function SettingsModal() {
                   value={settings.aiProvider}
                   onChange={(e) => {
                     const provider = e.target.value;
-                    let defaultUrl = settings.aiBaseUrl;
-                    let defaultModel = settings.aiModelName;
-
-                    if (provider === "ollama_hermes") {
-                      defaultUrl = "http://localhost:11434/v1";
-                      defaultModel = "hermes3:8b";
-                    } else if (provider === "openrouter") {
-                      defaultUrl = "https://openrouter.ai/api/v1";
-                      defaultModel = "nousresearch/hermes-3-llama-3.1-405b";
-                    } else if (provider === "openai") {
-                      defaultUrl = "https://api.openai.com/v1";
-                      defaultModel = "gpt-4o-mini";
-                    } else if (provider === "anthropic") {
-                      // claude-3-5-sonnet-20241022 was retired 2025-10-28; see
-                      // https://platform.claude.com/docs/en/about-claude/model-deprecations
-                      defaultUrl = "https://api.anthropic.com/v1";
-                      defaultModel = "claude-sonnet-5";
-                    } else if (provider === "gemini") {
-                      // Gemini's native REST API has no /chat/completions route — Google's
-                      // OpenAI-compatibility layer lives under a separate /openai path.
-                      // gemini-2.0-flash is the recommended stable production model as of 2026.
-                      // Use fetchAvailableModels to discover all current models for your key.
-                      defaultUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
-                      defaultModel = "gemini-2.0-flash";
-                    }
+                    const preset = getProviderPreset(provider);
+                    const defaultUrl = preset?.defaultBaseUrl ?? settings.aiBaseUrl;
+                    const defaultModel = preset?.defaultModel ?? settings.aiModelName;
 
                     updateSettings({
                       aiProvider: provider,
@@ -620,6 +599,16 @@ export default function SettingsModal() {
                     </div>
                   </div>
                 )}
+
+                {availableModels.length > 0 &&
+                  !!settings.aiModelName &&
+                  !availableModels.includes(settings.aiModelName) && (
+                    <div className="rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-300">
+                      ⚠️ "{settings.aiModelName}" was not found in the live model list for this API key. It may have
+                      been deprecated or renamed. Pick one from the list above, or click "Fetch Available Models"
+                      again.
+                    </div>
+                  )}
 
               </div>
 

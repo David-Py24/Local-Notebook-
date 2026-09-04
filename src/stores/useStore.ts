@@ -7,7 +7,24 @@ import { streamAIResponse, ChatMessagePayload, fetchAvailableModels } from "../s
 
 export type ViewMode = "source" | "live" | "preview";
 export type SaveStatus = "saved" | "saving" | "unsaved";
-export type SidePanelId = "assistant" | "sources";
+export type SidePanelId = "assistant" | "sources" | "artifacts" | "agent";
+
+export interface Artifact {
+  id: string;
+  title: string;
+  type: "code" | "markdown" | "html";
+  content: string;
+  createdAt: number;
+}
+
+export interface AgentMessage {
+  id: string;
+  role: "user" | "agent";
+  text: string;
+  timestamp: number;
+}
+
+export type AgentTask = "summarize" | "improve" | "assess" | "custom";
 
 export interface CustomLayout {
   id: string;
@@ -15,8 +32,12 @@ export interface CustomLayout {
   panelOrder: SidePanelId[];
   showAssistantPanel: boolean;
   showSourcesPanel: boolean;
+  showArtifactsPanel: boolean;
+  showAgentPanel: boolean;
   assistantWidth: number;
   sourcePanelWidth: number;
+  artifactsWidth: number;
+  agentWidth: number;
   splitActive: boolean;
 }
 
@@ -160,6 +181,20 @@ interface AppState {
   rightLivePreviewActive: boolean;
   sourcePreviewHeight: number;
   sourcePanelWidth: number;
+  splitLeftWidth: number;   // pixel width of the left split pane (right pane absorbs the rest)
+
+  // Artifacts panel
+  showArtifactsPanel: boolean;
+  artifactsWidth: number;
+  activeArtifact: Artifact | null;
+  artifacts: Artifact[];
+
+  // Agent panel
+  showAgentPanel: boolean;
+  agentWidth: number;
+  agentMessages: AgentMessage[];
+  agentContext: string | null;
+  agentTask: AgentTask;
 
   // Settings
   showSettings: boolean;
@@ -183,6 +218,7 @@ interface AppState {
   createFolder: (parentPath: string, name: string) => Promise<string>;
   renameEntry: (oldPath: string, newPath: string) => Promise<void>;
   deleteEntry: (path: string) => Promise<void>;
+  moveEntries: (entries: { oldPath: string; newPath: string }[]) => Promise<void>;
 
   openFile: (path: string, panel?: "left" | "right") => Promise<void>;
   openNewNote: () => Promise<void>;
@@ -202,6 +238,21 @@ interface AppState {
   setSidebarTab: (t: "sources" | "notes") => void;
   setSourcePreviewHeight: (h: number) => void;
   setSourcePanelWidth: (w: number) => void;
+  setSplitLeftWidth: (w: number) => void;
+
+  // Artifacts actions
+  toggleArtifactsPanel: () => void;
+  setArtifactsWidth: (w: number) => void;
+  setActiveArtifact: (a: Artifact | null) => void;
+  addArtifact: (a: Artifact) => void;
+
+  // Agent actions
+  toggleAgentPanel: () => void;
+  setAgentWidth: (w: number) => void;
+  setAgentMessages: (msgs: AgentMessage[]) => void;
+  addAgentMessage: (msg: AgentMessage) => void;
+  setAgentContext: (ctx: string | null) => void;
+  setAgentTask: (task: AgentTask) => void;
 
   // Settings Actions
   setShowSettings: (show: boolean) => void;
@@ -217,6 +268,7 @@ interface AppState {
   isAssistantStreaming: boolean;
   assistantStatusText: string;
   availableModels: string[];                              // dynamically fetched from provider
+  assistantAbortController: AbortController | null;       // never persisted to localStorage
 
   // OpenCode Agent runtime state (never persisted to localStorage)
   assistantMode: "study" | "opencode";                   // which tab is active
@@ -225,6 +277,7 @@ interface AppState {
   opencodeServerPassword: string | null;                 // in-memory only, never persisted
 
   sendAssistantMessage: (text: string) => Promise<void>;
+  cancelAssistantMessage: () => void;
   clearAssistantMessages: () => void;
   setAssistantWidth: (w: number) => void;
   toggleAssistantPanel: () => void;
@@ -282,9 +335,13 @@ export const useStore = create<AppState>((set, get) => {
   const initialProjects: Project[] = localProjects ? JSON.parse(localProjects) : [];
   const localPanelOrder = localStorage.getItem("lsn_panel_order");
   const parsedPanelOrder: SidePanelId[] | null = localPanelOrder ? JSON.parse(localPanelOrder) : null;
+  const VALID_PANEL_IDS: SidePanelId[] = ["assistant", "sources", "artifacts", "agent"];
   const isValidPanelOrder =
     parsedPanelOrder &&
-    parsedPanelOrder.length === 2 &&
+    Array.isArray(parsedPanelOrder) &&
+    parsedPanelOrder.length >= 1 &&
+    parsedPanelOrder.length <= 4 &&
+    parsedPanelOrder.every((id) => VALID_PANEL_IDS.includes(id)) &&
     parsedPanelOrder.includes("assistant") &&
     parsedPanelOrder.includes("sources");
   const initialPanelOrder: SidePanelId[] = isValidPanelOrder ? parsedPanelOrder! : ["assistant", "sources"];
@@ -339,6 +396,20 @@ export const useStore = create<AppState>((set, get) => {
     leftLivePreviewActive: false,
     rightLivePreviewActive: false,
     sourcePreviewHeight: 250,
+    splitLeftWidth: 0,
+
+    // Artifacts
+    showArtifactsPanel: false,
+    artifactsWidth: 340,
+    activeArtifact: null,
+    artifacts: [],
+
+    // Agent
+    showAgentPanel: false,
+    agentWidth: 340,
+    agentMessages: [],
+    agentContext: null,
+    agentTask: "custom",
 
     // Assistant States
     showAssistantPanel: true,
@@ -462,6 +533,38 @@ export const useStore = create<AppState>((set, get) => {
         const activeRight = get().activeRightTabId === oldPath ? newPath : get().activeRightTabId;
 
         set({ leftTabs, rightTabs, activeLeftTabId: activeLeft, activeRightTabId: activeRight });
+        await get().refreshExplorer();
+      } catch (err) {
+        throw new Error(String(err));
+      }
+    },
+
+    moveEntries: async (entries) => {
+      try {
+        for (const entry of entries) {
+          await invoke("rename_local_entry", {
+            oldPath: entry.oldPath,
+            newPath: entry.newPath,
+            vaultRoot: get().currentFolderPath || undefined,
+          });
+
+          // Update open tabs that reference the old path
+          const updateTabs = (tabs: Tab[]) =>
+            tabs.map((t) => {
+              if (t.id === entry.oldPath) {
+                const name = entry.newPath.split(/[\\/]/).pop() ?? entry.newPath;
+                return { ...t, id: entry.newPath, title: name.replace(/\.md$/, "") };
+              }
+              return t;
+            });
+
+          const leftTabs = updateTabs(get().leftTabs);
+          const rightTabs = updateTabs(get().rightTabs);
+          const activeLeft = get().activeLeftTabId === entry.oldPath ? entry.newPath : get().activeLeftTabId;
+          const activeRight = get().activeRightTabId === entry.oldPath ? entry.newPath : get().activeRightTabId;
+
+          set({ leftTabs, rightTabs, activeLeftTabId: activeLeft, activeRightTabId: activeRight });
+        }
         await get().refreshExplorer();
       } catch (err) {
         throw new Error(String(err));
@@ -870,6 +973,17 @@ export const useStore = create<AppState>((set, get) => {
     setSidebarTab: (t) => set({ sidebarTab: t }),
     setSourcePreviewHeight: (h) => set({ sourcePreviewHeight: h }),
     setSourcePanelWidth: (w) => set({ sourcePanelWidth: w }),
+    setSplitLeftWidth: (w) => set({ splitLeftWidth: Math.max(w, 200) }),
+    toggleArtifactsPanel: () => set((s) => ({ showArtifactsPanel: !s.showArtifactsPanel })),
+    setArtifactsWidth: (w) => set({ artifactsWidth: w }),
+    setActiveArtifact: (a) => set({ activeArtifact: a }),
+    addArtifact: (a) => set((s) => ({ artifacts: [...s.artifacts, a], activeArtifact: a })),
+    toggleAgentPanel: () => set((s) => ({ showAgentPanel: !s.showAgentPanel })),
+    setAgentWidth: (w) => set({ agentWidth: w }),
+    setAgentMessages: (msgs) => set({ agentMessages: msgs }),
+    addAgentMessage: (msg) => set((s) => ({ agentMessages: [...s.agentMessages, msg] })),
+    setAgentContext: (ctx) => set({ agentContext: ctx }),
+    setAgentTask: (task) => set({ agentTask: task }),
     reorderPanels: (fromId, toId) => {
       const order = get().panelOrder;
       const fromIndex = order.indexOf(fromId);
@@ -946,6 +1060,7 @@ export const useStore = create<AppState>((set, get) => {
 
     isAssistantStreaming: false,
     assistantStatusText: "",
+    assistantAbortController: null,
     availableModels: [],
 
     // OpenCode Agent runtime state — never persisted (no localStorage)
@@ -1013,6 +1128,9 @@ export const useStore = create<AppState>((set, get) => {
 
       set({ assistantMessages: [...updatedMessages, assistantMsg] });
 
+      const controller = new AbortController();
+      set({ assistantAbortController: controller });
+
       try {
         const finalText = await streamAIResponse({
           messages: historyPayload,
@@ -1027,6 +1145,7 @@ export const useStore = create<AppState>((set, get) => {
           onStatusChange: (status) => {
             set({ assistantStatusText: status });
           },
+          signal: controller.signal,
         });
 
         // A successful request with no visible text usually means the provider blocked or
@@ -1046,21 +1165,26 @@ export const useStore = create<AppState>((set, get) => {
           }));
         }
       } catch (err) {
+        const wasCancelled = err instanceof DOMException && err.name === "AbortError";
         set((state) => ({
           assistantMessages: state.assistantMessages.map((m) =>
             m.id === assistantMsgId
               ? {
                   ...m,
-                  content:
-                    m.content ||
-                    `⚠️ Unable to connect to AI server at \`${store.settings.aiBaseUrl}\` (${String(err)}).\n\nCheck your endpoint configuration in **Settings -> AI & BYOK Model**.`,
+                  content: wasCancelled
+                    ? m.content || "_Cancelled._"
+                    : m.content ||
+                      `⚠️ Unable to connect to AI server at \`${store.settings.aiBaseUrl}\` (${String(err)}).\n\nCheck your endpoint configuration in **Settings -> AI & BYOK Model**.`,
                 }
               : m
           ),
         }));
       } finally {
-        set({ isAssistantStreaming: false, assistantStatusText: "" });
+        set({ isAssistantStreaming: false, assistantStatusText: "", assistantAbortController: null });
       }
+    },
+    cancelAssistantMessage: () => {
+      get().assistantAbortController?.abort();
     },
     clearAssistantMessages: () => set({ assistantMessages: [] }),
     setAssistantWidth: (w) => set({ assistantWidth: w }),
@@ -1188,13 +1312,13 @@ export const useStore = create<AppState>((set, get) => {
     applyPanelPreset: (preset) => {
       set({ panelPreset: preset });
       if (preset === "default") {
-        set({ showAssistantPanel: true, showSourcesPanel: true, assistantWidth: 360, sourcePanelWidth: 200, splitActive: false });
+        set({ showAssistantPanel: true, showSourcesPanel: true, showArtifactsPanel: false, showAgentPanel: false, assistantWidth: 360, sourcePanelWidth: 200, splitActive: false });
       } else if (preset === "focus") {
-        set({ showAssistantPanel: false, showSourcesPanel: false, splitActive: false });
+        set({ showAssistantPanel: false, showSourcesPanel: false, showArtifactsPanel: false, showAgentPanel: false, splitActive: false });
       } else if (preset === "assistant") {
-        set({ showAssistantPanel: true, showSourcesPanel: false, assistantWidth: 420, splitActive: false });
+        set({ showAssistantPanel: true, showSourcesPanel: false, showArtifactsPanel: false, showAgentPanel: false, assistantWidth: 420, splitActive: false });
       } else if (preset === "explorer") {
-        set({ showAssistantPanel: false, showSourcesPanel: true, sourcePanelWidth: 240, splitActive: false });
+        set({ showAssistantPanel: false, showSourcesPanel: true, showArtifactsPanel: false, showAgentPanel: false, sourcePanelWidth: 240, splitActive: false });
       }
     },
 
@@ -1205,8 +1329,12 @@ export const useStore = create<AppState>((set, get) => {
         panelOrder: get().panelOrder,
         showAssistantPanel: get().showAssistantPanel,
         showSourcesPanel: get().showSourcesPanel,
+        showArtifactsPanel: get().showArtifactsPanel,
+        showAgentPanel: get().showAgentPanel,
         assistantWidth: get().assistantWidth,
         sourcePanelWidth: get().sourcePanelWidth,
+        artifactsWidth: get().artifactsWidth,
+        agentWidth: get().agentWidth,
         splitActive: get().splitActive,
       };
       const customLayouts = [...get().customLayouts, layout];
@@ -1221,8 +1349,12 @@ export const useStore = create<AppState>((set, get) => {
         panelOrder: layout.panelOrder,
         showAssistantPanel: layout.showAssistantPanel,
         showSourcesPanel: layout.showSourcesPanel,
+        showArtifactsPanel: layout.showArtifactsPanel,
+        showAgentPanel: layout.showAgentPanel,
         assistantWidth: layout.assistantWidth,
         sourcePanelWidth: layout.sourcePanelWidth,
+        artifactsWidth: layout.artifactsWidth,
+        agentWidth: layout.agentWidth,
         splitActive: layout.splitActive,
         panelPreset: "custom",
       });

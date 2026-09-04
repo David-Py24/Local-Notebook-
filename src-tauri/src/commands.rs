@@ -504,17 +504,24 @@ pub fn create_local_file(
         return Err("Target parent is not a directory".to_string());
     }
 
-    let file_path = target_dir.join(file_name);
+    let file_path = target_dir.join(&file_name);
     let valid_file_path = validate_vault_path(&file_path.to_string_lossy(), vault_root.as_deref())?;
 
     if valid_file_path.exists() {
         return Err("File already exists".to_string());
     }
 
-    std::fs::write(&valid_file_path, "").map_err(|e| e.to_string())?;
+    let initial_content = if file_name.ends_with(".md") || file_name.ends_with(".markdown") {
+        let title = file_name.trim_end_matches(".md").trim_end_matches(".markdown");
+        format!("# {}\n", title)
+    } else {
+        String::new()
+    };
+
+    std::fs::write(&valid_file_path, &initial_content).map_err(|e| e.to_string())?;
 
     if let Ok(conn) = state.vault_index.lock() {
-        let _ = upsert_file_index(&conn, &valid_file_path, "");
+        let _ = upsert_file_index(&conn, &valid_file_path, &initial_content);
     }
 
     Ok(valid_file_path.to_string_lossy().into_owned())

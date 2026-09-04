@@ -5,6 +5,8 @@ export default function Navbar() {
   const toggleSidebar = useStore((s) => s.toggleSourcesPanel);
   const showAssistant = useStore((s) => s.showAssistantPanel);
   const toggleAssistant = useStore((s) => s.toggleAssistantPanel);
+  const showAgent = useStore((s) => s.showAgentPanel);
+  const toggleAgent = useStore((s) => s.toggleAgentPanel);
   const openNewNote = useStore((s) => s.openNewNote);
   const setShowSettings = useStore((s) => s.setShowSettings);
 
@@ -39,6 +41,21 @@ export default function Navbar() {
         >
           <svg className="w-4.5 h-4.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+          </svg>
+        </button>
+
+        {/* Agent Panel Toggle (Lightning / Focus Icon) */}
+        <button
+          onClick={toggleAgent}
+          title="Toggle Agent Panel"
+          className={`flex h-9 w-9 items-center justify-center rounded-md transition-colors cursor-pointer ${
+            showAgent
+              ? "bg-accent text-white shadow-sm"
+              : "text-muted hover:bg-bg hover:text-white"
+          }`}
+        >
+          <svg className="w-4.5 h-4.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
           </svg>
         </button>
 

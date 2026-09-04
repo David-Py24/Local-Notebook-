@@ -1,6 +1,52 @@
 import { Settings } from "../stores/useStore";
 import { WORKSPACE_TOOLS, executeWorkspaceTool } from "./workspaceTools";
 
+const DEFAULT_CONNECT_TIMEOUT_MS = 30_000;
+const PROBE_TIMEOUT_MS = 15_000;
+const MAX_429_RETRIES = 2;
+
+function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; cleanup: () => void } {
+  // The abort listener deliberately stays attached after cleanup() — cleanup only cancels
+  // the connect-phase timer. Keeping the forward from `signal` to `controller` alive for the
+  // life of the request lets a user-triggered abort (e.g. a Stop button) still cut off an
+  // in-progress SSE stream, not just the initial connection.
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(signal?.reason);
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => controller.abort(new DOMException("Timed out", "TimeoutError")), timeoutMs);
+  return {
+    signal: controller.signal,
+    cleanup: () => clearTimeout(timer),
+  };
+}
+
+function isTimeoutError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "TimeoutError";
+}
+
+function getRetryDelayMs(res: Response, attempt: number): number {
+  const retryAfter = res.headers.get("retry-after");
+  if (retryAfter) {
+    const secs = Number(retryAfter);
+    if (!Number.isNaN(secs)) return Math.min(secs * 1000, 10_000);
+  }
+  return Math.min(1000 * 2 ** attempt, 8000);
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(t);
+        reject(new DOMException("Cancelled", "AbortError"));
+      },
+      { once: true }
+    );
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic Model Discovery
 // ---------------------------------------------------------------------------
@@ -20,8 +66,9 @@ export async function fetchAvailableModels(
   if (apiKey?.trim()) {
     headers["Authorization"] = `Bearer ${apiKey.trim()}`;
   }
+  const { signal, cleanup } = withTimeout(undefined, PROBE_TIMEOUT_MS);
   try {
-    const res = await fetch(`${cleanUrl}/models`, { method: "GET", headers });
+    const res = await fetch(`${cleanUrl}/models`, { method: "GET", headers, signal });
     if (!res.ok) return [];
     const data = await res.json();
     // Standard OpenAI-compat shape: { data: [ { id, object }, ... ] }
@@ -44,6 +91,8 @@ export async function fetchAvailableModels(
       .sort();
   } catch {
     return [];
+  } finally {
+    cleanup();
   }
 }
 
@@ -68,17 +117,29 @@ export async function testAIConnection(
     return { ok: false, message: shapeIssue };
   }
 
-  try {
-    const res = await fetch(`${cleanUrl}/models`, {
-      method: "GET",
-      headers: key ? { Authorization: `Bearer ${key}` } : {},
-    });
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      return { ok: false, message: formatApiError(res.status, res.statusText, errText) };
+  {
+    const { signal, cleanup } = withTimeout(undefined, PROBE_TIMEOUT_MS);
+    try {
+      const res = await fetch(`${cleanUrl}/models`, {
+        method: "GET",
+        headers: key ? { Authorization: `Bearer ${key}` } : {},
+        signal,
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        return { ok: false, message: formatApiError(res.status, res.statusText, errText) };
+      }
+    } catch (err) {
+      if (isTimeoutError(err)) {
+        return {
+          ok: false,
+          message: `Timed out waiting for ${cleanUrl} after ${PROBE_TIMEOUT_MS / 1000}s. The server may be slow, unreachable, or rate-limiting silently.`,
+        };
+      }
+      return { ok: false, message: `Could not reach ${cleanUrl}: ${String(err)}` };
+    } finally {
+      cleanup();
     }
-  } catch (err) {
-    return { ok: false, message: `Could not reach ${cleanUrl}: ${String(err)}` };
   }
 
   // Many OpenAI-compatible providers (OpenRouter included) expose GET /models publicly —
@@ -86,6 +147,7 @@ export async function testAIConnection(
   // works, so run one minimal authenticated chat request to actually validate it here,
   // instead of the user finding out on their first real message.
   if (key && model) {
+    const { signal, cleanup } = withTimeout(undefined, PROBE_TIMEOUT_MS);
     try {
       const res = await fetch(`${cleanUrl}/chat/completions`, {
         method: "POST",
@@ -94,13 +156,22 @@ export async function testAIConnection(
           Authorization: `Bearer ${key}`,
         },
         body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }], max_tokens: 1, stream: false }),
+        signal,
       });
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
         return { ok: false, message: formatApiError(res.status, res.statusText, errText) };
       }
     } catch (err) {
+      if (isTimeoutError(err)) {
+        return {
+          ok: false,
+          message: `Timed out waiting for ${cleanUrl} after ${PROBE_TIMEOUT_MS / 1000}s. The server may be slow, unreachable, or rate-limiting silently.`,
+        };
+      }
       return { ok: false, message: `Could not reach ${cleanUrl}: ${String(err)}` };
+    } finally {
+      cleanup();
     }
   }
 
@@ -161,7 +232,7 @@ function formatApiError(status: number, statusText: string, errText: string): st
     case 402:
       return `Out of credits (HTTP 402): ${detail}. Add credits or switch to a free-tier model (e.g. "google/gemini-2.0-flash-exp:free") in Settings -> AI & BYOK Model.`;
     case 429:
-      return `Rate limited (HTTP 429): ${detail}. Wait a moment before sending another message, or reduce request frequency.`;
+      return `Rate limited (HTTP 429) after automatic retries: ${detail}. OpenRouter free-tier models are often rate-limited — wait longer, or switch models in Settings -> AI & BYOK Model.`;
     default:
       return `AI request failed (HTTP ${status}): ${detail}`;
   }
@@ -226,8 +297,9 @@ export async function streamAIResponse(options: {
   onChunk: (text: string) => void;
   onToolCall?: (toolName: string, args: Record<string, any>) => void;
   onStatusChange?: (status: string) => void;
+  signal?: AbortSignal;
 }): Promise<string> {
-  const { settings, onChunk, onToolCall, onStatusChange } = options;
+  const { settings, onChunk, onToolCall, onStatusChange, signal: externalSignal } = options;
   const baseUrl = (settings.aiBaseUrl || "http://localhost:11434/v1").replace(/\/+$/, "");
   const endpoint = `${baseUrl}/chat/completions`;
   const model = settings.aiModelName || "hermes3:8b";
@@ -266,15 +338,33 @@ export async function streamAIResponse(options: {
 
   onStatusChange?.("Connecting...");
 
+  async function postOnce(): Promise<Response> {
+    const { signal, cleanup } = withTimeout(externalSignal, DEFAULT_CONNECT_TIMEOUT_MS);
+    try {
+      return await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        signal,
+      });
+    } finally {
+      cleanup();
+    }
+  }
+
   let response: Response;
   try {
-    response = await fetch(endpoint, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-    });
+    response = await postOnce();
   } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError" && externalSignal?.aborted) {
+      throw err;
+    }
     const isLocal = baseUrl.includes("localhost") || baseUrl.includes("127.0.0.1");
+    if (isTimeoutError(err)) {
+      throw new Error(
+        `Timed out connecting to ${endpoint} after ${DEFAULT_CONNECT_TIMEOUT_MS / 1000}s. The server may be slow, unreachable, or rate-limiting silently.`
+      );
+    }
     if (isLocal) {
       throw new Error(
         `Could not reach ${endpoint}. Make sure your local model server (e.g. Ollama) is installed and running — try "ollama run ${model}" in a terminal, then send your message again.`
@@ -285,17 +375,22 @@ export async function streamAIResponse(options: {
     );
   }
 
+  let retryAttempt = 0;
+  while (response.status === 429 && retryAttempt < MAX_429_RETRIES) {
+    const delay = getRetryDelayMs(response, retryAttempt);
+    onStatusChange?.(`Rate limited — retrying in ${Math.round(delay / 1000)}s...`);
+    await sleep(delay, externalSignal);
+    retryAttempt++;
+    response = await postOnce();
+  }
+
   if (!response.ok) {
     const errText = await response.text().catch(() => "");
 
     if (payload.tools && isLikelyToolIncompatibility(response.status, errText)) {
       delete payload.tools;
       payload.messages = stripToolArtifactsFromHistory(currentMessages);
-      response = await fetch(endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-      });
+      response = await postOnce();
     }
 
     if (!response.ok) {
@@ -415,6 +510,7 @@ export async function streamAIResponse(options: {
       onChunk,
       onToolCall,
       onStatusChange,
+      signal: externalSignal,
     });
   }
 

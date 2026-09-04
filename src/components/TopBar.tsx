@@ -12,6 +12,8 @@ export default function TopBar() {
   const showAssistantPanel = useStore((s) => s.showAssistantPanel);
   const toggleSourcesPanel = useStore((s) => s.toggleSourcesPanel);
   const showSourcesPanel = useStore((s) => s.showSourcesPanel);
+  const toggleArtifactsPanel = useStore((s) => s.toggleArtifactsPanel);
+  const showArtifactsPanel = useStore((s) => s.showArtifactsPanel);
   const splitActive = useStore((s) => s.splitActive);
   const splitScreen = useStore((s) => s.splitScreen);
   const closeSplit = useStore((s) => s.closeSplit);
@@ -169,13 +171,13 @@ export default function TopBar() {
             </svg>
           </button>
 
-          {/* Icon 3: Bottom Panel Toggle */}
+          {/* Icon 3: Artifacts Panel Toggle */}
           <button
-            onClick={() => {
-              // Bottom pane toggle
-            }}
-            title="Toggle Bottom Terminal/Preview Pane"
-            className="flex h-7 w-7 items-center justify-center rounded text-muted hover:bg-card hover:text-white cursor-pointer transition-colors"
+            onClick={toggleArtifactsPanel}
+            title="Toggle Artifacts Panel"
+            className={`flex h-7 w-7 items-center justify-center rounded transition-colors cursor-pointer ${
+              showArtifactsPanel ? "bg-[#33353d] text-white" : "text-muted hover:bg-card hover:text-white"
+            }`}
           >
             <svg className="w-4 h-4 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
               <rect x="3" y="3" width="18" height="18" rx="2" />

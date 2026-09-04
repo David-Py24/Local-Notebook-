@@ -1,13 +1,14 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { useStore, Tab, ViewMode } from "../stores/useStore";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import MarkdownEditor from "./MarkdownEditor";
 import BacklinksPanel from "./BacklinksPanel";
+import EditorContextMenu from "./EditorContextMenu";
+import EdgeResizer from "./EdgeResizer";
 
 export const TAB_DRAG_MIME = "application/x-lsn-tab";
 
-// Cycle order for the view-mode toggle button: live -> source -> preview -> live
 const NEXT_VIEW_MODE: Record<ViewMode, ViewMode> = {
   live: "source",
   source: "preview",
@@ -19,21 +20,33 @@ export default function StudyBoard() {
   const activePanel = useStore((s) => s.activePanel);
   const setActivePanel = useStore((s) => s.setActivePanel);
   const moveTab = useStore((s) => s.moveTab);
+  const splitLeftWidth = useStore((s) => s.splitLeftWidth);
+  const setSplitLeftWidth = useStore((s) => s.setSplitLeftWidth);
   const [splitDropActive, setSplitDropActive] = useState(false);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  const leftWidth = splitLeftWidth > 0 ? splitLeftWidth : (containerRef.current?.clientWidth ?? 800) / 2;
+
+  const handleSplitResize = (delta: number) => {
+    const containerWidth = containerRef.current?.clientWidth ?? 800;
+    if (containerWidth <= 0) return;
+    const next = Math.min(Math.max(leftWidth + delta, 200), containerWidth - 200);
+    setSplitLeftWidth(next);
+  };
+
+  const leftStyle = splitActive ? { flex: `0 0 ${leftWidth}px` } : { flex: "1 1 0%" };
+  const rightStyle = splitActive ? { flex: `1 1 0%` } : {};
 
   return (
-    <div className="flex h-full w-full gap-1">
-      {/* Left / Main Editor Pane */}
+    <div ref={containerRef} className="flex h-full w-full gap-1">
       <div
         onClick={() => setActivePanel("left")}
-        className={`relative flex-1 flex flex-col h-full overflow-hidden panel-rounded bg-card transition-colors ${
+        style={leftStyle}
+        className={`relative flex flex-col h-full overflow-hidden panel-rounded bg-card transition-colors ${
           activePanel === "left" && splitActive ? "border border-accent/60" : "border-r border-border/40"
         }`}
       >
         <EditorPanel panel="left" />
-
-        {/* Drop zone that auto-creates the split pane when a tab is dragged to the edge
-            while unsplit — otherwise there's nothing to drop onto yet. */}
         {!splitActive && (
           <div
             onDragOver={(e) => {
@@ -58,16 +71,19 @@ export default function StudyBoard() {
         )}
       </div>
 
-      {/* Right Split Pane (if active) */}
       {splitActive && (
-        <div
-          onClick={() => setActivePanel("right")}
-          className={`flex-1 flex flex-col h-full overflow-hidden panel-rounded bg-card transition-colors ${
-            activePanel === "right" ? "border border-accent/60" : "border-l border-border/40"
-          }`}
-        >
-          <EditorPanel panel="right" />
-        </div>
+        <>
+          <EdgeResizer onResize={handleSplitResize} />
+          <div
+            onClick={() => setActivePanel("right")}
+            style={rightStyle}
+            className={`flex flex-col h-full overflow-hidden panel-rounded bg-card transition-colors ${
+              activePanel === "right" ? "border border-accent/60" : "border-l border-border/40"
+            }`}
+          >
+            <EditorPanel panel="right" />
+          </div>
+        </>
       )}
     </div>
   );
@@ -97,9 +113,12 @@ function EditorPanel({ panel }: EditorPanelProps) {
   const toggleSourcesPanel = useStore((s) => s.toggleSourcesPanel);
   const toggleAssistantPanel = useStore((s) => s.toggleAssistantPanel);
   const openNewNote = useStore((s) => s.openNewNote);
-  const fontSize = useStore((s) => s.settings.fontSize);
-  const fontFamily = useStore((s) => s.settings.fontFamily);
-  const showWordCount = useStore((s) => s.settings.showWordCount);
+  const settings = useStore((s) => s.settings);
+  const updateSettings = useStore((s) => s.updateSettings);
+  const fontSize = settings.fontSize;
+  const fontFamily = settings.fontFamily;
+  const showWordCount = settings.showWordCount;
+  const lineWrap = settings.lineWrap;
 
   const getFontFamilyStyle = (font: string) => {
     switch (font) {
@@ -115,19 +134,26 @@ function EditorPanel({ panel }: EditorPanelProps) {
 
   const [showOptions, setShowOptions] = useState(false);
   const [showMoreTabs, setShowMoreTabs] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [showTOC, setShowTOC] = useState(false);
+  const [showFindBar, setShowFindBar] = useState(false);
+  const [findQuery, setFindQuery] = useState("");
+  const [findIndex, setFindIndex] = useState(0);
+  const [findCount, setFindCount] = useState(0);
 
   const optionsRef = useRef<HTMLDivElement | null>(null);
   const moreTabsRef = useRef<HTMLDivElement | null>(null);
   const tabContainerRef = useRef<HTMLDivElement | null>(null);
+  const tocRef = useRef<HTMLDivElement | null>(null);
+  const findInputRef = useRef<HTMLInputElement | null>(null);
+  const editorContentRef = useRef<HTMLDivElement | null>(null);
 
   const activeTab = tabs.find((t) => t.id === activeTabId);
 
-  // Maximum 3 visible tabs calculation (Requirement: Only shows max 3 open tabs)
   const MAX_VISIBLE_TABS = 3;
   const visibleTabs = tabs.slice(0, MAX_VISIBLE_TABS);
   const hiddenTabs = tabs.slice(MAX_VISIBLE_TABS);
 
-  // If active tab is in hidden tabs, make sure active tab is visible
   let displayTabs = visibleTabs;
   if (activeTabId && !visibleTabs.some((t) => t.id === activeTabId)) {
     const activeObj = tabs.find((t) => t.id === activeTabId);
@@ -136,14 +162,12 @@ function EditorPanel({ panel }: EditorPanelProps) {
     }
   }
 
-  // Horizontal mouse scroll function for navigating tabs (Requirement)
   const handleTabWheelScroll = (e: React.WheelEvent) => {
     if (tabContainerRef.current) {
       tabContainerRef.current.scrollLeft += e.deltaY;
     }
   };
 
-  // Close options dropdowns on outside click
   useEffect(() => {
     const handleOutsideClick = (e: MouseEvent) => {
       if (optionsRef.current && !optionsRef.current.contains(e.target as Node)) {
@@ -152,20 +176,77 @@ function EditorPanel({ panel }: EditorPanelProps) {
       if (moreTabsRef.current && !moreTabsRef.current.contains(e.target as Node)) {
         setShowMoreTabs(false);
       }
+      if (tocRef.current && !tocRef.current.contains(e.target as Node)) {
+        setShowTOC(false);
+      }
     };
     window.addEventListener("mousedown", handleOutsideClick);
     return () => window.removeEventListener("mousedown", handleOutsideClick);
   }, []);
 
+  useEffect(() => {
+    if (showFindBar && findInputRef.current) {
+      findInputRef.current.focus();
+      findInputRef.current.select();
+    }
+  }, [showFindBar]);
+
+  useEffect(() => {
+    if (!findQuery || !draft) { setFindCount(0); setFindIndex(0); return; }
+    const regex = new RegExp(findQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    const matches = draft.match(regex);
+    setFindCount(matches ? matches.length : 0);
+    setFindIndex(0);
+  }, [findQuery, draft]);
+
+  const tocHeadings = useMemo(() => {
+    if (!draft) return [];
+    const lines = draft.split(/\r?\n/);
+    const headings: { level: number; text: string; line: number }[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^(#{1,6})\s+(.+)/);
+      if (m) {
+        headings.push({ level: m[1].length, text: m[2].replace(/[*_`~\[\]]/g, ""), line: i });
+      }
+    }
+    return headings;
+  }, [draft]);
+
   const isPinned = activeTabId ? pinnedPaths.includes(activeTabId) : false;
+
+  const handleContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({ x: e.clientX, y: e.clientY });
+  };
+
+  const handleCopyAsFile = async () => {
+    if (!activeTabId || !draft) { setShowOptions(false); return; }
+    const blob = new Blob([draft], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = (activeTabId.split(/[\\/]/).pop()) || "note.md";
+    a.click();
+    URL.revokeObjectURL(url);
+    setShowOptions(false);
+  };
+
+  const handlePrint = () => {
+    window.print();
+    setShowOptions(false);
+  };
+
+  const handleFontSize = (delta: number) => {
+    const next = Math.min(Math.max(fontSize + delta, 10), 28);
+    updateSettings({ fontSize: next });
+  };
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden relative">
       {/* Top Tab Bar */}
       <div className="flex h-9 shrink-0 items-center justify-between border-b border-border/30 bg-bg/30 px-2 select-none">
-        {/* Left Side: Layout toggle + Max 3 Tabs list + Overflow Dropdown + Scroll container */}
         <div className="flex items-center gap-1 min-w-0 flex-1 overflow-hidden">
-          {/* Sidebar Toggle Icon [||] */}
           <button
             onClick={() => toggleSourcesPanel()}
             title="Toggle Explorer Panel"
@@ -177,8 +258,6 @@ function EditorPanel({ panel }: EditorPanelProps) {
             </svg>
           </button>
 
-          {/* Tab container with horizontal wheel scroll; also a drop target for tabs
-              dragged over from the other split pane. */}
           <div
             ref={tabContainerRef}
             onWheel={handleTabWheelScroll}
@@ -238,7 +317,6 @@ function EditorPanel({ panel }: EditorPanelProps) {
               );
             })}
 
-            {/* Hidden tabs overflow badge indicator (+N more) */}
             {tabs.length > MAX_VISIBLE_TABS && (
               <div className="relative shrink-0" ref={moreTabsRef}>
                 <button
@@ -281,7 +359,6 @@ function EditorPanel({ panel }: EditorPanelProps) {
             )}
           </div>
 
-          {/* Add New Note (+) Button */}
           {isLeft && (
             <button
               onClick={() => openNewNote()}
@@ -296,9 +373,8 @@ function EditorPanel({ panel }: EditorPanelProps) {
           )}
         </div>
 
-        {/* Right Controls of Tab Bar */}
+        {/* Right Controls */}
         <div className="flex items-center gap-1 shrink-0 ml-2">
-          {/* View mode cycle: live (Obsidian-style rendered markdown) -> source (raw) -> preview (full reading view) -> live */}
           <button
             onClick={() => setPanelViewMode(panel, NEXT_VIEW_MODE[viewMode])}
             title={`Switch to ${NEXT_VIEW_MODE[viewMode]}`}
@@ -319,7 +395,7 @@ function EditorPanel({ panel }: EditorPanelProps) {
             )}
           </button>
 
-          {/* Options Menu */}
+          {/* Enhanced Options Menu */}
           <div className="relative" ref={optionsRef}>
             <button
               onClick={() => setShowOptions(!showOptions)}
@@ -334,13 +410,67 @@ function EditorPanel({ panel }: EditorPanelProps) {
             </button>
 
             {showOptions && (
-              <div className="absolute right-0 top-7 z-30 flex w-44 flex-col rounded-md border border-border bg-card p-1 text-xs text-text shadow-xl">
+              <div className="absolute right-0 top-7 z-30 flex w-52 flex-col rounded-md border border-border bg-card p-1 text-xs text-text shadow-xl max-h-[80vh] overflow-y-auto scrollbar-thin">
+                {/* View Section */}
+                <div className="px-2 py-1 text-[10px] font-semibold uppercase text-muted">View</div>
+                <div className="flex items-center justify-between rounded px-2.5 py-1.5 hover:bg-accent hover:text-white cursor-pointer transition-colors">
+                  <span>Font Size</span>
+                  <div className="flex items-center gap-1">
+                    <button onClick={() => handleFontSize(-1)} className="rounded px-1.5 py-0.5 text-[10px] font-bold bg-bg/60 hover:bg-accent cursor-pointer">A-</button>
+                    <span className="text-[10px] font-mono w-5 text-center">{fontSize}</span>
+                    <button onClick={() => handleFontSize(1)} className="rounded px-1.5 py-0.5 text-[10px] font-bold bg-bg/60 hover:bg-accent cursor-pointer">A+</button>
+                  </div>
+                </div>
+                <button
+                  onClick={() => { updateSettings({ lineWrap: !lineWrap }); setShowOptions(false); }}
+                  className="flex items-center justify-between rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors"
+                >
+                  <span>Line Wrap</span>
+                  <span className={`text-[10px] font-mono ${lineWrap ? "text-accent" : "text-muted"}`}>{lineWrap ? "ON" : "OFF"}</span>
+                </button>
+                <button
+                  onClick={() => { updateSettings({ showWordCount: !showWordCount }); setShowOptions(false); }}
+                  className="flex items-center justify-between rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors"
+                >
+                  <span>Word Count</span>
+                  <span className={`text-[10px] font-mono ${showWordCount ? "text-accent" : "text-muted"}`}>{showWordCount ? "ON" : "OFF"}</span>
+                </button>
+
+                <div className="h-px bg-border/60 my-0.5" />
+
+                {/* Export Section */}
+                <div className="px-2 py-1 text-[10px] font-semibold uppercase text-muted">Export</div>
+                <button onClick={handleCopyAsFile} className="rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors">
+                  Export as File
+                </button>
+                <button onClick={handlePrint} className="rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors">
+                  Print Note
+                </button>
+
+                <div className="h-px bg-border/60 my-0.5" />
+
+                {/* Navigate Section */}
+                <div className="px-2 py-1 text-[10px] font-semibold uppercase text-muted">Navigate</div>
+                <button
+                  onClick={() => { setShowFindBar(true); setShowOptions(false); }}
+                  className="rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors"
+                >
+                  Search in Note
+                </button>
+                <button
+                  onClick={() => { setShowTOC(!showTOC); setShowOptions(false); }}
+                  className="rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors"
+                >
+                  Table of Contents
+                </button>
+
+                <div className="h-px bg-border/60 my-0.5" />
+
+                {/* Pane Section */}
+                <div className="px-2 py-1 text-[10px] font-semibold uppercase text-muted">Pane</div>
                 {activeTabId && (
                   <button
-                    onClick={() => {
-                      togglePinPath(activeTabId);
-                      setShowOptions(false);
-                    }}
+                    onClick={() => { togglePinPath(activeTabId); setShowOptions(false); }}
                     className="rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors"
                   >
                     {isPinned ? "Unpin Note" : "Pin Note"}
@@ -348,31 +478,21 @@ function EditorPanel({ panel }: EditorPanelProps) {
                 )}
                 {isLeft ? (
                   <button
-                    onClick={() => {
-                      splitScreen();
-                      setShowOptions(false);
-                    }}
+                    onClick={() => { splitScreen(); setShowOptions(false); }}
                     className="rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors"
                   >
                     Split Screen Side-by-Side
                   </button>
                 ) : (
                   <button
-                    onClick={() => {
-                      closeSplit();
-                      setShowOptions(false);
-                    }}
-                    className="rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors text-red-400"
+                    onClick={() => { closeSplit(); setShowOptions(false); }}
+                    className="rounded px-2.5 py-1.5 text-left text-red-400 hover:bg-red-500 hover:text-white cursor-pointer transition-colors"
                   >
                     Close Split Pane
                   </button>
                 )}
-                <div className="h-px bg-border/60 my-0.5" />
                 <button
-                  onClick={() => {
-                    toggleAssistantPanel();
-                    setShowOptions(false);
-                  }}
+                  onClick={() => { toggleAssistantPanel(); setShowOptions(false); }}
                   className="rounded px-2.5 py-1.5 text-left text-muted hover:bg-bg hover:text-white cursor-pointer transition-colors"
                 >
                   Toggle Assistant Panel
@@ -383,8 +503,43 @@ function EditorPanel({ panel }: EditorPanelProps) {
         </div>
       </div>
 
-      {/* Main Document Workspace (Fine-grained word/sentence syntax reveal) */}
-      <div className="flex-1 overflow-y-auto w-full bg-card scrollbar-thin">
+      {/* Find in Note Bar */}
+      {showFindBar && (
+        <div className="flex items-center gap-2 border-b border-border/30 bg-bg/40 px-3 py-1.5 shrink-0">
+          <svg className="w-3.5 h-3.5 text-muted shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="11" cy="11" r="8" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+          <input
+            ref={findInputRef}
+            value={findQuery}
+            onChange={(e) => setFindQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") { setShowFindBar(false); setFindQuery(""); }
+            }}
+            placeholder="Find in note..."
+            className="flex-1 bg-transparent text-xs text-text outline-none placeholder:text-muted"
+          />
+          {findQuery && (
+            <span className="text-[10px] text-muted font-mono shrink-0">
+              {findCount > 0 ? `${findIndex + 1}/${findCount}` : "No results"}
+            </span>
+          )}
+          <button
+            onClick={() => { setShowFindBar(false); setFindQuery(""); }}
+            className="text-muted hover:text-white text-[10px] cursor-pointer"
+          >
+            ESC
+          </button>
+        </div>
+      )}
+
+      {/* Main Document Workspace */}
+      <div
+        ref={editorContentRef}
+        onContextMenu={handleContextMenu}
+        className="flex-1 overflow-y-auto w-full bg-card scrollbar-thin"
+      >
         {tabs.length === 0 || !activeTabId || !activeTab ? (
           <div className="flex h-full flex-col items-center justify-center p-8 text-center select-none text-muted">
             <div className="h-10 w-10 rounded-full border border-border bg-bg/40 flex items-center justify-center mb-3">
@@ -409,13 +564,10 @@ function EditorPanel({ panel }: EditorPanelProps) {
             style={{ fontSize: `${fontSize}px`, fontFamily: getFontFamilyStyle(fontFamily) }}
           >
             {viewMode === "preview" ? (
-              /* Full Document Preview */
               <div className="markdown-preview leading-relaxed tracking-normal">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>{draft || "*Empty document...*"}</ReactMarkdown>
               </div>
             ) : (
-              /* CodeMirror 6 editor — "live" renders Obsidian-style inline formatting
-                 with syntax hidden except on the active line; "source" shows raw markdown. */
               <MarkdownEditor
                 key={activeTabId}
                 value={draft}
@@ -427,9 +579,35 @@ function EditorPanel({ panel }: EditorPanelProps) {
         )}
       </div>
 
+      {/* Table of Contents Overlay */}
+      {showTOC && tocHeadings.length > 0 && (
+        <div
+          ref={tocRef}
+          className="absolute right-2 top-12 z-40 w-56 max-h-64 overflow-y-auto rounded-md border border-border bg-card p-2 shadow-xl scrollbar-thin"
+        >
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-[10px] font-semibold uppercase text-muted">Table of Contents</span>
+            <button onClick={() => setShowTOC(false)} className="text-muted hover:text-white text-[10px] cursor-pointer">✕</button>
+          </div>
+          <div className="space-y-0.5">
+            {tocHeadings.map((h, i) => (
+              <div
+                key={i}
+                onClick={() => setShowTOC(false)}
+                className="rounded px-2 py-1 text-[11px] hover:bg-accent hover:text-white cursor-pointer transition-colors truncate"
+                style={{ paddingLeft: `${(h.level - 1) * 12 + 8}px` }}
+              >
+                <span className="text-muted font-mono text-[9px] mr-1">H{h.level}</span>
+                {h.text}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <BacklinksPanel activeTabId={activeTabId} panel={panel} />
 
-      {/* Editor Status Bar (Word count, char count, mode indicator) */}
+      {/* Editor Status Bar */}
       {activeTabId && (
         <div className="flex h-6 shrink-0 items-center justify-between border-t border-border/20 bg-bg/20 px-3 text-[11px] text-muted select-none">
           <div className="flex items-center gap-3">
@@ -446,6 +624,18 @@ function EditorPanel({ panel }: EditorPanelProps) {
             <span className="capitalize">{viewMode} mode</span>
           </div>
         </div>
+      )}
+
+      {/* Context Menu */}
+      {contextMenu && (
+        <EditorContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          onClose={() => setContextMenu(null)}
+          activeTabId={activeTabId}
+          panel={panel}
+          draft={draft}
+        />
       )}
     </div>
   );

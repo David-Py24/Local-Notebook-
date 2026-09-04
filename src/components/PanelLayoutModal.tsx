@@ -17,6 +17,16 @@ export default function PanelLayoutModal() {
   const sourcePanelWidth = useStore((s) => s.sourcePanelWidth);
   const setSourcePanelWidth = useStore((s) => s.setSourcePanelWidth);
 
+  const showArtifactsPanel = useStore((s) => s.showArtifactsPanel);
+  const toggleArtifactsPanel = useStore((s) => s.toggleArtifactsPanel);
+  const artifactsWidth = useStore((s) => s.artifactsWidth);
+  const setArtifactsWidth = useStore((s) => s.setArtifactsWidth);
+
+  const showAgentPanel = useStore((s) => s.showAgentPanel);
+  const toggleAgentPanel = useStore((s) => s.toggleAgentPanel);
+  const agentWidth = useStore((s) => s.agentWidth);
+  const setAgentWidth = useStore((s) => s.setAgentWidth);
+
   const splitActive = useStore((s) => s.splitActive);
   const splitScreen = useStore((s) => s.splitScreen);
   const closeSplit = useStore((s) => s.closeSplit);
@@ -227,6 +237,60 @@ export default function PanelLayoutModal() {
               <span className="text-[10px] text-muted font-mono">
                 {splitActive ? "Side-by-side" : "Single pane"}
               </span>
+            </div>
+
+            {/* Artifacts Panel Toggle & Width */}
+            <div className="flex items-center justify-between p-2.5 rounded-lg border border-border/60 bg-bg/20">
+              <div className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={showArtifactsPanel}
+                  onChange={toggleArtifactsPanel}
+                  className="rounded accent-accent cursor-pointer"
+                />
+                <span className="text-xs font-medium text-text">Artifacts Panel</span>
+              </div>
+              {showArtifactsPanel && (
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] text-muted font-mono">{artifactsWidth}px</span>
+                  <input
+                    type="range"
+                    min={260}
+                    max={600}
+                    step={10}
+                    value={artifactsWidth}
+                    onChange={(e) => setArtifactsWidth(Number(e.target.value))}
+                    className="w-24 accent-accent cursor-pointer"
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Agent Panel Toggle & Width */}
+            <div className="flex items-center justify-between p-2.5 rounded-lg border border-border/60 bg-bg/20">
+              <div className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={showAgentPanel}
+                  onChange={toggleAgentPanel}
+                  className="rounded accent-accent cursor-pointer"
+                />
+                <span className="text-xs font-medium text-text">Agent Panel</span>
+              </div>
+              {showAgentPanel && (
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] text-muted font-mono">{agentWidth}px</span>
+                  <input
+                    type="range"
+                    min={260}
+                    max={600}
+                    step={10}
+                    value={agentWidth}
+                    onChange={(e) => setAgentWidth(Number(e.target.value))}
+                    className="w-24 accent-accent cursor-pointer"
+                  />
+                </div>
+              )}
             </div>
           </div>
         </div>

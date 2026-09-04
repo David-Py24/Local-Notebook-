@@ -2,10 +2,12 @@ import { useState, useRef, useEffect } from "react";
 import { useStore } from "../stores/useStore";
 import ReactMarkdown from "react-markdown";
 import OpenCodeView from "./OpenCodeView";
+import { PROVIDER_PRESETS, getProviderPreset } from "../services/providerPresets";
 
 export default function AssistantPanel() {
   const assistantMessages = useStore((s) => s.assistantMessages);
   const sendAssistantMessage = useStore((s) => s.sendAssistantMessage);
+  const cancelAssistantMessage = useStore((s) => s.cancelAssistantMessage);
   const clearAssistantMessages = useStore((s) => s.clearAssistantMessages);
   const isAssistantStreaming = useStore((s) => s.isAssistantStreaming);
   const assistantStatusText = useStore((s) => s.assistantStatusText);
@@ -35,11 +37,7 @@ export default function AssistantPanel() {
   const attachMenuRef = useRef<HTMLDivElement | null>(null);
 
   const modelsList = [
-    { id: "ollama_hermes", model: "hermes3:8b", name: "Nous Hermes 3 (Local)", icon: "🦙", desc: "Offline function tool calling agent" },
-    { id: "openrouter", model: "nousresearch/hermes-3-llama-3.1-405b", name: "Nous Hermes 3 (OpenRouter)", icon: "🌐", desc: "Online 405B reasoning & synthesis" },
-    { id: "openai", model: "gpt-4o-mini", name: "OpenAI GPT-4o Mini", icon: "⚡", desc: "Fast & lightweight cloud reasoning" },
-    { id: "anthropic", model: "claude-sonnet-5", name: "Claude Sonnet 5", icon: "✨", desc: "Deep study & synthesis model" },
-    { id: "gemini", model: "gemini-2.0-flash", name: "Google Gemini", icon: "💎", desc: "Multimodal study tutor — Hermes tools compatible" },
+    ...PROVIDER_PRESETS.map((p) => ({ id: p.id, model: p.defaultModel, name: p.name, icon: p.icon, desc: p.desc })),
     { id: "custom", model: settings.aiModelName || "custom-model", name: "Custom Endpoint", icon: "⚙️", desc: "vLLM / LM Studio / Local Proxy" },
   ];
 
@@ -352,13 +350,7 @@ export default function AssistantPanel() {
                       <button
                         key={m.id}
                         onClick={() => {
-                          let defaultUrl = settings.aiBaseUrl;
-                          if (m.id === "ollama_hermes") defaultUrl = "http://localhost:11434/v1";
-                          else if (m.id === "openrouter") defaultUrl = "https://openrouter.ai/api/v1";
-                          else if (m.id === "openai") defaultUrl = "https://api.openai.com/v1";
-                          else if (m.id === "anthropic") defaultUrl = "https://api.anthropic.com/v1";
-                          else if (m.id === "gemini") defaultUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
-
+                          const defaultUrl = getProviderPreset(m.id)?.defaultBaseUrl ?? settings.aiBaseUrl;
 
                           updateSettings({
                             aiProvider: m.id,
@@ -385,22 +377,34 @@ export default function AssistantPanel() {
               </div>
             </div>
 
-            {/* Right: Send Submit Button (↑) */}
-            <button
-              onClick={handleSend}
-              disabled={!inputVal.trim()}
-              className={`flex h-7 w-7 items-center justify-center rounded-md transition-all ${
-                inputVal.trim()
-                  ? "bg-accent text-white shadow-sm hover:bg-accent-hover cursor-pointer scale-100"
-                  : "bg-border/40 text-muted cursor-not-allowed opacity-50"
-              }`}
-              title="Send message"
-            >
-              <svg className="w-4 h-4 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <line x1="12" y1="19" x2="12" y2="5" />
-                <polyline points="5 12 12 5 19 12" />
-              </svg>
-            </button>
+            {/* Right: Send / Stop Button */}
+            {isAssistantStreaming ? (
+              <button
+                onClick={cancelAssistantMessage}
+                className="flex h-7 w-7 items-center justify-center rounded-md bg-red-500/90 text-white shadow-sm hover:bg-red-500 cursor-pointer transition-all"
+                title="Stop generating"
+              >
+                <svg className="w-3 h-3 fill-current" viewBox="0 0 24 24">
+                  <rect x="5" y="5" width="14" height="14" rx="2" />
+                </svg>
+              </button>
+            ) : (
+              <button
+                onClick={handleSend}
+                disabled={!inputVal.trim()}
+                className={`flex h-7 w-7 items-center justify-center rounded-md transition-all ${
+                  inputVal.trim()
+                    ? "bg-accent text-white shadow-sm hover:bg-accent-hover cursor-pointer scale-100"
+                    : "bg-border/40 text-muted cursor-not-allowed opacity-50"
+                }`}
+                title="Send message"
+              >
+                <svg className="w-4 h-4 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="12" y1="19" x2="12" y2="5" />
+                  <polyline points="5 12 12 5 19 12" />
+                </svg>
+              </button>
+            )}
           </div>
         </div>
       </div>
