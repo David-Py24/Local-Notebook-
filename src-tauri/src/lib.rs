@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod git;
 
 use db::DbState;
 use tauri::Manager;
@@ -37,7 +38,10 @@ pub fn run() {
             // OpenCode Agent process management
             commands::check_opencode_installed,
             commands::spawn_opencode_server,
-            commands::kill_opencode_server
+            commands::kill_opencode_server,
+            // Git work-tree status + file diff (Work-Tree panel)
+            git::git_status,
+            git::git_diff_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

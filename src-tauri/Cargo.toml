@@ -17,6 +17,11 @@ tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Git work-tree status + file diffs (Work-Tree panel). Only local operations, so
+# network features (ssh/https, openssl) are disabled to keep Windows builds clean.
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
 

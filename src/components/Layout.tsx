@@ -4,6 +4,7 @@ import AssistantPanel from "./AssistantPanel";
 import SourcesPanel from "./SourcesPanel";
 import ArtifactsPanel from "./ArtifactsPanel";
 import AgentPanel from "./AgentPanel";
+import WorkTreePanel from "./WorkTreePanel";
 import StudyBoard from "./StudyBoard";
 import SettingsModal from "./SettingsModal";
 import WorkspaceLauncherModal from "./WorkspaceLauncherModal";
@@ -33,6 +34,10 @@ export default function Layout() {
   const agentWidth = useStore((s) => s.agentWidth);
   const setAgentWidth = useStore((s) => s.setAgentWidth);
 
+  const showWorkTreePanel = useStore((s) => s.showWorkTreePanel);
+  const workTreeWidth = useStore((s) => s.workTreeWidth);
+  const setWorkTreeWidth = useStore((s) => s.setWorkTreeWidth);
+
   const cornerRoundness = useStore((s) => s.settings.cornerRoundness);
 
   const handleAssistantResize = (delta: number) => {
@@ -55,6 +60,11 @@ export default function Layout() {
     setAgentWidth(next);
   };
 
+  const handleWorkTreeResize = (delta: number) => {
+    const next = Math.min(Math.max(workTreeWidth - delta, 240), 600);
+    setWorkTreeWidth(next);
+  };
+
   const panelConfig: Record<
     SidePanelId,
     { visible: boolean; width: number; onResize: (delta: number) => void; Component: React.ComponentType }
@@ -63,6 +73,7 @@ export default function Layout() {
     sources: { visible: showSourcesPanel, width: sourcePanelWidth, onResize: handleSourcesResize, Component: SourcesPanel },
     artifacts: { visible: showArtifactsPanel, width: artifactsWidth, onResize: handleArtifactsResize, Component: ArtifactsPanel },
     agent: { visible: showAgentPanel, width: agentWidth, onResize: handleAgentResize, Component: AgentPanel },
+    worktree: { visible: showWorkTreePanel, width: workTreeWidth, onResize: handleWorkTreeResize, Component: WorkTreePanel },
   };
 
   const roundnessStyle =
@@ -125,6 +136,15 @@ export default function Layout() {
             <EdgeResizer onResize={handleAgentResize} />
             <div style={{ width: agentWidth }} className="relative shrink-0 h-full">
               <AgentPanel />
+            </div>
+          </div>
+        )}
+
+        {showWorkTreePanel && !panelOrder.includes("worktree") && (
+          <div className="contents">
+            <EdgeResizer onResize={handleWorkTreeResize} />
+            <div style={{ width: workTreeWidth }} className="relative shrink-0 h-full">
+              <WorkTreePanel />
             </div>
           </div>
         )}

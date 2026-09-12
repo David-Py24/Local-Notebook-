@@ -1,13 +1,13 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { getThemeById, applyThemeToDocument } from "../themes";
-import type { Project } from "../types";
+import type { Project, GitRepoStatus, GitStatusEntry } from "../types";
 import { streamAIResponse, ChatMessagePayload, fetchAvailableModels } from "../services/aiProvider";
 
 
 export type ViewMode = "source" | "live" | "preview";
 export type SaveStatus = "saved" | "saving" | "unsaved";
-export type SidePanelId = "assistant" | "sources" | "artifacts" | "agent";
+export type SidePanelId = "assistant" | "sources" | "artifacts" | "agent" | "worktree";
 
 export interface Artifact {
   id: string;
@@ -39,6 +39,9 @@ export interface CustomLayout {
   artifactsWidth: number;
   agentWidth: number;
   splitActive: boolean;
+  // Work-Tree panel (optional so layouts saved before the panel existed load cleanly)
+  showWorkTreePanel?: boolean;
+  workTreeWidth?: number;
 }
 
 export interface FileEntry {
@@ -49,9 +52,11 @@ export interface FileEntry {
 }
 
 export interface Tab {
-  id: string; // absolute file path
+  id: string; // absolute file path (diff tabs append "#diff" / "#diff-staged")
   title: string;
   pinned: boolean;
+  kind?: "document" | "diff";
+  diffStaged?: boolean;
 }
 
 export interface SessionTab {
@@ -196,6 +201,14 @@ interface AppState {
   agentContext: string | null;
   agentTask: AgentTask;
 
+  // Work-Tree (git) panel
+  showWorkTreePanel: boolean;
+  workTreeWidth: number;
+  gitStatus: GitRepoStatus | null;
+  gitStatusLoading: boolean;
+  gitStatusError: string | null;
+  diffContents: Record<string, string>;
+
   // Settings
   showSettings: boolean;
   settings: Settings;
@@ -253,6 +266,13 @@ interface AppState {
   addAgentMessage: (msg: AgentMessage) => void;
   setAgentContext: (ctx: string | null) => void;
   setAgentTask: (task: AgentTask) => void;
+
+  // Work-Tree (git) actions
+  toggleWorkTreePanel: () => void;
+  setWorkTreeWidth: (w: number) => void;
+  refreshGitStatus: () => Promise<void>;
+  openGitFile: (entry: GitStatusEntry) => Promise<void>;
+  openGitDiff: (path: string, staged: boolean, panel?: "left" | "right") => Promise<void>;
 
   // Settings Actions
   setShowSettings: (show: boolean) => void;
@@ -335,12 +355,12 @@ export const useStore = create<AppState>((set, get) => {
   const initialProjects: Project[] = localProjects ? JSON.parse(localProjects) : [];
   const localPanelOrder = localStorage.getItem("lsn_panel_order");
   const parsedPanelOrder: SidePanelId[] | null = localPanelOrder ? JSON.parse(localPanelOrder) : null;
-  const VALID_PANEL_IDS: SidePanelId[] = ["assistant", "sources", "artifacts", "agent"];
+  const VALID_PANEL_IDS: SidePanelId[] = ["assistant", "sources", "artifacts", "agent", "worktree"];
   const isValidPanelOrder =
     parsedPanelOrder &&
     Array.isArray(parsedPanelOrder) &&
     parsedPanelOrder.length >= 1 &&
-    parsedPanelOrder.length <= 4 &&
+    parsedPanelOrder.length <= 5 &&
     parsedPanelOrder.every((id) => VALID_PANEL_IDS.includes(id)) &&
     parsedPanelOrder.includes("assistant") &&
     parsedPanelOrder.includes("sources");
@@ -365,6 +385,8 @@ export const useStore = create<AppState>((set, get) => {
   // Local write timer refs managed inside store callbacks
   let leftSaveTimer: number | null = null;
   let rightSaveTimer: number | null = null;
+  // Debounced git status refresh after a file write (Work-Tree panel)
+  let gitRefreshTimer: number | null = null;
 
   return {
     // Explorer States
@@ -411,6 +433,14 @@ export const useStore = create<AppState>((set, get) => {
     agentContext: null,
     agentTask: "custom",
 
+    // Work-Tree (git)
+    showWorkTreePanel: false,
+    workTreeWidth: 320,
+    gitStatus: null,
+    gitStatusLoading: false,
+    gitStatusError: null,
+    diffContents: {},
+
     // Assistant States
     showAssistantPanel: true,
     assistantWidth: 380,
@@ -449,6 +479,7 @@ export const useStore = create<AppState>((set, get) => {
       set({ currentFolderPath: path });
       localStorage.setItem("lsn_last_folder", path);
       await get().refreshExplorer();
+      get().refreshGitStatus();
       // Full vault-index rescan (DATA-2) — fire-and-forget so a large vault's content
       // hashing doesn't delay the folder actually opening; incremental updates from
       // individual file operations keep the index current the rest of the time.
@@ -458,7 +489,7 @@ export const useStore = create<AppState>((set, get) => {
     },
 
     closeFolder: () => {
-      set({ currentFolderPath: null, explorerEntries: [], leftTabs: [], rightTabs: [], activeLeftTabId: null, activeRightTabId: null });
+      set({ currentFolderPath: null, explorerEntries: [], leftTabs: [], rightTabs: [], activeLeftTabId: null, activeRightTabId: null, gitStatus: null, gitStatusError: null });
       localStorage.removeItem("lsn_last_folder");
     },
 
@@ -489,6 +520,7 @@ export const useStore = create<AppState>((set, get) => {
           vaultRoot: get().currentFolderPath || undefined,
         });
         await get().refreshExplorer();
+        get().refreshGitStatus();
         return path;
       } catch (err) {
         throw new Error(String(err));
@@ -503,6 +535,7 @@ export const useStore = create<AppState>((set, get) => {
           vaultRoot: get().currentFolderPath || undefined,
         });
         await get().refreshExplorer();
+        get().refreshGitStatus();
         return path;
       } catch (err) {
         throw new Error(String(err));
@@ -534,6 +567,7 @@ export const useStore = create<AppState>((set, get) => {
 
         set({ leftTabs, rightTabs, activeLeftTabId: activeLeft, activeRightTabId: activeRight });
         await get().refreshExplorer();
+        get().refreshGitStatus();
       } catch (err) {
         throw new Error(String(err));
       }
@@ -566,6 +600,7 @@ export const useStore = create<AppState>((set, get) => {
           set({ leftTabs, rightTabs, activeLeftTabId: activeLeft, activeRightTabId: activeRight });
         }
         await get().refreshExplorer();
+        get().refreshGitStatus();
       } catch (err) {
         throw new Error(String(err));
       }
@@ -583,6 +618,7 @@ export const useStore = create<AppState>((set, get) => {
         get().closeTab("right", path);
         
         await get().refreshExplorer();
+        get().refreshGitStatus();
       } catch (err) {
         throw new Error(String(err));
       }
@@ -716,20 +752,30 @@ export const useStore = create<AppState>((set, get) => {
       if (isLeft) {
         set({ leftTabs: newTabs, activeLeftTabId: nextActive });
         if (nextActive) {
-          try {
-            const c = await invoke<string>("read_local_file", { path: nextActive });
-            set({ leftDraft: c, leftSaveStatus: "saved" });
-          } catch {}
+          const nextIsDiff = (newTabs.find((t) => t.id === nextActive)?.kind ?? "document") === "diff";
+          if (nextIsDiff) {
+            set({ leftDraft: "", leftSaveStatus: "saved" });
+          } else {
+            try {
+              const c = await invoke<string>("read_local_file", { path: nextActive });
+              set({ leftDraft: c, leftSaveStatus: "saved" });
+            } catch {}
+          }
         } else {
           set({ leftDraft: "", leftSaveStatus: "saved" });
         }
       } else {
         set({ rightTabs: newTabs, activeRightTabId: nextActive });
         if (nextActive) {
-          try {
-            const c = await invoke<string>("read_local_file", { path: nextActive });
-            set({ rightDraft: c, rightSaveStatus: "saved" });
-          } catch {}
+          const nextIsDiff = (newTabs.find((t) => t.id === nextActive)?.kind ?? "document") === "diff";
+          if (nextIsDiff) {
+            set({ rightDraft: "", rightSaveStatus: "saved" });
+          } else {
+            try {
+              const c = await invoke<string>("read_local_file", { path: nextActive });
+              set({ rightDraft: c, rightSaveStatus: "saved" });
+            } catch {}
+          }
         } else {
           set({ rightDraft: "", rightSaveStatus: "saved" });
         }
@@ -742,6 +788,15 @@ export const useStore = create<AppState>((set, get) => {
       if (activeId === path) return;
 
       await get().flushPendingSave(panel);
+
+      // Diff tabs are virtual — their content lives in `diffContents`, not on disk.
+      const tabs = isLeft ? get().leftTabs : get().rightTabs;
+      const isDiff = (tabs.find((t) => t.id === path)?.kind ?? "document") === "diff";
+      if (isDiff) {
+        if (isLeft) set({ activeLeftTabId: path, leftDraft: "" });
+        else set({ activeRightTabId: path, rightDraft: "" });
+        return;
+      }
 
       if (isLeft) {
         set({ activeLeftTabId: path });
@@ -844,6 +899,15 @@ export const useStore = create<AppState>((set, get) => {
         } else {
           set({ rightTabs: updateTabTitle(get().rightTabs) });
         }
+
+        // The on-disk working tree changed — refresh the git panel (debounced).
+        if (get().showWorkTreePanel) {
+          if (gitRefreshTimer !== null) window.clearTimeout(gitRefreshTimer);
+          gitRefreshTimer = window.setTimeout(() => {
+            gitRefreshTimer = null;
+            get().refreshGitStatus();
+          }, 600);
+        }
       } catch (err) {
         if (isLeft) set({ leftSaveStatus: "unsaved" }); else set({ rightSaveStatus: "unsaved" });
         console.error("Autosave failed", err);
@@ -905,7 +969,7 @@ export const useStore = create<AppState>((set, get) => {
 
       const fromTabs = fromIsLeft ? get().leftTabs : get().rightTabs;
       const tab = fromTabs.find((t) => t.id === path);
-      if (!tab) return;
+      if (!tab || (tab.kind ?? "document") === "diff") return;
 
       const fromActiveId = fromIsLeft ? get().activeLeftTabId : get().activeRightTabId;
       const isActiveInSource = fromActiveId === path;
@@ -984,6 +1048,64 @@ export const useStore = create<AppState>((set, get) => {
     addAgentMessage: (msg) => set((s) => ({ agentMessages: [...s.agentMessages, msg] })),
     setAgentContext: (ctx) => set({ agentContext: ctx }),
     setAgentTask: (task) => set({ agentTask: task }),
+    toggleWorkTreePanel: () => set((s) => ({ showWorkTreePanel: !s.showWorkTreePanel })),
+    setWorkTreeWidth: (w) => set({ workTreeWidth: w }),
+    refreshGitStatus: async () => {
+      const folderPath = get().currentFolderPath;
+      if (!folderPath || !get().showWorkTreePanel) return;
+      set({ gitStatusLoading: true, gitStatusError: null });
+      try {
+        const status = await invoke<GitRepoStatus>("git_status", { vaultRoot: folderPath });
+        set({ gitStatus: status, gitStatusLoading: false });
+      } catch (err) {
+        set({ gitStatusLoading: false, gitStatusError: String(err) });
+      }
+    },
+    openGitFile: async (entry) => {
+      const status = get().gitStatus;
+      if (!status) return;
+      const abs = status.root.replace(/\\/g, "/") + "/" + entry.path;
+      await get().openFile(abs);
+    },
+    openGitDiff: async (path, staged, panel) => {
+      const targetPanel = panel || get().activePanel;
+      const isLeft = targetPanel === "left";
+      const tabs = isLeft ? get().leftTabs : get().rightTabs;
+      const tabId = staged ? `${path}#diff-staged` : `${path}#diff`;
+
+      await get().flushPendingSave(targetPanel);
+
+      const existing = tabs.find((t) => t.id === tabId);
+      if (existing) {
+        if (isLeft) set({ activeLeftTabId: tabId }); else set({ activeRightTabId: tabId });
+      } else {
+        const filename = path.split(/[\\/]/).pop() ?? "file";
+        const tab: Tab = {
+          id: tabId,
+          title: `${filename}${staged ? " (staged)" : ""}`,
+          pinned: false,
+          kind: "diff",
+          diffStaged: staged,
+        };
+        if (isLeft) set({ leftTabs: [...tabs, tab], activeLeftTabId: tabId });
+        else set({ rightTabs: [...tabs, tab], activeRightTabId: tabId });
+      }
+
+      if (isLeft) set({ leftDraft: "", leftSaveStatus: "saved" });
+      else set({ rightDraft: "", rightSaveStatus: "saved" });
+
+      set({ diffContents: { ...get().diffContents, [tabId]: "" } });
+      try {
+        const patch = await invoke<string | null>("git_diff_file", {
+          vaultRoot: get().currentFolderPath || undefined,
+          path,
+          staged,
+        });
+        set({ diffContents: { ...get().diffContents, [tabId]: patch ?? "" } });
+      } catch (err) {
+        set({ diffContents: { ...get().diffContents, [tabId]: `// Failed to load diff: ${String(err)}` } });
+      }
+    },
     reorderPanels: (fromId, toId) => {
       const order = get().panelOrder;
       const fromIndex = order.indexOf(fromId);
@@ -1312,13 +1434,13 @@ export const useStore = create<AppState>((set, get) => {
     applyPanelPreset: (preset) => {
       set({ panelPreset: preset });
       if (preset === "default") {
-        set({ showAssistantPanel: true, showSourcesPanel: true, showArtifactsPanel: false, showAgentPanel: false, assistantWidth: 360, sourcePanelWidth: 200, splitActive: false });
+        set({ showAssistantPanel: true, showSourcesPanel: true, showArtifactsPanel: false, showAgentPanel: false, showWorkTreePanel: false, assistantWidth: 360, sourcePanelWidth: 200, splitActive: false });
       } else if (preset === "focus") {
-        set({ showAssistantPanel: false, showSourcesPanel: false, showArtifactsPanel: false, showAgentPanel: false, splitActive: false });
+        set({ showAssistantPanel: false, showSourcesPanel: false, showArtifactsPanel: false, showAgentPanel: false, showWorkTreePanel: false, splitActive: false });
       } else if (preset === "assistant") {
-        set({ showAssistantPanel: true, showSourcesPanel: false, showArtifactsPanel: false, showAgentPanel: false, assistantWidth: 420, splitActive: false });
+        set({ showAssistantPanel: true, showSourcesPanel: false, showArtifactsPanel: false, showAgentPanel: false, showWorkTreePanel: false, assistantWidth: 420, splitActive: false });
       } else if (preset === "explorer") {
-        set({ showAssistantPanel: false, showSourcesPanel: true, showArtifactsPanel: false, showAgentPanel: false, sourcePanelWidth: 240, splitActive: false });
+        set({ showAssistantPanel: false, showSourcesPanel: true, showArtifactsPanel: false, showAgentPanel: false, showWorkTreePanel: false, sourcePanelWidth: 240, splitActive: false });
       }
     },
 
@@ -1336,6 +1458,8 @@ export const useStore = create<AppState>((set, get) => {
         artifactsWidth: get().artifactsWidth,
         agentWidth: get().agentWidth,
         splitActive: get().splitActive,
+        showWorkTreePanel: get().showWorkTreePanel,
+        workTreeWidth: get().workTreeWidth,
       };
       const customLayouts = [...get().customLayouts, layout];
       set({ customLayouts, panelPreset: "custom" });
@@ -1356,6 +1480,8 @@ export const useStore = create<AppState>((set, get) => {
         artifactsWidth: layout.artifactsWidth,
         agentWidth: layout.agentWidth,
         splitActive: layout.splitActive,
+        showWorkTreePanel: layout.showWorkTreePanel ?? false,
+        workTreeWidth: layout.workTreeWidth ?? 320,
         panelPreset: "custom",
       });
       localStorage.setItem("lsn_panel_order", JSON.stringify(layout.panelOrder));

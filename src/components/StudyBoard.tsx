@@ -6,6 +6,7 @@ import MarkdownEditor from "./MarkdownEditor";
 import BacklinksPanel from "./BacklinksPanel";
 import EditorContextMenu from "./EditorContextMenu";
 import EdgeResizer from "./EdgeResizer";
+import DiffView from "./DiffView";
 
 export const TAB_DRAG_MIME = "application/x-lsn-tab";
 
@@ -280,7 +281,7 @@ function EditorPanel({ panel }: EditorPanelProps) {
               return (
                 <div
                   key={tab.id}
-                  draggable
+                  draggable={tab.kind !== "diff"}
                   onDragStart={(e) => {
                     e.dataTransfer.setData(TAB_DRAG_MIME, JSON.stringify({ panel, path: tab.id }));
                     e.dataTransfer.effectAllowed = "move";
@@ -292,7 +293,9 @@ function EditorPanel({ panel }: EditorPanelProps) {
                       : "text-muted hover:bg-card/60 hover:text-text"
                   }`}
                 >
-                  {isMd ? (
+                  {tab.kind === "diff" ? (
+                    <span className="text-[9px] text-amber-400 font-mono font-bold">⇄</span>
+                  ) : isMd ? (
                     <span className="text-[9px] text-cyan-400 font-mono font-bold">M+</span>
                   ) : (
                     <svg className="w-3 h-3 stroke-current shrink-0 text-muted" viewBox="0 0 24 24" fill="none" strokeWidth="2">
@@ -563,7 +566,9 @@ function EditorPanel({ panel }: EditorPanelProps) {
             className="max-w-4xl mx-auto w-full min-h-full px-8 py-8 flex flex-col space-y-1"
             style={{ fontSize: `${fontSize}px`, fontFamily: getFontFamilyStyle(fontFamily) }}
           >
-            {viewMode === "preview" ? (
+            {activeTab.kind === "diff" ? (
+              <DiffView tabId={activeTab.id} staged={activeTab.diffStaged === true} />
+            ) : viewMode === "preview" ? (
               <div className="markdown-preview leading-relaxed tracking-normal">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>{draft || "*Empty document...*"}</ReactMarkdown>
               </div>

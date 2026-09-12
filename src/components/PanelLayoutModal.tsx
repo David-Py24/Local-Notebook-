@@ -27,6 +27,11 @@ export default function PanelLayoutModal() {
   const agentWidth = useStore((s) => s.agentWidth);
   const setAgentWidth = useStore((s) => s.setAgentWidth);
 
+  const showWorkTreePanel = useStore((s) => s.showWorkTreePanel);
+  const toggleWorkTreePanel = useStore((s) => s.toggleWorkTreePanel);
+  const workTreeWidth = useStore((s) => s.workTreeWidth);
+  const setWorkTreeWidth = useStore((s) => s.setWorkTreeWidth);
+
   const splitActive = useStore((s) => s.splitActive);
   const splitScreen = useStore((s) => s.splitScreen);
   const closeSplit = useStore((s) => s.closeSplit);
@@ -287,6 +292,33 @@ export default function PanelLayoutModal() {
                     step={10}
                     value={agentWidth}
                     onChange={(e) => setAgentWidth(Number(e.target.value))}
+                    className="w-24 accent-accent cursor-pointer"
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Work-Tree Panel Toggle & Width */}
+            <div className="flex items-center justify-between p-2.5 rounded-lg border border-border/60 bg-bg/20">
+              <div className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={showWorkTreePanel}
+                  onChange={toggleWorkTreePanel}
+                  className="rounded accent-accent cursor-pointer"
+                />
+                <span className="text-xs font-medium text-text">Work-Tree Panel</span>
+              </div>
+              {showWorkTreePanel && (
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] text-muted font-mono">{workTreeWidth}px</span>
+                  <input
+                    type="range"
+                    min={240}
+                    max={600}
+                    step={10}
+                    value={workTreeWidth}
+                    onChange={(e) => setWorkTreeWidth(Number(e.target.value))}
                     className="w-24 accent-accent cursor-pointer"
                   />
                 </div>

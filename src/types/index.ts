@@ -27,6 +27,33 @@ export interface OpenTab {
   dirty: boolean;
 }
 
+export type FileChangeKind =
+  | "added"
+  | "modified"
+  | "deleted"
+  | "renamed"
+  | "untracked"
+  | "conflicted";
+
+export interface GitStatusEntry {
+  /** path relative to the repository root (forward slashes) */
+  path: string;
+  kind: FileChangeKind;
+  staged: boolean;
+  /** previous path for renames */
+  oldPath?: string;
+}
+
+export interface GitRepoStatus {
+  /** false when the vault folder is not inside any git repository */
+  isRepo: boolean;
+  /** repository working-directory root */
+  root: string;
+  /** currently checked-out branch (null when detached/unborn) */
+  branch: string | null;
+  entries: GitStatusEntry[];
+}
+
 export interface Project {
   id: string;
   name: string;

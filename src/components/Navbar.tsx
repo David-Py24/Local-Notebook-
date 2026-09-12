@@ -7,6 +7,8 @@ export default function Navbar() {
   const toggleAssistant = useStore((s) => s.toggleAssistantPanel);
   const showAgent = useStore((s) => s.showAgentPanel);
   const toggleAgent = useStore((s) => s.toggleAgentPanel);
+  const showWorkTree = useStore((s) => s.showWorkTreePanel);
+  const toggleWorkTree = useStore((s) => s.toggleWorkTreePanel);
   const openNewNote = useStore((s) => s.openNewNote);
   const setShowSettings = useStore((s) => s.setShowSettings);
 
@@ -41,6 +43,24 @@ export default function Navbar() {
         >
           <svg className="w-4.5 h-4.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+          </svg>
+        </button>
+
+        {/* Work-Tree Toggle Button (Git Branch Icon) */}
+        <button
+          onClick={toggleWorkTree}
+          title="Toggle Work-Tree Panel"
+          className={`flex h-9 w-9 items-center justify-center rounded-md transition-colors cursor-pointer ${
+            showWorkTree
+              ? "bg-accent text-white shadow-sm"
+              : "text-muted hover:bg-bg hover:text-white"
+          }`}
+        >
+          <svg className="w-4.5 h-4.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="6" cy="6" r="3" />
+            <line x1="6" y1="9" x2="6" y2="15" />
+            <circle cx="18" cy="18" r="3" />
+            <path d="M18 15V9a4 4 0 0 0-4-4h-3" />
           </svg>
         </button>
 
