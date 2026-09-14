@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
-import { useStore } from "../stores/useStore";
+import { RefObject, useEffect, useRef, useState } from "react";
+import { useStore, ViewMode } from "../stores/useStore";
+import { BlockPrefixKind, MarkdownEditorHandle } from "./MarkdownEditor";
 
 interface EditorContextMenuProps {
   x: number;
@@ -8,10 +9,83 @@ interface EditorContextMenuProps {
   activeTabId: string | null;
   panel: "left" | "right";
   draft: string;
+  editorRef: RefObject<MarkdownEditorHandle | null>;
+  viewMode: ViewMode;
 }
 
-export default function EditorContextMenu({ x, y, onClose, activeTabId, panel, draft }: EditorContextMenuProps) {
+function MenuButton({ onClick, children, className = "" }: { onClick: () => void; children: React.ReactNode; className?: string }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors ${className}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function MenuGroup({
+  id,
+  label,
+  openGroup,
+  onOpen,
+  onRequestClose,
+  children,
+}: {
+  id: string;
+  label: string;
+  openGroup: string | null;
+  onOpen: (id: string) => void;
+  onRequestClose: () => void;
+  children: React.ReactNode;
+}) {
+  const isOpen = openGroup === id;
+  return (
+    <div
+      className="relative"
+      onMouseEnter={() => onOpen(id)}
+      onMouseLeave={onRequestClose}
+    >
+      <button className="flex w-full items-center justify-between rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors">
+        {label}
+        <span className="text-[9px] text-muted">▶</span>
+      </button>
+      {isOpen && (
+        <>
+          {/* Invisible bridge so the pointer never leaves the hoverable area while crossing the gap to the flyout */}
+          <div className="absolute left-full top-0 h-full w-2" />
+          <div className="absolute left-[calc(100%+0.5rem)] top-0 flex w-48 flex-col rounded-md border border-border bg-card p-1 text-xs text-text shadow-xl">
+            {children}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+export default function EditorContextMenu({ x, y, onClose, activeTabId, panel, draft, editorRef, viewMode }: EditorContextMenuProps) {
   const ref = useRef<HTMLDivElement | null>(null);
+  const [openGroup, setOpenGroup] = useState<string | null>(null);
+  const closeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearCloseTimeout = () => {
+    if (closeTimeoutRef.current) {
+      clearTimeout(closeTimeoutRef.current);
+      closeTimeoutRef.current = null;
+    }
+  };
+
+  const openMenuGroup = (id: string) => {
+    clearCloseTimeout();
+    setOpenGroup(id);
+  };
+
+  const requestCloseMenuGroup = () => {
+    clearCloseTimeout();
+    closeTimeoutRef.current = setTimeout(() => setOpenGroup(null), 350);
+  };
+
+  useEffect(() => clearCloseTimeout, []);
   const togglePinPath = useStore((s) => s.togglePinPath);
   const pinnedPaths = useStore((s) => s.pinnedPaths);
   const openFile = useStore((s) => s.openFile);
@@ -126,6 +200,28 @@ export default function EditorContextMenu({ x, y, onClose, activeTabId, panel, d
     onClose();
   };
 
+  const canFormat = viewMode !== "preview";
+
+  const applyWrap = (before: string, after?: string) => {
+    editorRef.current?.wrapSelection(before, after);
+    onClose();
+  };
+
+  const applyBlockPrefix = (kind: BlockPrefixKind) => {
+    editorRef.current?.setBlockPrefix(kind);
+    onClose();
+  };
+
+  const applyInsert = (template: string, cursorOffset?: number) => {
+    editorRef.current?.insertBlock(template, cursorOffset);
+    onClose();
+  };
+
+  const applyFootnote = () => {
+    editorRef.current?.insertFootnote();
+    onClose();
+  };
+
   return (
     <div
       ref={ref}
@@ -145,6 +241,44 @@ export default function EditorContextMenu({ x, y, onClose, activeTabId, panel, d
       <button onClick={handleSelectAll} className="rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors">
         Select All
       </button>
+
+      {canFormat && (
+        <>
+          <div className="h-px bg-border/60 my-0.5" />
+
+          <MenuGroup id="format" label="Format" openGroup={openGroup} onOpen={openMenuGroup} onRequestClose={requestCloseMenuGroup}>
+            <MenuButton onClick={() => applyWrap("**")}>Bold</MenuButton>
+            <MenuButton onClick={() => applyWrap("*")}>Italic</MenuButton>
+            <MenuButton onClick={() => applyWrap("~~")}>Strikethrough</MenuButton>
+            <MenuButton onClick={() => applyWrap("==")}>Highlight</MenuButton>
+            <MenuButton onClick={() => applyWrap("`")}>Code</MenuButton>
+          </MenuGroup>
+
+          <MenuGroup id="paragraph" label="Paragraph" openGroup={openGroup} onOpen={openMenuGroup} onRequestClose={requestCloseMenuGroup}>
+            <MenuButton onClick={() => applyBlockPrefix("bullet")}>Bullet list</MenuButton>
+            <MenuButton onClick={() => applyBlockPrefix("numbered")}>Numbered list</MenuButton>
+            <MenuButton onClick={() => applyBlockPrefix("task")}>Task list</MenuButton>
+            <div className="h-px bg-border/60 my-0.5" />
+            <MenuButton onClick={() => applyBlockPrefix("h1")}>Heading 1</MenuButton>
+            <MenuButton onClick={() => applyBlockPrefix("h2")}>Heading 2</MenuButton>
+            <MenuButton onClick={() => applyBlockPrefix("h3")}>Heading 3</MenuButton>
+            <MenuButton onClick={() => applyBlockPrefix("h4")}>Heading 4</MenuButton>
+            <MenuButton onClick={() => applyBlockPrefix("h5")}>Heading 5</MenuButton>
+            <MenuButton onClick={() => applyBlockPrefix("h6")}>Heading 6</MenuButton>
+            <div className="h-px bg-border/60 my-0.5" />
+            <MenuButton onClick={() => applyBlockPrefix("body")}>Body</MenuButton>
+            <MenuButton onClick={() => applyBlockPrefix("quote")}>Quote</MenuButton>
+          </MenuGroup>
+
+          <MenuGroup id="insert" label="Insert" openGroup={openGroup} onOpen={openMenuGroup} onRequestClose={requestCloseMenuGroup}>
+            <MenuButton onClick={() => applyFootnote()}>Footnote</MenuButton>
+            <MenuButton onClick={() => applyInsert("\n| Header | Header |\n| --- | --- |\n|  |  |\n")}>Table</MenuButton>
+            <MenuButton onClick={() => applyInsert("\n> [!note]\n> ")}>Callout</MenuButton>
+            <MenuButton onClick={() => applyInsert("\n\n---\n\n")}>Horizontal rule</MenuButton>
+            <MenuButton onClick={() => applyInsert("\n```\n\n```\n", 5)}>Code block</MenuButton>
+          </MenuGroup>
+        </>
+      )}
 
       <div className="h-px bg-border/60 my-0.5" />
 

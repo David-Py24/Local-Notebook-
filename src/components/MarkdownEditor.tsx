@@ -1,5 +1,5 @@
-import { useEffect, useRef } from "react";
-import { Compartment, EditorState, Prec } from "@codemirror/state";
+import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
+import { Compartment, EditorSelection, EditorState, Prec } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { HighlightStyle, indentUnit, syntaxHighlighting } from "@codemirror/language";
@@ -21,7 +21,10 @@ const editorTheme = EditorView.theme({
     caretColor: "var(--color-text)",
     fontFamily: "inherit",
     fontSize: "inherit",
-    padding: "0",
+    padding: "4px 0",
+  },
+  ".cm-line": {
+    padding: "1px 0",
   },
   ".cm-scroller": {
     fontFamily: "inherit",
@@ -64,16 +67,27 @@ const editorTheme = EditorView.theme({
     fontSize: "0.9em",
   },
   ".cm-md-task-checkbox": {
-    verticalAlign: "middle",
-    marginRight: "4px",
+    verticalAlign: "-0.15em",
+    marginRight: "6px",
     cursor: "pointer",
+    accentColor: "var(--color-accent)",
   },
   ".cm-md-bullet": {
     display: "inline-block",
-    width: "1em",
-    color: "var(--color-accent)",
+    width: "1.25em",
+    color: "var(--color-muted)",
     fontWeight: "700",
+    textAlign: "center",
+    userSelect: "none",
   },
+  ".cm-md-list-line": {
+    paddingTop: "4px",
+    paddingBottom: "4px",
+    lineHeight: "1.35",
+  },
+  ".cm-md-list-line-0": { paddingLeft: "1.6em", textIndent: "-1.6em" },
+  ".cm-md-list-line-1": { paddingLeft: "3.1em", textIndent: "-3.1em" },
+  ".cm-md-list-line-2": { paddingLeft: "4.6em", textIndent: "-4.6em" },
   ".cm-md-hr": {
     border: "none",
     borderTop: "1px solid var(--color-border)",
@@ -129,7 +143,22 @@ interface MarkdownEditorProps {
   livePreview?: boolean;
 }
 
-export default function MarkdownEditor({ value, onChange, livePreview = false }: MarkdownEditorProps) {
+export type BlockPrefixKind = "bullet" | "numbered" | "task" | "quote" | "body" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6";
+
+export interface MarkdownEditorHandle {
+  wrapSelection: (before: string, after?: string) => void;
+  setBlockPrefix: (kind: BlockPrefixKind) => void;
+  insertBlock: (template: string, cursorOffset?: number) => void;
+  insertFootnote: () => void;
+  focus: () => void;
+}
+
+const BLOCK_PREFIX_STRIP_RE = /^(#{1,6}\s+|[-*+]\s+(\[[ xX]\]\s+)?|\d+\.\s+|>\s?)/;
+
+const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorProps>(function MarkdownEditor(
+  { value, onChange, livePreview = false },
+  forwardedRef
+) {
   const tabSize = useStore((s) => s.settings.tabSize);
   const showLineNumbers = useStore((s) => s.settings.showLineNumbers);
   const autoPairBrackets = useStore((s) => s.settings.autoPairBrackets);
@@ -239,5 +268,105 @@ export default function MarkdownEditor({ value, onChange, livePreview = false }:
     });
   }, [autoPairBrackets]);
 
+  useImperativeHandle(forwardedRef, () => ({
+    focus: () => {
+      viewRef.current?.focus();
+    },
+    wrapSelection: (before, after = before) => {
+      const view = viewRef.current;
+      if (!view) return;
+      view.dispatch(
+        view.state.changeByRange((range) => {
+          const selected = view.state.sliceDoc(range.from, range.to);
+          const insert = `${before}${selected}${after}`;
+          return {
+            changes: { from: range.from, to: range.to, insert },
+            range: EditorSelection.range(range.from + before.length, range.from + before.length + selected.length),
+          };
+        })
+      );
+      view.focus();
+    },
+    setBlockPrefix: (kind) => {
+      const view = viewRef.current;
+      if (!view) return;
+      const state = view.state;
+      view.dispatch(
+        state.changeByRange((range) => {
+          const startLine = state.doc.lineAt(range.from);
+          const endLine = state.doc.lineAt(range.to);
+          let counter = 1;
+          const newLines: string[] = [];
+          for (let ln = startLine.number; ln <= endLine.number; ln++) {
+            const stripped = state.doc.line(ln).text.replace(BLOCK_PREFIX_STRIP_RE, "");
+            switch (kind) {
+              case "body":
+                newLines.push(stripped);
+                break;
+              case "bullet":
+                newLines.push(`- ${stripped}`);
+                break;
+              case "task":
+                newLines.push(`- [ ] ${stripped}`);
+                break;
+              case "numbered":
+                newLines.push(`${counter++}. ${stripped}`);
+                break;
+              case "quote":
+                newLines.push(`> ${stripped}`);
+                break;
+              default:
+                newLines.push(`${"#".repeat(Number(kind[1]))} ${stripped}`);
+            }
+          }
+          const insert = newLines.join("\n");
+          return {
+            changes: { from: startLine.from, to: endLine.to, insert },
+            range: EditorSelection.range(startLine.from, startLine.from + insert.length),
+          };
+        })
+      );
+      view.focus();
+    },
+    insertBlock: (template, cursorOffset) => {
+      const view = viewRef.current;
+      if (!view) return;
+      view.dispatch(
+        view.state.changeByRange((range) => {
+          const insert = template;
+          const pos = range.to;
+          return {
+            changes: { from: pos, to: pos, insert },
+            range: EditorSelection.cursor(pos + (cursorOffset ?? insert.length)),
+          };
+        })
+      );
+      view.focus();
+    },
+    insertFootnote: () => {
+      const view = viewRef.current;
+      if (!view) return;
+      const state = view.state;
+      const docText = state.doc.toString();
+      const used = [...docText.matchAll(/\[\^(\d+)\]/g)].map((m) => parseInt(m[1], 10));
+      const next = used.length ? Math.max(...used) + 1 : 1;
+      const pos = state.selection.main.to;
+      const docEnd = state.doc.length;
+      const marker = `[^${next}]`;
+      const definition = `\n[^${next}]: `;
+      const newDocLength = state.doc.length + marker.length + definition.length;
+      view.dispatch({
+        changes: [
+          { from: pos, to: pos, insert: marker },
+          { from: docEnd, to: docEnd, insert: definition },
+        ],
+        selection: EditorSelection.cursor(newDocLength),
+      });
+      view.focus();
+    },
+  }));
+
   return <div ref={containerRef} className="w-full" />;
-}
+});
+
+export default MarkdownEditor;

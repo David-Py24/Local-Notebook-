@@ -1,13 +1,29 @@
-import { useState } from "react";
-import { useStore } from "../stores/useStore";
+import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { useStore, CONNECTOR_PRESETS } from "../stores/useStore";
+import type { McpConnector, ConnectorKind } from "../types";
 import { THEMES } from "../themes";
 import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { testAIConnection } from "../services/aiProvider";
 import { getProviderPreset } from "../services/providerPresets";
 
-type SettingSection = "general" | "appearance" | "editor" | "files" | "project" | "ai_byok" | "about";
+type SettingSection = "general" | "appearance" | "editor" | "files" | "project" | "backup" | "ai_byok" | "connectors" | "about";
 type UpdateStatus = "idle" | "checking" | "up-to-date" | "available" | "downloading" | "error";
+
+/** Shows the local debug log's file path once "Verbose AI tool logging" is enabled. */
+function VerboseLogPathHint() {
+  const [path, setPath] = useState<string | null>(null);
+  useEffect(() => {
+    invoke<string>("get_ai_debug_log_path").then(setPath).catch(() => setPath(null));
+  }, []);
+  if (!path) return null;
+  return (
+    <p className="text-[10px] text-muted py-1 select-text break-all">
+      Log file: <span className="text-white/80">{path}</span>
+    </p>
+  );
+}
 
 export default function SettingsModal() {
   const showSettings = useStore((s) => s.showSettings);
@@ -21,11 +37,138 @@ export default function SettingsModal() {
   const [showApiKey, setShowApiKey] = useState(false);
   const [testConnectionStatus, setTestConnectionStatus] = useState<string | null>(null);
   const [fetchModelsStatus, setFetchModelsStatus] = useState<"idle" | "fetching" | "done" | "empty">("idle");
+  const [reindexStatus, setReindexStatus] = useState<string | null>(null);
+  const currentFolderPath = useStore((s) => s.currentFolderPath);
 
 
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
+
+  const googleAccount = useStore((s) => s.googleAccount);
+  const backupSigningIn = useStore((s) => s.backupSigningIn);
+  const connectGoogle = useStore((s) => s.connectGoogle);
+  const signOutGoogle = useStore((s) => s.signOutGoogle);
+  const [backupError, setBackupError] = useState<string | null>(null);
+
+  // ── MCP Connectors ────────────────────────────────────────────
+  const connectors = useStore((s) => s.settings.connectors);
+  const addConnector = useStore((s) => s.addConnector);
+  const updateConnector = useStore((s) => s.updateConnector);
+  const removeConnector = useStore((s) => s.removeConnector);
+
+  const [online, setOnline] = useState(() => typeof navigator !== "undefined" && navigator.onLine);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [draft, setDraft] = useState<McpConnector | null>(null);
+  const [testStatus, setTestStatus] = useState<Record<string, string>>({});
+  const [addMode, setAddMode] = useState<"closed" | "menu" | "custom">("closed");
+  const [headersText, setHeadersText] = useState("");
+
+  useEffect(() => {
+    const on = () => setOnline(true);
+    const off = () => setOnline(false);
+    window.addEventListener("online", on);
+    window.addEventListener("offline", off);
+    return () => {
+      window.removeEventListener("online", on);
+      window.removeEventListener("offline", off);
+    };
+  }, []);
+
+  const connectorConfig = (c: McpConnector) => ({
+    id: c.id,
+    name: c.name,
+    kind: c.kind,
+    command: c.command,
+    args: c.args,
+    cwd: c.cwd,
+    url: c.url,
+    headers: c.headers,
+    env: c.env,
+    tools: c.tools,
+  });
+
+  const handleTestConnector = async (c: McpConnector) => {
+    setTestStatus((s) => ({ ...s, [c.id]: "Testing…" }));
+    try {
+      const health = await invoke<{ ok: boolean; tool_count: number; error: string | null }>(
+        "test_connector",
+        { config: connectorConfig(c) }
+      );
+      setTestStatus((s) => ({
+        ...s,
+        [c.id]: health.ok ? `✓ ${health.tool_count} tools available` : `✗ ${health.error ?? "failed"}`,
+      }));
+    } catch (err) {
+      setTestStatus((s) => ({ ...s, [c.id]: `✗ ${String(err)}` }));
+    }
+  };
+
+  const startEditor = (c: McpConnector) => {
+    setDraft({ ...c });
+    setHeadersText(Object.entries(c.headers ?? {}).map(([k, v]) => `${k}: ${v}`).join("\n"));
+    setExpandedId(c.id);
+  };
+
+  const startCustomAdd = () => {
+    setDraft({
+      id: "",
+      name: "",
+      kind: "stdio",
+      command: "",
+      args: [],
+      cwd: "",
+      url: "",
+      headers: {},
+      env: {},
+      enabled: false,
+      tools: [],
+    });
+    setHeadersText("");
+    setExpandedId("__new__");
+    setAddMode("closed");
+  };
+
+  const closeEditor = () => {
+    setExpandedId(null);
+    setDraft(null);
+  };
+
+  const saveDraft = () => {
+    if (!draft) return;
+    const name = draft.name.trim();
+    if (!name) return;
+    if (draft.kind === "stdio" && !draft.command?.trim()) return;
+    if (draft.kind === "http" && !draft.url?.trim()) return;
+
+    let parsedHeaders: Record<string, string> = {};
+    for (const line of headersText.split("\n")) {
+      const idx = line.indexOf(":");
+      if (idx > 0) parsedHeaders[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+    }
+
+    const cleanedFields = {
+      name,
+      kind: draft.kind,
+      command: draft.kind === "stdio" ? draft.command?.trim() : undefined,
+      args: draft.kind === "stdio" ? draft.args?.filter((a) => a.trim()) ?? [] : undefined,
+      cwd: draft.kind === "stdio" ? draft.cwd?.trim() || undefined : undefined,
+      url: draft.kind === "http" ? draft.url?.trim() : undefined,
+      headers: parsedHeaders,
+      env: draft.env ?? {},
+    };
+
+    if (expandedId === "__new__") {
+      addConnector(cleanedFields);
+    } else if (expandedId) {
+      updateConnector(expandedId, cleanedFields);
+    }
+    closeEditor();
+  };
+
+  const availablePresets = CONNECTOR_PRESETS.filter(
+    (p) => !connectors.some((c) => c.name === p.name)
+  );
 
   const handleCheckForUpdates = async () => {
     setUpdateStatus("checking");
@@ -84,6 +227,15 @@ export default function SettingsModal() {
     }
   };
 
+  const handleConnectGoogle = async () => {
+    setBackupError(null);
+    try {
+      await connectGoogle();
+    } catch (err) {
+      setBackupError(String(err));
+    }
+  };
+
   if (!showSettings) return null;
 
   const sections: { id: SettingSection; label: string }[] = [
@@ -92,7 +244,9 @@ export default function SettingsModal() {
     { id: "editor", label: "Editor" },
     { id: "files", label: "Files & Links" },
     { id: "project", label: "Project" },
+    { id: "backup", label: "Backup & Drive" },
     { id: "ai_byok", label: "AI & BYOK Model" },
+    { id: "connectors", label: "Connectors & Research" },
     { id: "about", label: "About" },
   ];
 
@@ -452,12 +606,72 @@ export default function SettingsModal() {
             </div>
           )}
 
+          {activeSection === "backup" && (
+            <div className="space-y-6">
+              <div>
+                <h3 className="text-base font-semibold text-white">Google Drive Backup</h3>
+                <p className="text-xs text-muted">
+                  Connect a Google account to back up your vault notes to your own Google Drive.
+                </p>
+              </div>
+
+              {!googleAccount ? (
+                <div className="flex flex-col gap-1.5">
+                  <button
+                    type="button"
+                    onClick={handleConnectGoogle}
+                    disabled={backupSigningIn}
+                    className="flex items-center gap-2.5 rounded border border-border bg-bg/60 px-3 py-2.5 text-xs font-medium text-white hover:bg-card cursor-pointer transition-colors disabled:opacity-60 disabled:cursor-wait"
+                  >
+                    <svg className="w-4 h-4 shrink-0" viewBox="0 0 48 48">
+                      <path fill="#FFC107" d="M43.6 20.1H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.9 1.2 8 3l5.7-5.7C34 6.1 29.3 4 24 4 13 4 4 13 4 24s9 20 20 20 20-9 20-20c0-1.3-.1-2.6-.4-3.9z"/>
+                      <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.9 1.2 8 3l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/>
+                      <path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/>
+                      <path fill="#1976D2" d="M43.6 20.1H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C36.9 35.5 44 38 44 24c0-1.3-.1-2.6-.4-3.9z"/>
+                    </svg>
+                    {backupSigningIn ? "Waiting for Google sign-in in your browser…" : "Connect Google Drive"}
+                  </button>
+                  <span className="text-[10px] text-muted">
+                    {backupSigningIn
+                      ? "A browser window has opened. Complete the consent screen there and return here."
+                      : "Sign in with Google to choose which folders to back up to your Drive."}
+                  </span>
+                  {backupError && <span className="text-[11px] text-red-400">Sign-in failed: {backupError}</span>}
+                </div>
+              ) : (
+                <div className="flex flex-col gap-1.5">
+                  <div className="rounded-md border border-border bg-bg/40 p-3 flex items-center gap-3">
+                    <span
+                      className="flex h-9 w-9 shrink-0 items-center justify-center rounded bg-accent text-sm font-semibold text-white uppercase"
+                    >
+                      {googleAccount.email.charAt(0)}
+                    </span>
+                    <div className="min-w-0">
+                      <p className="truncate text-xs font-medium text-white">{googleAccount.name}</p>
+                      <p className="truncate text-[11px] text-muted">{googleAccount.email}</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => signOutGoogle()}
+                      className="ml-auto shrink-0 rounded border border-border bg-bg/60 px-2.5 py-1 text-[11px] font-medium text-muted hover:bg-card hover:text-white cursor-pointer transition-colors"
+                    >
+                      Sign out
+                    </button>
+                  </div>
+                  <span className="text-[10px] text-muted">
+                    Connected. Vault selection and the "Backup now" button arrive in the next milestone.
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
           {activeSection === "ai_byok" && (
             <div className="space-y-6">
               <div>
                 <h3 className="text-base font-semibold text-white">AI & BYOK Model Server</h3>
                 <p className="text-xs text-muted">
-                  Bring Your Own Key (BYOK) or connect a local Hermes / Ollama server endpoint.
+                  BYOK powers the assistant directly or acts as the automatic fallback when the OpenCode engine is unavailable.
                 </p>
               </div>
 
@@ -488,9 +702,55 @@ export default function SettingsModal() {
                 />
               </div>
 
+              {/* Primary Engine Selection */}
+              <div className="flex flex-col gap-2 border-b border-border/40 pb-4">
+                <label className="text-xs font-medium text-text">Primary Assistant Engine</label>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => updateSettings({ assistantEngine: "opencode" })}
+                    className={`flex-1 rounded border px-3 py-2 text-xs font-medium cursor-pointer transition-colors ${
+                      settings.assistantEngine === "opencode"
+                        ? "border-accent bg-accent/15 text-accent"
+                        : "border-border bg-bg/50 text-text hover:border-accent/50"
+                    }`}
+                  >
+                    🤖 OpenCode
+                    <span className="block text-[10px] font-normal text-muted mt-0.5">Agentic engine — default</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => updateSettings({ assistantEngine: "byok" })}
+                    className={`flex-1 rounded border px-3 py-2 text-xs font-medium cursor-pointer transition-colors ${
+                      settings.assistantEngine === "byok"
+                        ? "border-accent bg-accent/15 text-accent"
+                        : "border-border bg-bg/50 text-text hover:border-accent/50"
+                    }`}
+                  >
+                    🔑 BYOK
+                    <span className="block text-[10px] font-normal text-muted mt-0.5">Direct API — local / cloud keys</span>
+                  </button>
+                </div>
+                <div className="flex items-center justify-between pt-1">
+                  <div className="flex flex-col">
+                    <label className="text-xs font-medium text-white">Fall back to BYOK automatically</label>
+                    <span className="text-[10px] text-muted">
+                      When OpenCode is unavailable or errors, the assistant routes to the BYOK provider below.
+                    </span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={settings.assistantEngine === "opencode" ? settings.opencodeFallbackToByok : true}
+                    disabled={settings.assistantEngine !== "opencode"}
+                    onChange={(e) => updateSettings({ opencodeFallbackToByok: e.target.checked })}
+                    className="w-4 h-4 rounded border-border bg-bg/50 text-accent focus:ring-accent cursor-pointer"
+                  />
+                </div>
+              </div>
+
               {/* Provider Selection */}
               <div className="flex flex-col gap-1.5">
-                <label className="text-xs font-medium text-text">AI Model Provider</label>
+                <label className="text-xs font-medium text-text">Fallback Provider (BYOK)</label>
                 <select
                   value={settings.aiProvider}
                   onChange={(e) => {
@@ -690,12 +950,131 @@ export default function SettingsModal() {
                 />
               </div>
 
+              {/* ─── Memory-RAG (Agent Knowledge) ─────────────────── */}
+              <div className="pt-4 border-t border-border/40 space-y-3">
+                <div>
+                  <h4 className="text-xs font-semibold text-white">🧠 Memory-RAG (Agent Knowledge)</h4>
+                  <p className="text-[10px] text-muted mt-0.5">
+                    Semantic memory + retrieval over your vault. Embeddings run against a local Ollama server; when it is offline, tools fall back to keyword search.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-text">Embedding Base URL</label>
+                    <input
+                      type="text"
+                      value={settings.embedBaseUrl}
+                      onChange={(e) => updateSettings({ embedBaseUrl: e.target.value })}
+                      placeholder="http://localhost:11434"
+                      className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent font-mono"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-text">Embedding Model</label>
+                    <input
+                      type="text"
+                      value={settings.embedModel}
+                      onChange={(e) => updateSettings({ embedModel: e.target.value })}
+                      placeholder="nomic-embed-text"
+                      className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent font-mono"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 items-end">
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-text">RAG Top-K</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={20}
+                      value={settings.ragTopK}
+                      onChange={(e) => updateSettings({ ragTopK: parseInt(e.target.value) || 5 })}
+                      className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent"
+                    />
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (!currentFolderPath) {
+                          setReindexStatus("Open a vault first.");
+                          return;
+                        }
+                        setReindexStatus("Embedding chunks...");
+                        try {
+                          const { rebuildEmbeddings } = await import("../services/agentKnowledge");
+                          const n = await rebuildEmbeddings(currentFolderPath, settings);
+                          setReindexStatus(n === 0 ? "Embeddings up to date" : `Embedded ${n} chunks`);
+                        } catch (err) {
+                          setReindexStatus(`Failed: ${String(err)}`);
+                        }
+                      }}
+                      className="rounded border border-border bg-bg/60 px-3 py-1.5 text-xs font-medium text-sky-400 hover:bg-card hover:text-sky-300 cursor-pointer transition-colors"
+                    >
+                      ↻ Re-index Embeddings
+                    </button>
+                    {reindexStatus && (
+                      <span className="text-[10px] text-muted">{reindexStatus}</span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between py-2 border-b border-border/40">
+                  <div className="flex flex-col">
+                    <label className="text-xs font-medium text-white">Auto-save conversation memory</label>
+                    <span className="text-[10px] text-muted">Persist Q&A turns so future sessions recall them.</span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={settings.memoryAutoSave !== false}
+                    onChange={(e) => updateSettings({ memoryAutoSave: e.target.checked })}
+                    className="w-4 h-4 rounded border-border bg-bg/50 text-accent focus:ring-accent cursor-pointer"
+                  />
+                </div>
+
+                {/* File-write tools gate */}
+                <div className="flex items-center justify-between py-2 border-b border-border/40">
+                  <div className="flex flex-col">
+                    <label className="text-xs font-medium text-white">Allow AI file writes</label>
+                    <span className="text-[10px] text-muted">
+                      Lets the AI create, edit, rename and delete notes (destructive actions still need your approval). Off by default.
+                    </span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={settings.aiEnableFileWrite === true}
+                    onChange={(e) => updateSettings({ aiEnableFileWrite: e.target.checked })}
+                    className="w-4 h-4 rounded border-border bg-bg/50 text-accent focus:ring-accent cursor-pointer"
+                  />
+                </div>
+
+                {/* Verbose AI tool-call logging (diagnostics) */}
+                <div className="flex items-center justify-between py-2 border-b border-border/40">
+                  <div className="flex flex-col">
+                    <label className="text-xs font-medium text-white">Verbose AI tool logging</label>
+                    <span className="text-[10px] text-muted">
+                      Logs which tools were offered, called, and their results to a local debug file — for
+                      diagnosing tool-calling issues. Off by default.
+                    </span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={settings.aiVerboseLogging === true}
+                    onChange={(e) => updateSettings({ aiVerboseLogging: e.target.checked })}
+                    className="w-4 h-4 rounded border-border bg-bg/50 text-accent focus:ring-accent cursor-pointer"
+                  />
+                </div>
+                {settings.aiVerboseLogging && <VerboseLogPathHint />}
+              </div>
+
               {/* ─── OpenCode Agent ──────────────────────────────── */}
               <div className="pt-4 border-t border-border/40 space-y-3">
                 <div>
                   <h4 className="text-xs font-semibold text-white">🤖 OpenCode Agent</h4>
                   <p className="text-[10px] text-muted mt-0.5">
-                    Settings for the OpenCode Agent tab. BYOK keys are injected from above at launch — no separate key configuration needed.
+                    OpenCode is the primary engine for the assistant panel. BYOK (fallback) keys are injected from above at launch — no separate key configuration needed.
                   </p>
                 </div>
 
@@ -737,8 +1116,8 @@ export default function SettingsModal() {
                 {/* Auto-start toggle */}
                 <div className="flex items-center justify-between py-1">
                   <div className="flex flex-col">
-                    <label className="text-xs font-medium text-white">Auto-start on Agent Tab Switch</label>
-                    <span className="text-[10px] text-muted">Automatically start opencode serve when you switch to the Agent tab.</span>
+                    <label className="text-xs font-medium text-white">Auto-start OpenCode Engine</label>
+                    <span className="text-[10px] text-muted">Automatically start opencode serve when the OpenCode engine is the active assistant engine.</span>
                   </div>
                   <input
                     type="checkbox"
@@ -748,6 +1127,310 @@ export default function SettingsModal() {
                   />
                 </div>
               </div>
+            </div>
+          )}
+
+          {activeSection === "connectors" && (
+            <div className="space-y-5">
+              <div>
+                <h3 className="text-base font-semibold text-white">Connectors & Research</h3>
+                <p className="text-xs text-muted">
+                  MCP servers expose tools to the AI assistant. Offline-first: every connector is opt-in and stays off until you enable it.
+                </p>
+              </div>
+
+              {/* Online state */}
+              <div className={`flex items-center gap-2 rounded-md border px-3 py-2 text-xs ${online ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" : "border-amber-500/30 bg-amber-500/10 text-amber-300"}`}>
+                <span className={`h-2 w-2 rounded-full ${online ? "bg-emerald-400" : "bg-amber-400"}`} />
+                {online ? "Online — web connectors (🔌) are available." : "Offline — web connectors will be skipped until you reconnect."}
+              </div>
+
+              {/* Add Connector */}
+              <div className="relative">
+                <button
+                  onClick={() => setAddMode(addMode === "menu" ? "closed" : "menu")}
+                  className="rounded border border-border bg-bg/60 px-3 py-1.5 text-xs font-medium text-text hover:bg-card hover:text-white cursor-pointer transition-colors"
+                >
+                  {addMode === "menu" ? "Close" : "+ Add Connector"}
+                </button>
+
+                {addMode === "menu" && (
+                  <div className="absolute left-0 top-9 z-30 w-64 rounded-md border border-border bg-card p-1 text-xs text-text shadow-xl">
+                    {availablePresets.length > 0 && (
+                      <>
+                        <div className="px-2 py-1 text-[10px] font-semibold uppercase text-muted">From preset</div>
+                        {availablePresets.map((p) => (
+                          <button
+                            key={p.id}
+                            onClick={() => {
+                              addConnector({
+                                name: p.name,
+                                kind: p.kind,
+                                command: p.command,
+                                args: p.args,
+                                cwd: p.cwd,
+                                url: p.url,
+                                headers: p.headers,
+                                env: p.env,
+                              });
+                              setAddMode("closed");
+                            }}
+                            className="flex w-full items-center justify-between rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors"
+                          >
+                            <span>{p.name}</span>
+                            <span className={`rounded px-1.5 py-px text-[9px] font-semibold uppercase ${p.kind === "http" ? "bg-sky-500/15 text-sky-400" : "bg-violet-500/15 text-violet-400"}`}>
+                              {p.kind}
+                            </span>
+                          </button>
+                        ))}
+                      </>
+                    )}
+                    <div className="h-px bg-border/60 my-0.5" />
+                    <button
+                      onClick={startCustomAdd}
+                      className="w-full rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors"
+                    >
+                      Custom connector…
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Registry list */}
+              <div className="space-y-2">
+                {connectors.length === 0 && (
+                  <div className="rounded-md border border-dashed border-border bg-bg/30 px-4 py-6 text-center text-[11px] text-muted">
+                    No connectors registered. Add one above, or rerun to restore the built-in presets.
+                  </div>
+                )}
+
+                {connectors.map((c) => {
+                  const isExpanded = expandedId === c.id;
+                  const status = testStatus[c.id];
+                  return (
+                    <div key={c.id} className="rounded-md border border-border bg-bg/40 px-3 py-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${c.enabled ? "bg-emerald-400" : "bg-border"}`} />
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-1.5">
+                              <span className="truncate text-xs font-medium text-text">{c.name}</span>
+                              <span className={`rounded px-1.5 py-px text-[9px] font-semibold uppercase ${c.kind === "http" ? "bg-sky-500/15 text-sky-400" : "bg-violet-500/15 text-violet-400"}`}>{c.kind}</span>
+                              {c.kind === "http" && <span className="rounded px-1.5 py-px text-[9px] uppercase text-muted bg-border/40">🔌 web</span>}
+                            </div>
+                            <div className="truncate text-[10px] text-muted">
+                              {c.kind === "stdio" ? `${c.command ?? ""} ${(c.args ?? []).join(" ")}`.trim() : c.url}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          <input
+                            type="checkbox"
+                            checked={c.enabled}
+                            onChange={(e) => updateConnector(c.id, { enabled: e.target.checked })}
+                            className="h-3.5 w-3.5 cursor-pointer rounded border-border bg-bg/50 text-accent focus:ring-accent"
+                            title={c.enabled ? "Disable connector" : "Enable connector"}
+                          />
+                          <button
+                            onClick={() => handleTestConnector(c)}
+                            className="cursor-pointer rounded border border-border/60 px-1.5 py-0.5 text-[10px] text-muted hover:text-white transition-colors"
+                          >
+                            Test
+                          </button>
+                          <button
+                            onClick={() => (isExpanded ? closeEditor() : startEditor(c))}
+                            className="cursor-pointer rounded border border-border/60 px-1.5 py-0.5 text-[10px] text-muted hover:text-white transition-colors"
+                          >
+                            {isExpanded ? "Close" : "Configure"}
+                          </button>
+                          <button
+                            onClick={() => {
+                              if (window.confirm(`Remove connector "${c.name}"?`)) removeConnector(c.id);
+                            }}
+                            className="cursor-pointer rounded border border-border/60 px-1.5 py-0.5 text-[10px] text-red-400 hover:text-red-300 transition-colors"
+                            title="Remove connector"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      </div>
+
+                      {status && (
+                        <p className={`mt-1.5 text-[10px] ${status.startsWith("✓") ? "text-emerald-400" : status.startsWith("✗") ? "text-red-400" : "text-muted"}`}>
+                          {status}
+                        </p>
+                      )}
+
+                      {isExpanded && draft && (
+                        <div className="mt-3 space-y-2 border-t border-border/40 pt-3">
+                          <input
+                            type="text"
+                            value={draft.name}
+                            onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+                            placeholder="Connector name"
+                            className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent"
+                          />
+                          <select
+                            value={draft.kind}
+                            onChange={(e) => setDraft({ ...draft, kind: e.target.value as ConnectorKind })}
+                            className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent cursor-pointer"
+                          >
+                            <option value="stdio">stdio (local binary)</option>
+                            <option value="http">http (remote streamable-http)</option>
+                          </select>
+
+                          {draft.kind === "stdio" ? (
+                            <>
+                              <input
+                                type="text"
+                                value={draft.command ?? ""}
+                                onChange={(e) => setDraft({ ...draft, command: e.target.value })}
+                                placeholder="e.g. npx, python -m, or a binary path"
+                                className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent font-mono"
+                              />
+                              <input
+                                type="text"
+                                value={draft.args?.join(", ") ?? ""}
+                                onChange={(e) =>
+                                  setDraft({
+                                    ...draft,
+                                    args: e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
+                                  })
+                                }
+                                placeholder="Arguments, comma-separated — e.g. -y, @modelcontextprotocol/server-filesystem, /vault"
+                                className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent font-mono"
+                              />
+                              <input
+                                type="text"
+                                value={draft.cwd ?? ""}
+                                onChange={(e) => setDraft({ ...draft, cwd: e.target.value })}
+                                placeholder="Working directory (optional)"
+                                className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent font-mono"
+                              />
+                            </>
+                          ) : (
+                            <>
+                              <input
+                                type="text"
+                                value={draft.url ?? ""}
+                                onChange={(e) => setDraft({ ...draft, url: e.target.value })}
+                                placeholder="https://mcp.example.com/sse"
+                                className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent font-mono"
+                              />
+                              <textarea
+                                rows={3}
+                                value={headersText}
+                                onChange={(e) => setHeadersText(e.target.value)}
+                                placeholder={'Headers (one per line), e.g.\nauthorization: Bearer sk-...'}
+                                className="w-full resize-none rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent font-mono leading-relaxed"
+                              />
+                            </>
+                          )}
+
+                          <div className="flex items-center justify-end gap-2">
+                            <button
+                              onClick={closeEditor}
+                              className="cursor-pointer rounded border border-border/60 px-2.5 py-1 text-[10px] text-muted hover:text-white transition-colors"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              onClick={saveDraft}
+                              className="cursor-pointer rounded bg-accent px-2.5 py-1 text-[10px] font-medium text-white hover:bg-accent-hover transition-colors"
+                            >
+                              Save
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Editor for a brand-new custom connector (no row yet) */}
+              {expandedId === "__new__" && draft && (
+                <div className="space-y-2 border-t border-border/40 pt-3">
+                  <input
+                    type="text"
+                    value={draft.name}
+                    onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+                    placeholder="Connector name"
+                    className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent"
+                  />
+                  <select
+                    value={draft.kind}
+                    onChange={(e) => setDraft({ ...draft, kind: e.target.value as ConnectorKind })}
+                    className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent cursor-pointer"
+                  >
+                    <option value="stdio">stdio (local binary)</option>
+                    <option value="http">http (remote streamable-http)</option>
+                  </select>
+
+                  {draft.kind === "stdio" ? (
+                    <>
+                      <input
+                        type="text"
+                        value={draft.command ?? ""}
+                        onChange={(e) => setDraft({ ...draft, command: e.target.value })}
+                        placeholder="e.g. npx, python -m, or a binary path"
+                        className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent font-mono"
+                      />
+                      <input
+                        type="text"
+                        value={draft.args?.join(", ") ?? ""}
+                        onChange={(e) =>
+                          setDraft({
+                            ...draft,
+                            args: e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
+                          })
+                        }
+                        placeholder="Arguments, comma-separated — e.g. -y, @modelcontextprotocol/server-filesystem"
+                        className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent font-mono"
+                      />
+                      <input
+                        type="text"
+                        value={draft.cwd ?? ""}
+                        onChange={(e) => setDraft({ ...draft, cwd: e.target.value })}
+                        placeholder="Working directory (optional)"
+                        className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent font-mono"
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <input
+                        type="text"
+                        value={draft.url ?? ""}
+                        onChange={(e) => setDraft({ ...draft, url: e.target.value })}
+                        placeholder="https://mcp.example.com/sse"
+                        className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent font-mono"
+                      />
+                      <textarea
+                        rows={3}
+                        value={headersText}
+                        onChange={(e) => setHeadersText(e.target.value)}
+                        placeholder={"Headers (one per line), e.g.\nauthorization: Bearer sk-..."}
+                        className="w-full resize-none rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent font-mono leading-relaxed"
+                      />
+                    </>
+                  )}
+
+                  <div className="flex items-center justify-end gap-2">
+                    <button
+                      onClick={closeEditor}
+                      className="cursor-pointer rounded border border-border/60 px-2.5 py-1 text-[10px] text-muted hover:text-white transition-colors"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={saveDraft}
+                      className="cursor-pointer rounded bg-accent px-2.5 py-1 text-[10px] font-medium text-white hover:bg-accent-hover transition-colors"
+                    >
+                      Save
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 

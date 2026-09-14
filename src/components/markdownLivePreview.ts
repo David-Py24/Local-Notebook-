@@ -48,13 +48,19 @@ class TaskCheckboxWidget extends WidgetType {
 }
 
 class BulletWidget extends WidgetType {
-  eq() {
-    return true;
+  constructor(private readonly level: number = 0) {
+    super();
   }
+
+  eq(other: BulletWidget) {
+    return other.level === this.level;
+  }
+
   toDOM() {
     const span = document.createElement("span");
     span.className = "cm-md-bullet";
-    span.textContent = "•";
+    const bulletChar = this.level === 0 ? "•" : this.level === 1 ? "◦" : "▪";
+    span.textContent = bulletChar;
     return span;
   }
 }
@@ -71,11 +77,15 @@ class HorizontalRuleWidget extends WidgetType {
 }
 
 function buildDecorations(state: EditorState, visibleRanges: readonly { from: number; to: number }[]): DecorationSet {
+  const selFrom = state.selection.main.from;
+  const selTo = state.selection.main.to;
   const cursorLine = state.doc.lineAt(state.selection.main.head).number;
   const ranges: Range<Decoration>[] = [];
-  // Line-level decorations (e.g. table-row/codeblock backgrounds) must be added in document
-  // order and separately from the mark/replace ranges above, per CodeMirror's RangeSet rules.
   const lineRanges: Range<Decoration>[] = [];
+
+  const isRangeActive = (from: number, to: number) => {
+    return selTo >= from && selFrom <= to;
+  };
 
   const hide = (from: number, to: number) => {
     if (to > from) ranges.push(Decoration.replace({}).range(from, to));
@@ -101,112 +111,132 @@ function buildDecorations(state: EditorState, visibleRanges: readonly { from: nu
       enter: (node) => {
         const line = state.doc.lineAt(node.from).number;
         const isActiveLine = line === cursorLine;
+        const isNodeActive = isRangeActive(node.from, node.to);
 
+        // Styling (bold/italic/heading size/etc.) always applies, WYSIWYG-style, regardless
+        // of where the cursor is. Only the raw marker characters ("##", "**", "`", "~~") are
+        // cursor-aware, and only their OWN narrow range — not the whole formatted span — so
+        // typing inside a heading or bold run never flashes back to raw markdown; the marker
+        // reveals only when the cursor is right at it (so it can still be edited/removed).
         const headingLevel = HEADING_LEVEL[node.name];
         if (headingLevel) {
-          if (!isActiveLine) style(node.from, node.to, `cm-md-heading cm-md-h${headingLevel}`);
+          style(node.from, node.to, `cm-md-heading cm-md-h${headingLevel}`);
           return;
         }
 
-        if (node.name === "HeaderMark" && !isActiveLine) {
-          let end = node.to;
-          if (state.doc.sliceString(end, end + 1) === " ") end += 1;
-          hide(node.from, end);
-          return;
-        }
-
-        if (node.name === "StrongEmphasis" && !isActiveLine) {
-          style(node.from, node.to, "cm-md-strong");
-          return;
-        }
-
-        if (node.name === "Emphasis" && !isActiveLine) {
-          style(node.from, node.to, "cm-md-em");
-          return;
-        }
-
-        if (node.name === "EmphasisMark" && !isActiveLine) {
-          hide(node.from, node.to);
-          return;
-        }
-
-        if (node.name === "InlineCode" && !isActiveLine) {
-          style(node.from, node.to, "cm-md-inline-code");
-          return;
-        }
-
-        if (node.name === "CodeMark" && !isActiveLine) {
-          hide(node.from, node.to);
-          return;
-        }
-
-        if (node.name === "Strikethrough" && !isActiveLine) {
-          style(node.from, node.to, "cm-md-strike");
-          return;
-        }
-
-        if (node.name === "StrikethroughMark" && !isActiveLine) {
-          hide(node.from, node.to);
-          return;
-        }
-
-        if (node.name === "TaskMarker" && !isActiveLine) {
-          const text = state.doc.sliceString(node.from, node.to);
-          const checked = /x/i.test(text);
-          ranges.push(
-            Decoration.replace({ widget: new TaskCheckboxWidget(checked, node.from, node.to) }).range(
-              node.from,
-              node.to
-            )
-          );
-          return;
-        }
-
-        if (node.name === "ListMark" && !isActiveLine) {
-          // ListMark is shared between bullet and ordered lists — only render a bullet
-          // dot for the plain bullet markers (-, *, +); leave ordered-list numbers ("1.") raw.
-          const text = state.doc.sliceString(node.from, node.to);
-          if (text === "-" || text === "*" || text === "+") {
+        if (node.name === "HeaderMark") {
+          if (!isNodeActive) {
             let end = node.to;
             if (state.doc.sliceString(end, end + 1) === " ") end += 1;
-            ranges.push(Decoration.replace({ widget: new BulletWidget() }).range(node.from, end));
+            hide(node.from, end);
           }
           return;
         }
 
-        if (node.name === "HorizontalRule" && !isActiveLine) {
-          ranges.push(Decoration.replace({ widget: new HorizontalRuleWidget() }).range(node.from, node.to));
+        if (node.name === "StrongEmphasis") {
+          style(node.from, node.to, "cm-md-strong");
           return;
         }
 
-        // Fenced code blocks: keep the body monospaced/backgrounded at all times (like
-        // Obsidian), but only hide the ``` fence markers and language label off the active line.
+        if (node.name === "Emphasis") {
+          style(node.from, node.to, "cm-md-em");
+          return;
+        }
+
+        if (node.name === "EmphasisMark") {
+          if (!isNodeActive) hide(node.from, node.to);
+          return;
+        }
+
+        if (node.name === "InlineCode") {
+          style(node.from, node.to, "cm-md-inline-code");
+          return;
+        }
+
+        if (node.name === "CodeMark") {
+          const parentName = node.node.parent?.name;
+          if (parentName === "InlineCode") {
+            if (!isNodeActive) hide(node.from, node.to);
+          } else if (parentName === "FencedCode" && !isActiveLine) {
+            hide(node.from, node.to);
+          }
+          return;
+        }
+
+        if (node.name === "Strikethrough") {
+          style(node.from, node.to, "cm-md-strike");
+          return;
+        }
+
+        if (node.name === "StrikethroughMark") {
+          if (!isNodeActive) hide(node.from, node.to);
+          return;
+        }
+
+        if (node.name === "TaskMarker") {
+          if (!isNodeActive) {
+            const text = state.doc.sliceString(node.from, node.to);
+            const checked = /x/i.test(text);
+            ranges.push(
+              Decoration.replace({ widget: new TaskCheckboxWidget(checked, node.from, node.to) }).range(
+                node.from,
+                node.to
+              )
+            );
+          }
+          return;
+        }
+
+        if (node.name === "ListMark") {
+          const text = state.doc.sliceString(node.from, node.to);
+          const isBullet = text === "-" || text === "*" || text === "+";
+          const lineText = state.doc.lineAt(node.from).text;
+          const indentMatch = lineText.match(/^(\s*)/);
+          const indentSpaces = indentMatch ? indentMatch[1].length : 0;
+          const level = Math.min(Math.floor(indentSpaces / 2), 2);
+          // Applied unconditionally (not just !isNodeActive) so a list item keeps its
+          // spacing/hanging-indent while it's the active/raw editing line too, avoiding
+          // a layout jump each time the cursor enters or leaves it.
+          styleLine(node.from, `cm-md-list-line cm-md-list-line-${level}`);
+          if (isBullet && !isNodeActive) {
+            let end = node.to;
+            if (state.doc.sliceString(end, end + 1) === " ") end += 1;
+            ranges.push(Decoration.replace({ widget: new BulletWidget(level) }).range(node.from, end));
+          }
+          return;
+        }
+
+        if (node.name === "HorizontalRule") {
+          if (!isNodeActive) {
+            ranges.push(Decoration.replace({ widget: new HorizontalRuleWidget() }).range(node.from, node.to));
+          }
+          return;
+        }
+
         if (node.name === "CodeText") {
           for (let l = state.doc.lineAt(node.from).number; l <= state.doc.lineAt(node.to).number; l++) {
             styleLine(state.doc.line(l).from, "cm-md-codeblock-line");
           }
           return;
         }
-        if ((node.name === "CodeMark" || node.name === "CodeInfo") && !isActiveLine) {
+
+        if (node.name === "CodeInfo" && !isActiveLine) {
           const parentName = node.node.parent?.name;
           if (parentName === "FencedCode") hide(node.from, node.to);
           return;
         }
 
-        // GFM tables: give header/body rows a CSS `table-row` so cells line up in columns;
-        // hide the raw `|` separators and the `---|---` alignment row off the active line.
-        // The active line is deliberately left out of the `table-row` grouping (not just
-        // left with its marks visible) — otherwise its one giant raw-text cell forces the
-        // shared column widths to stretch around it, skewing every other row while typing.
         if ((node.name === "TableHeader" || node.name === "TableRow") && !isActiveLine) {
           styleLine(node.from, "cm-md-table-row");
           return;
         }
+
         if (node.name === "TableCell" && !isActiveLine) {
           const inHeader = node.node.parent?.name === "TableHeader";
           style(node.from, node.to, inHeader ? "cm-md-table-header-cell" : "cm-md-table-cell");
           return;
         }
+
         if (node.name === "TableDelimiter") {
           const isAlignmentRow = node.to - node.from > 1;
           if (isAlignmentRow) {

@@ -62,3 +62,22 @@ export interface Project {
   lastOpened: string; // ISO timestamp
 }
 
+export type ConnectorKind = "stdio" | "http";
+
+export interface McpConnector {
+  id: string;
+  name: string;
+  kind: ConnectorKind;
+  // stdio server (local binary)
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  // http (streamable-http) server
+  url?: string;
+  headers?: Record<string, string>;
+  // common
+  enabled: boolean;
+  env?: Record<string, string>;   // scoped child env vars (never persisted secrets)
+  tools?: string[];               // cached list of tool names exposed by this server
+}
+

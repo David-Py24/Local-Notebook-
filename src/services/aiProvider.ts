@@ -1,9 +1,21 @@
+import { invoke } from "@tauri-apps/api/core";
 import { Settings } from "../stores/useStore";
-import { WORKSPACE_TOOLS, executeWorkspaceTool } from "./workspaceTools";
+import { buildEffectiveTools, executeWorkspaceTool } from "./workspaceTools";
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 15_000;
 const MAX_429_RETRIES = 2;
+
+/**
+ * Best-effort append to the local AI debug log (Settings -> "Verbose AI tool logging").
+ * Never throws, never blocks the actual request — diagnostics only. Long values are
+ * truncated so one verbose tool result can't bloat the log file unboundedly.
+ */
+function logDebug(enabled: boolean | undefined, line: string): void {
+  if (!enabled) return;
+  const truncated = line.length > 2000 ? line.slice(0, 2000) + "…(truncated)" : line;
+  invoke("append_ai_debug_log", { line: `[${new Date().toISOString()}] ${truncated}` }).catch(() => {});
+}
 
 function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; cleanup: () => void } {
   // The abort listener deliberately stays attached after cleanup() — cleanup only cancels
@@ -102,6 +114,49 @@ export interface ChatMessagePayload {
   name?: string;
   tool_call_id?: string;
   tool_calls?: any[];
+}
+
+// ---------------------------------------------------------------------------
+// Memory-RAG (AGENT_MEMORY_RAG_PLAN.md, M2): Ollama embeddings for the front end.
+// All embed HTTP stays here (consistent with the chat streaming path), while Rust
+// owns vector storage (`store_chunk_embeddings`, `add_memory`) and retrieval math.
+// ---------------------------------------------------------------------------
+
+const EMBED_TIMEOUT_MS = 60_000;
+
+/** Maps an OpenAI-compat Base URL (e.g. http://localhost:11434/v1) to the Ollama HTTP root. */
+export function deriveEmbedBaseUrl(aiBaseUrl?: string): string {
+  const clean = (aiBaseUrl || "").trim().replace(/\/+$/, "");
+  if (!clean) return "http://localhost:11434";
+  return clean.replace(/\/v1$/i, "");
+}
+
+/**
+ * Embeds `texts` in one batch against Ollama's /api/embeddings. Returns a parallel array
+ * of vectors (empty inner array for any failed/failed-text slot), or [] on transport or
+ * shape failure so callers can degrade to keyword-only retrieval without crashing.
+ */
+export async function embedTexts(texts: string[], settings: Settings): Promise<number[][]> {
+  if (!texts.length) return [];
+  const baseUrl = deriveEmbedBaseUrl(settings.aiBaseUrl || settings.embedBaseUrl);
+  const model = settings.embedModel || "nomic-embed-text";
+  try {
+    const res = await fetch(`${baseUrl}/api/embeddings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, input: texts }),
+      signal: AbortSignal.timeout(EMBED_TIMEOUT_MS),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const embeddings = data?.embeddings;
+    if (!Array.isArray(embeddings)) return [];
+    return embeddings.map((vec) =>
+      Array.isArray(vec) ? vec.map((v) => Number(v) || 0) : []
+    );
+  } catch {
+    return [];
+  }
 }
 
 export async function testAIConnection(
@@ -273,10 +328,12 @@ function describeEndpointShapeIssue(baseUrl: string): string | null {
  * Maps a Gemini SSE finish_reason or promptFeedback blockReason to a
  * human-readable explanation surfaced in the chat UI.
  */
-function describeGeminiBlock(finishReason?: string, blockReason?: string): string | null {
+export function describeGeminiBlock(finishReason?: string, blockReason?: string): string | null {
   const reason = (finishReason || blockReason || "").toUpperCase();
-  if (!reason || reason === "STOP" || reason === "MAX_TOKENS") {
-    // MAX_TOKENS is a normal completion stop — no block message needed
+  if (!reason || reason === "STOP" || reason === "MAX_TOKENS" || reason === "TOOL_CALLS" || reason === "FUNCTION_CALL") {
+    // MAX_TOKENS is a normal completion stop; TOOL_CALLS/FUNCTION_CALL is the standard,
+    // successful finish reason when a model (any provider, not just Gemini — this runs
+    // unconditionally) stops to invoke a function. None of these are a block/error.
     return null;
   }
   switch (reason) {
@@ -298,6 +355,13 @@ export async function streamAIResponse(options: {
   onToolCall?: (toolName: string, args: Record<string, any>) => void;
   onStatusChange?: (status: string) => void;
   signal?: AbortSignal;
+  /**
+   * Internal: the tool schema for this conversation, computed once by the top-level call
+   * and threaded through each tool-loop recursion so it isn't recomputed (and re-fetched
+   * from every enabled MCP connector) on every round-trip of a multi-tool-call turn.
+   * Callers should not pass this.
+   */
+  _cachedTools?: Record<string, any>[];
 }): Promise<string> {
   const { settings, onChunk, onToolCall, onStatusChange, signal: externalSignal } = options;
   const baseUrl = (settings.aiBaseUrl || "http://localhost:11434/v1").replace(/\/+$/, "");
@@ -332,8 +396,22 @@ export async function streamAIResponse(options: {
     temperature: 0.7,
   };
 
+  let effectiveTools = options._cachedTools;
   if (settings.aiEnableWorkspaceTools) {
-    payload.tools = WORKSPACE_TOOLS;
+    if (!effectiveTools) {
+      try {
+        // Builtin workspace tools + enabled MCP connector tools (offline-aware). Computed
+        // once per user turn and reused across the tool-loop recursion below — rebuilding
+        // this on every round-trip re-pings every enabled MCP connector's tools/list and
+        // resends ~3k+ tokens of schema per call for no reason within a single turn.
+        effectiveTools = await buildEffectiveTools();
+        logDebug(settings.aiVerboseLogging, `tools offered (${effectiveTools.length}): ${effectiveTools.map((t) => t.function.name).join(", ")}`);
+      } catch (err) {
+        console.warn("[AI] Failed to load effective tools:", err);
+        logDebug(settings.aiVerboseLogging, `failed to load tools: ${String(err)}`);
+      }
+    }
+    payload.tools = effectiveTools;
   }
 
   onStatusChange?.("Connecting...");
@@ -491,8 +569,10 @@ export async function streamAIResponse(options: {
 
       onToolCall?.(tc.name, parsedArgs);
       onStatusChange?.(`Running tool: ${tc.name}...`);
-      
+      logDebug(settings.aiVerboseLogging, `call ${tc.name} args=${JSON.stringify(parsedArgs)}`);
+
       const result = await executeWorkspaceTool(tc.name, parsedArgs);
+      logDebug(settings.aiVerboseLogging, `result ${tc.name} => ${result}`);
 
       currentMessages.push({
         role: "tool",
@@ -511,6 +591,7 @@ export async function streamAIResponse(options: {
       onToolCall,
       onStatusChange,
       signal: externalSignal,
+      _cachedTools: effectiveTools,
     });
   }
 

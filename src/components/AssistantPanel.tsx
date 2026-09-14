@@ -1,8 +1,8 @@
 import { useState, useRef, useEffect } from "react";
 import { useStore } from "../stores/useStore";
 import ReactMarkdown from "react-markdown";
-import OpenCodeView from "./OpenCodeView";
 import { PROVIDER_PRESETS, getProviderPreset } from "../services/providerPresets";
+import { getPlatformInstallCmd } from "../services/opencodeClient";
 
 export default function AssistantPanel() {
   const assistantMessages = useStore((s) => s.assistantMessages);
@@ -16,12 +16,16 @@ export default function AssistantPanel() {
   const assistantTopicTitle = useStore((s) => s.assistantTopicTitle);
   const setAssistantTopicTitle = useStore((s) => s.setAssistantTopicTitle);
   const toggleAssistantPanel = useStore((s) => s.toggleAssistantPanel);
-  const assistantMode = useStore((s) => s.assistantMode);
-  const setAssistantMode = useStore((s) => s.setAssistantMode);
   const checkOpencodeInstalled = useStore((s) => s.checkOpencodeInstalled);
-  const startOpencodeServer = useStore((s) => s.startOpencodeServer);
   const stopOpencodeServer = useStore((s) => s.stopOpencodeServer);
+  const opencodeInstalled = useStore((s) => s.opencodeInstalled);
   const opencodeServerPid = useStore((s) => s.opencodeServerPid);
+  const opencodeStatus = useStore((s) => s.opencodeStatus);
+  const pendingToolApprovals = useStore((s) => s.pendingToolApprovals);
+  const resolveToolApproval = useStore((s) => s.resolveToolApproval);
+  const clearToolApproval = useStore((s) => s.clearToolApproval);
+
+  const engine = settings.assistantEngine;
 
   const [inputVal, setInputVal] = useState("");
   const [showModelDropdown, setShowModelDropdown] = useState(false);
@@ -62,6 +66,38 @@ export default function AssistantPanel() {
     window.addEventListener("mousedown", handleOutsideClick);
     return () => window.removeEventListener("mousedown", handleOutsideClick);
   }, []);
+
+  // Keep the fused panel's engine consistent: start/stop the opencode server
+  // based on the selected engine, and refresh install status for the OpenCode path.
+  useEffect(() => {
+    if (engine === "opencode") {
+      checkOpencodeInstalled();
+      if (settings.opencodeAutoStart && opencodeInstalled && opencodeServerPid === null) {
+        useStore.getState().ensureOpencodeReady().catch(() => {});
+      }
+    } else if (opencodeServerPid !== null) {
+      stopOpencodeServer();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engine, opencodeInstalled]);
+
+  // Stop the opencode server when the panel unmounts (same lifecycle as the old Agent view).
+  useEffect(() => {
+    return () => {
+      const pid = useStore.getState().opencodeServerPid;
+      if (pid !== null) useStore.getState().stopOpencodeServer();
+    };
+  }, []);
+
+  const handleEngineSelect = (next: "opencode" | "byok") => {
+    if (next === engine) return;
+    updateSettings({ assistantEngine: next });
+    if (next === "opencode") {
+      checkOpencodeInstalled();
+    } else if (opencodeServerPid !== null) {
+      stopOpencodeServer();
+    }
+  };
 
   const handleSend = () => {
     if (!inputVal.trim()) return;
@@ -105,78 +141,78 @@ export default function AssistantPanel() {
   };
 
   return (
-    <div className="flex h-full flex-col overflow-hidden panel-rounded border border-border bg-card">
+    <div className="flex h-full flex-col overflow-hidden panel-rounded border border-border/60 bg-card">
       {/* Top Header */}
-      <div className="flex shrink-0 items-center justify-between border-b border-border/40 px-3.5 py-2.5 bg-bg/20">
+      <div className="flex shrink-0 items-center justify-between px-4 py-3">
         <div className="flex items-center gap-2 min-w-0 flex-1">
-          {/* Mode Toggle Tabs */}
-          <div className="flex items-center rounded-md border border-border/60 bg-bg/40 p-0.5 shrink-0">
-            <button
-              onClick={() => {
-                setAssistantMode("study");
-                if (opencodeServerPid !== null) stopOpencodeServer();
+          <FluxMark className="h-4 w-4 text-accent shrink-0" />
+          {isEditingTitle ? (
+            <input
+              autoFocus
+              value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleTitleSubmit()}
+              onBlur={handleTitleSubmit}
+              className="min-w-0 flex-1 rounded border border-border bg-bg/80 px-2 py-0.5 text-xs text-white outline-none"
+            />
+          ) : (
+            <h2
+              onDoubleClick={() => {
+                setTitleDraft(assistantTopicTitle);
+                setIsEditingTitle(true);
               }}
-              className={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors cursor-pointer ${
-                assistantMode === "study"
-                  ? "bg-accent text-white"
-                  : "text-muted hover:text-white"
-              }`}
+              title="Double click to rename topic"
+              className="truncate text-[11px] font-medium tracking-wide text-muted select-none cursor-pointer hover:text-text"
             >
-              💬 Study
-            </button>
-            <button
-              onClick={() => {
-                setAssistantMode("opencode");
-                checkOpencodeInstalled();
-                if (opencodeServerPid === null) startOpencodeServer();
-              }}
-              className={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors cursor-pointer ${
-                assistantMode === "opencode"
-                  ? "bg-accent text-white"
-                  : "text-muted hover:text-white"
-              }`}
-            >
-              🤖 Agent
-            </button>
-          </div>
-
-          {assistantMode === "study" && (
-            <>
-              {isEditingTitle ? (
-                <input
-                  autoFocus
-                  value={titleDraft}
-                  onChange={(e) => setTitleDraft(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && handleTitleSubmit()}
-                  onBlur={handleTitleSubmit}
-                  className="min-w-0 flex-1 rounded border border-border bg-bg/80 px-2 py-0.5 text-xs text-white outline-none"
-                />
-              ) : (
-                <h2
-                  onDoubleClick={() => {
-                    setTitleDraft(assistantTopicTitle);
-                    setIsEditingTitle(true);
-                  }}
-                  title="Double click to rename topic"
-                  className="truncate text-xs font-semibold text-text select-none cursor-pointer hover:text-white"
-                >
-                  {assistantTopicTitle}
-                </h2>
-              )}
-            </>
+              {assistantTopicTitle}
+            </h2>
           )}
         </div>
 
         {/* Header Right Actions */}
         <div className="flex items-center gap-1.5 shrink-0">
-          {/* Online indicator circle */}
-          <div className="h-2 w-2 rounded-full border border-emerald-400/30 bg-emerald-500/80 shadow-xs" title="Assistant Active" />
+          <div className="flex items-center gap-1 pl-0.5">
+            {/* Engine status dot */}
+            {engine === "opencode" && (
+              <div
+                className={`h-1.5 w-1.5 rounded-full ${
+                  opencodeStatus === "ready"
+                    ? "bg-emerald-500"
+                    : opencodeStatus === "error"
+                      ? "bg-red-500"
+                      : opencodeStatus === "starting"
+                        ? "bg-amber-400 animate-pulse"
+                        : "bg-border"
+                }`}
+                title={
+                  opencodeStatus === "ready"
+                    ? "OpenCode ready"
+                    : opencodeStatus === "error"
+                      ? "OpenCode error"
+                      : opencodeStatus === "starting"
+                        ? "Starting OpenCode..."
+                        : "OpenCode idle"
+                }
+              />
+            )}
+            {/* Memory-RAG status dot (M6 UX) */}
+            <div
+              className={`h-1.5 w-1.5 rounded-full ${
+                settings.aiEnabled ? "bg-sky-500" : "bg-border"
+              }`}
+              title={
+                settings.aiEnabled
+                  ? `Memory-RAG on · ${settings.embedModel || "nomic-embed-text"} @ ${settings.embedBaseUrl || "localhost:11434"}`
+                  : "AI disabled — Memory-RAG off"
+              }
+            />
+          </div>
 
           {/* Options Menu (Three Dots) */}
           <div className="relative" ref={optionsMenuRef}>
             <button
               onClick={() => setShowOptionsMenu(!showOptionsMenu)}
-              className="rounded p-1 text-muted hover:bg-bg hover:text-white cursor-pointer transition-colors"
+              className="rounded-full p-1 text-muted hover:bg-bg/60 hover:text-text cursor-pointer transition-colors"
               title="Assistant Options"
             >
               <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
@@ -187,14 +223,40 @@ export default function AssistantPanel() {
             </button>
 
             {showOptionsMenu && (
-              <div className="absolute right-0 top-7 z-30 flex w-40 flex-col rounded-md border border-border bg-card p-1 text-xs text-text shadow-xl">
+              <div className="absolute right-0 top-7 z-30 flex w-48 flex-col rounded-xl border border-border/60 bg-card p-1 text-xs text-text shadow-xl">
+                <div className="px-2.5 pt-1 pb-1.5 text-[10px] font-semibold uppercase text-muted">Engine</div>
+                <div className="flex items-center rounded-full border border-border/50 bg-bg/30 p-0.5 mx-2 mb-1.5">
+                  <button
+                    onClick={() => handleEngineSelect("opencode")}
+                    title="OpenCode engine (primary) — agentic; falls back to BYOK if unavailable"
+                    className={`flex-1 rounded-full px-2.5 py-1 text-[10px] font-medium transition-colors cursor-pointer ${
+                      engine === "opencode"
+                        ? "bg-accent text-white"
+                        : "text-muted hover:text-text"
+                    }`}
+                  >
+                    OpenCode
+                  </button>
+                  <button
+                    onClick={() => handleEngineSelect("byok")}
+                    title="BYOK engine — direct API (Ollama / OpenAI / Anthropic / Gemini)"
+                    className={`flex-1 rounded-full px-2.5 py-1 text-[10px] font-medium transition-colors cursor-pointer ${
+                      engine === "byok"
+                        ? "bg-accent text-white"
+                        : "text-muted hover:text-text"
+                    }`}
+                  >
+                    BYOK
+                  </button>
+                </div>
+                <div className="h-px bg-border/50 my-0.5" />
                 <button
                   onClick={() => {
                     setTitleDraft(assistantTopicTitle);
                     setIsEditingTitle(true);
                     setShowOptionsMenu(false);
                   }}
-                  className="rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors"
+                  className="rounded-lg px-2.5 py-1.5 text-left hover:bg-bg/70 cursor-pointer transition-colors"
                 >
                   Rename Topic
                 </button>
@@ -203,17 +265,17 @@ export default function AssistantPanel() {
                     clearAssistantMessages();
                     setShowOptionsMenu(false);
                   }}
-                  className="rounded px-2.5 py-1.5 text-left text-red-400 hover:bg-red-500 hover:text-white cursor-pointer transition-colors"
+                  className="rounded-lg px-2.5 py-1.5 text-left text-red-400 hover:bg-red-500/10 cursor-pointer transition-colors"
                 >
                   Clear Chat
                 </button>
-                <div className="h-px bg-border/60 my-0.5" />
+                <div className="h-px bg-border/50 my-0.5" />
                 <button
                   onClick={() => {
                     toggleAssistantPanel();
                     setShowOptionsMenu(false);
                   }}
-                  className="rounded px-2.5 py-1.5 text-left text-muted hover:bg-bg hover:text-white cursor-pointer transition-colors"
+                  className="rounded-lg px-2.5 py-1.5 text-left text-muted hover:bg-bg/70 cursor-pointer transition-colors"
                 >
                   Hide Panel
                 </button>
@@ -223,59 +285,115 @@ export default function AssistantPanel() {
         </div>
       </div>
 
-      {/* Content: Study Assistant or OpenCode Agent */}
-      {assistantMode === "opencode" ? (
-        <div className="flex-1 overflow-hidden">
-          <OpenCodeView />
+      {/* OpenCode not installed banner */}
+      {engine === "opencode" && !opencodeInstalled && (
+        <div className="shrink-0 mx-3 mb-2 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] px-3.5 py-2.5 flex items-center justify-between gap-2">
+          <div className="min-w-0 flex-1">
+            <p className="text-[11px] font-medium text-amber-300">OpenCode not found</p>
+            <p className="text-[10px] text-muted mt-0.5 leading-relaxed">
+              Install it to power the assistant — your BYOK keys will be used as fallback automatically.
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <code className="rounded-md border border-amber-500/30 bg-bg/60 px-1.5 py-0.5 font-mono text-[10px] text-accent select-all">
+              {getPlatformInstallCmd()}
+            </code>
+            <button
+              onClick={() => checkOpencodeInstalled()}
+              className="rounded-md border border-border/50 bg-bg/40 px-2 py-1 text-[10px] text-text hover:text-white cursor-pointer transition-colors"
+            >
+              Recheck
+            </button>
+          </div>
         </div>
-      ) : (
-        <>
-          {/* Messages Stream */}
-          <div className="flex-1 space-y-4 overflow-y-auto p-4 scrollbar-thin">
+      )}
+
+      {/* Messages Stream (fused: both engines render here) */}
+      <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4 scrollbar-thin">
         {assistantMessages.length === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center text-center p-6 text-muted select-none">
-            <div className="h-10 w-10 rounded-full border border-border bg-bg/50 flex items-center justify-center mb-3">
-              <svg className="w-5 h-5 stroke-current text-accent" viewBox="0 0 24 24" fill="none" strokeWidth="2">
-                <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
-              </svg>
-            </div>
-            <p className="text-xs font-semibold text-text">Study Assistant Ready</p>
-            <p className="text-[11px] text-muted mt-1 max-w-[220px]">
-              Ask questions about your study notes, summarize documents, or generate learning plans.
+          <div className="flex h-full flex-col items-center justify-center text-center px-6 select-none">
+            <FluxMark className="h-11 w-11 text-accent/80 mb-3" />
+            <p className="text-sm font-semibold text-text tracking-tight">
+              {engine === "opencode" ? "OpenCode Agent" : "Study Assistant"}
+            </p>
+            <p className="text-[11px] text-muted mt-1.5 max-w-[230px] leading-relaxed">
+              {engine === "opencode"
+                ? "Ask it to write, edit, or refactor notes in your workspace."
+                : "Ask questions about your notes, summarize sources, or plan your study."}
             </p>
           </div>
         ) : (
-          assistantMessages.map((msg) => (
-            <div
-              key={msg.id}
-              className={`flex flex-col ${
-                msg.role === "user" ? "items-end" : "items-start"
-              }`}
-            >
-              {msg.role === "user" ? (
-                <div className="max-w-[85%] rounded-lg bg-accent px-3 py-2 text-xs text-white shadow-sm leading-relaxed whitespace-pre-wrap">
+          assistantMessages.map((msg) =>
+            msg.role === "user" ? (
+              <div key={msg.id} className="flex flex-col items-start">
+                <span className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted/70">User</span>
+                <div className="max-w-[88%] border-l-2 border-accent/40 pl-3 text-xs text-text leading-relaxed whitespace-pre-wrap">
                   {msg.content}
                 </div>
-              ) : (
-                <div className="w-full text-xs text-text/90 leading-relaxed markdown-preview">
+              </div>
+            ) : (
+              <div key={msg.id} className="flex flex-col items-end">
+                <span className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted/70">Agent</span>
+                <div className="max-w-[88%] border-r-2 border-border pr-3 text-right text-xs text-text/85 leading-relaxed markdown-preview">
                   <ReactMarkdown>{msg.content}</ReactMarkdown>
                 </div>
-              )}
-            </div>
-          ))
+              </div>
+            )
+          )
         )}
         {assistantStatusText && (
-          <div className="flex items-center gap-2 rounded-full border border-accent/40 bg-accent/10 px-3 py-1.5 text-[11px] text-accent font-medium animate-pulse w-fit">
-            <span className="text-[10px]">✨</span>
+          <div className="flex items-center gap-2 text-[11px] text-muted font-medium w-fit">
+            <span className="h-1.5 w-1.5 rounded-full bg-accent animate-pulse" />
             <span>{assistantStatusText}</span>
           </div>
         )}
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Bottom Input Area */}
-      <div className="p-3 pt-0">
-        <div className="flex flex-col rounded-xl border border-border/80 bg-bg/60 p-2.5 shadow-inner focus-within:border-accent/80 transition-colors">
+      {/* Pending file-tool approval gate (Phase 2b) */}
+      {pendingToolApprovals.length > 0 && (
+        <div className="space-y-2 px-3 pb-1">
+          {pendingToolApprovals
+            .filter((p) => p.status === "pending")
+            .map((p) => (
+              <div
+                key={p.id}
+                className="flex items-center justify-between gap-2 rounded-xl border border-amber-400/30 bg-amber-400/[0.07] px-3 py-2 text-xs"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5 font-medium text-amber-300">
+                    <span className="uppercase tracking-wide text-[10px]">AI wants to change your files</span>
+                  </div>
+                  <p className="mt-0.5 text-text/80 leading-relaxed break-words">{p.summary}</p>
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <button
+                    onClick={() => {
+                      resolveToolApproval(p.id, "approved");
+                      setTimeout(() => clearToolApproval(p.id), 1200);
+                    }}
+                    className="rounded-full bg-emerald-500 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-emerald-400 cursor-pointer transition-colors"
+                  >
+                    Approve
+                  </button>
+                  <button
+                    onClick={() => {
+                      resolveToolApproval(p.id, "rejected");
+                      clearToolApproval(p.id);
+                    }}
+                    className="rounded-full border border-border/60 bg-bg/60 px-2.5 py-1 text-[11px] font-medium text-red-400 hover:bg-red-500/10 cursor-pointer transition-colors"
+                  >
+                    Deny
+                  </button>
+                </div>
+              </div>
+            ))}
+        </div>
+      )}
+
+      {/* Bottom Input Area (shared) */}
+      <div className="px-3 pb-3 pt-1">
+        <div className="flex flex-col rounded-3xl border border-border/50 bg-bg/50 px-4 py-3 focus-within:border-accent/50 transition-colors">
           {/* Text Area */}
           <textarea
             ref={textareaRef}
@@ -283,105 +401,117 @@ export default function AssistantPanel() {
             value={inputVal}
             onChange={(e) => setInputVal(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Add \ or ask assistant..."
-            className="w-full resize-none bg-transparent text-xs text-text placeholder:text-muted/60 outline-none leading-relaxed"
+            placeholder={
+              engine === "opencode"
+                ? "Ask the OpenCode agent to write, edit, or explain code..."
+                : "Ask anything..."
+            }
+            className="w-full resize-none bg-transparent text-xs text-text placeholder:text-muted/50 outline-none leading-relaxed"
           />
 
           {/* Bottom Toolbar */}
-          <div className="mt-2 flex items-center justify-between pt-1 border-t border-border/30">
+          <div className="mt-1 flex items-center justify-between">
             {/* Left toolbar items */}
             <div className="flex items-center gap-1.5">
-              {/* Attach Context Button (+) */}
-              <div className="relative" ref={attachMenuRef}>
-                <button
-                  onClick={() => setShowAttachMenu(!showAttachMenu)}
-                  title="Add context attachment"
-                  className="flex h-6 w-6 items-center justify-center rounded-md border border-border/60 text-muted hover:border-text hover:text-white cursor-pointer transition-colors"
-                >
-                  <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2.5">
-                    <line x1="12" y1="5" x2="12" y2="19" />
-                    <line x1="5" y1="12" x2="19" y2="12" />
-                  </svg>
-                </button>
-
-                {showAttachMenu && (
-                  <div className="absolute bottom-8 left-0 z-30 flex w-44 flex-col rounded-md border border-border bg-card p-1 text-xs text-text shadow-xl">
+              {engine === "opencode" ? (
+                <span className="text-[10px] font-medium text-muted">
+                  OpenCode · file edit · LSP
+                </span>
+              ) : (
+                <>
+                  {/* Attach Context Button (+) */}
+                  <div className="relative" ref={attachMenuRef}>
                     <button
-                      onClick={() => handleAttachContext("active_file")}
-                      className="flex items-center gap-2 rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors"
+                      onClick={() => setShowAttachMenu(!showAttachMenu)}
+                      title="Add context attachment"
+                      className="flex h-6 w-6 items-center justify-center rounded-full text-muted hover:text-text hover:bg-bg/60 cursor-pointer transition-colors"
                     >
-                      <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
-                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2.5">
+                        <line x1="12" y1="5" x2="12" y2="19" />
+                        <line x1="5" y1="12" x2="19" y2="12" />
                       </svg>
-                      Active Note Context
                     </button>
+
+                    {showAttachMenu && (
+                      <div className="absolute bottom-8 left-0 z-30 flex w-44 flex-col rounded-xl border border-border/60 bg-card p-1 text-xs text-text shadow-xl">
+                        <button
+                          onClick={() => handleAttachContext("active_file")}
+                          className="flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-left hover:bg-bg/70 cursor-pointer transition-colors"
+                        >
+                          <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                          </svg>
+                          Active Note Context
+                        </button>
+                        <button
+                          onClick={() => handleAttachContext("folder")}
+                          className="flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-left hover:bg-bg/70 cursor-pointer transition-colors"
+                        >
+                          <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
+                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                          </svg>
+                          Vault Workspace
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Model Dropdown Pill Badge */}
+                  <div className="relative" ref={modelDropdownRef}>
                     <button
-                      onClick={() => handleAttachContext("folder")}
-                      className="flex items-center gap-2 rounded px-2.5 py-1.5 text-left hover:bg-accent hover:text-white cursor-pointer transition-colors"
+                      onClick={() => setShowModelDropdown(!showModelDropdown)}
+                      className="flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium text-muted hover:text-text hover:bg-bg/60 cursor-pointer transition-colors"
                     >
-                      <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
-                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                      <span className="text-[10px] text-accent font-bold">
+                        {modelsList.find((m) => m.id === settings.aiProvider)?.icon || "🦙"}
+                      </span>
+                      <span className="truncate max-w-[100px]">{settings.aiModelName || "hermes3:8b"}</span>
+                      <svg className="w-3 h-3 text-muted shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <polyline points="6 9 12 15 18 9" />
                       </svg>
-                      Vault Workspace
                     </button>
+
+                    {showModelDropdown && (
+                      <div className="absolute bottom-8 left-0 z-30 flex w-56 flex-col rounded-xl border border-border/60 bg-card p-1 text-xs text-text shadow-xl">
+                        <div className="px-2 py-1 text-[10px] font-semibold uppercase text-muted">BYOK Fallback AI Engine & Model</div>
+                        {modelsList.map((m) => (
+                          <button
+                            key={m.id}
+                            onClick={() => {
+                              const defaultUrl = getProviderPreset(m.id)?.defaultBaseUrl ?? settings.aiBaseUrl;
+
+                              updateSettings({
+                                aiProvider: m.id,
+                                aiModelName: m.model,
+                                aiBaseUrl: defaultUrl,
+                              });
+                              setShowModelDropdown(false);
+                            }}
+                            className={`flex items-center justify-between rounded-lg px-2.5 py-1.5 text-left cursor-pointer transition-colors ${
+                              settings.aiProvider === m.id ? "bg-accent text-white font-medium" : "hover:bg-bg/70 text-text/90"
+                            }`}
+                          >
+                            <div className="flex flex-col min-w-0">
+                              <div className="flex items-center gap-1.5 font-medium truncate">
+                                <span>{m.icon}</span>
+                                <span className="truncate">{m.name}</span>
+                              </div>
+                              <span className="text-[10px] text-muted leading-tight truncate">{m.desc}</span>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
-
-              {/* Model Dropdown Pill Badge */}
-              <div className="relative" ref={modelDropdownRef}>
-                <button
-                  onClick={() => setShowModelDropdown(!showModelDropdown)}
-                  className="flex items-center gap-1 rounded-md border border-border/70 bg-card/80 px-2 py-1 text-[11px] font-medium text-text/90 hover:border-accent/60 hover:text-white cursor-pointer transition-colors"
-                >
-                  <span className="text-[10px] text-accent font-bold">
-                    {modelsList.find((m) => m.id === settings.aiProvider)?.icon || "🦙"}
-                  </span>
-                  <span className="truncate max-w-[100px]">{settings.aiModelName || "hermes3:8b"}</span>
-                  <svg className="w-3 h-3 text-muted shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <polyline points="6 9 12 15 18 9" />
-                  </svg>
-                </button>
-
-                {showModelDropdown && (
-                  <div className="absolute bottom-8 left-0 z-30 flex w-56 flex-col rounded-md border border-border bg-card p-1 text-xs text-text shadow-xl">
-                    <div className="px-2 py-1 text-[10px] font-semibold uppercase text-muted">AI Engine & Model</div>
-                    {modelsList.map((m) => (
-                      <button
-                        key={m.id}
-                        onClick={() => {
-                          const defaultUrl = getProviderPreset(m.id)?.defaultBaseUrl ?? settings.aiBaseUrl;
-
-                          updateSettings({
-                            aiProvider: m.id,
-                            aiModelName: m.model,
-                            aiBaseUrl: defaultUrl,
-                          });
-                          setShowModelDropdown(false);
-                        }}
-                        className={`flex items-center justify-between rounded px-2.5 py-1.5 text-left cursor-pointer transition-colors ${
-                          settings.aiProvider === m.id ? "bg-accent text-white font-medium" : "hover:bg-bg/80 text-text/90"
-                        }`}
-                      >
-                        <div className="flex flex-col min-w-0">
-                          <div className="flex items-center gap-1.5 font-medium truncate">
-                            <span>{m.icon}</span>
-                            <span className="truncate">{m.name}</span>
-                          </div>
-                          <span className="text-[10px] text-muted leading-tight truncate">{m.desc}</span>
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
+                </>
+              )}
             </div>
 
             {/* Right: Send / Stop Button */}
             {isAssistantStreaming ? (
               <button
                 onClick={cancelAssistantMessage}
-                className="flex h-7 w-7 items-center justify-center rounded-md bg-red-500/90 text-white shadow-sm hover:bg-red-500 cursor-pointer transition-all"
+                className="flex h-7 w-7 items-center justify-center rounded-full bg-red-500/90 text-white hover:bg-red-500 cursor-pointer transition-all"
                 title="Stop generating"
               >
                 <svg className="w-3 h-3 fill-current" viewBox="0 0 24 24">
@@ -392,9 +522,9 @@ export default function AssistantPanel() {
               <button
                 onClick={handleSend}
                 disabled={!inputVal.trim()}
-                className={`flex h-7 w-7 items-center justify-center rounded-md transition-all ${
+                className={`flex h-7 w-7 items-center justify-center rounded-full transition-all ${
                   inputVal.trim()
-                    ? "bg-accent text-white shadow-sm hover:bg-accent-hover cursor-pointer scale-100"
+                    ? "bg-accent text-white hover:bg-accent-hover cursor-pointer scale-100"
                     : "bg-border/40 text-muted cursor-not-allowed opacity-50"
                 }`}
                 title="Send message"
@@ -408,9 +538,18 @@ export default function AssistantPanel() {
           </div>
         </div>
       </div>
-        </>
-      )}
     </div>
   );
 }
 
+function FluxMark({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 64 64" fill="none" stroke="currentColor" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 24h12a8 8 0 0 1 8 8v0a8 8 0 0 0 8 8h12" />
+      <polyline points="44 32 52 40 44 48" />
+      <path d="M52 40H40a8 8 0 0 1-8-8v0a8 8 0 0 0-8-8H12" />
+      <polyline points="20 32 12 24 20 16" />
+      <circle cx="12" cy="40" r="2.5" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}

@@ -1,8 +1,53 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { getThemeById, applyThemeToDocument } from "../themes";
-import type { Project, GitRepoStatus, GitStatusEntry } from "../types";
-import { streamAIResponse, ChatMessagePayload, fetchAvailableModels } from "../services/aiProvider";
+import type { Project, McpConnector, GitRepoStatus, GitStatusEntry } from "../types";
+import { streamAIResponse, fetchAvailableModels } from "../services/aiProvider";
+import { applyProjectTemplate } from "../utils/projectTemplates";
+
+// Debounce window for the lazy Memory-RAG embedding pass that runs after vault reindex.
+let pendingEmbedRebuildTimer: ReturnType<typeof setTimeout> | null = null;
+
+
+// Built-in research connector presets (offline-first: shipped disabled). Users opt in
+// per-connector in Settings -> Connectors & Research. Remote presets that need a key
+// leave `headers` empty until the user supplies credentials.
+export const CONNECTOR_PRESETS: McpConnector[] = [
+  {
+    id: "preset-wikipedia",
+    name: "Wikipedia",
+    kind: "http",
+    url: "https://mcp-wikipedia.vdo.pub/sse",
+    enabled: false,
+    headers: {},
+  },
+  {
+    id: "preset-arxiv",
+    name: "Arxiv Research",
+    kind: "http",
+    url: "https://mcp-papers-api.arxiv.org/sse",
+    enabled: false,
+    headers: {},
+  },
+  {
+    id: "preset-filesystem",
+    name: "Filesystem",
+    kind: "stdio",
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "."],
+    enabled: false,
+    env: {},
+  },
+  {
+    id: "preset-fetch",
+    name: "Fetch (raw URLs)",
+    kind: "stdio",
+    command: "npx",
+    args: ["-y", "mcp-server-fetch"],
+    enabled: false,
+    env: {},
+  },
+];
 
 
 export type ViewMode = "source" | "live" | "preview";
@@ -73,11 +118,26 @@ export interface UserAccount {
   avatarColor: string;
 }
 
+export interface GoogleAccount {
+  name: string;
+  email: string;
+}
+
 export interface AssistantMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   timestamp: string;
+}
+
+// Pending destructive file-write tool approval (Phase 2b approval gate). A tool call
+// suspends in `executeWorkspaceTool` until the user approves or rejects it.
+export interface PendingToolApproval {
+  id: string;
+  tool: string;
+  args: Record<string, any>;
+  summary: string;
+  status: "pending" | "approved" | "rejected";
 }
 
 const INITIAL_ASSISTANT_MESSAGES: AssistantMessage[] = [
@@ -109,7 +169,7 @@ export interface Settings {
   autoPairBrackets: boolean;
   showWordCount: boolean;
 
-  // BYOK AI Engine Settings
+  // BYOK AI Engine Settings (also the fallback route when OpenCode fails)
   aiEnabled: boolean;
   aiProvider: string; // "ollama_hermes" | "openai" | "anthropic" | "gemini" | "custom"
   aiBaseUrl: string;
@@ -118,9 +178,29 @@ export interface Settings {
   aiEnableWorkspaceTools: boolean;
   aiSystemPrompt: string;
 
+  // Primary assistant engine (fused panel): "opencode" (default) or "byok" (direct API)
+  assistantEngine: "opencode" | "byok";
+  opencodeFallbackToByok: boolean; // route to BYOK automatically when OpenCode is unavailable
+
+  // Memory-RAG (Agent Knowledge) settings
+  embedBaseUrl: string; // Ollama HTTP root, e.g. http://localhost:11434
+  embedModel: string;   // embedding model tag, e.g. nomic-embed-text
+  ragTopK: number;      // RAG passages injected into context per turn
+  memoryAutoSave: boolean; // persist Q&A turns and extracted facts to memory_entries
+
+  // File-mutation tools (create/update/delete) — off by default
+  aiEnableFileWrite: boolean;
+
+  // Diagnostics: append tool-calling activity (tools offered, calls made, results
+  // returned) to a local debug log file — off by default, opt-in for troubleshooting.
+  aiVerboseLogging: boolean;
+
   // OpenCode Agent Settings
   opencodePort: number;       // default 4096 (OpenCode's own default for `opencode serve`)
   opencodeAutoStart: boolean; // auto-start server when switching to OpenCode Agent tab
+
+  // MCP Connectors
+  connectors: McpConnector[];
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -152,9 +232,27 @@ const DEFAULT_SETTINGS: Settings = {
   aiEnableWorkspaceTools: true,
   aiSystemPrompt: "You are an intelligent study assistant for Local Study Notebook. Use workspace tools and context to provide accurate study summaries.",
 
+  // Memory-RAG defaults
+  embedBaseUrl: "http://localhost:11434",
+  embedModel: "nomic-embed-text",
+  ragTopK: 5,
+  memoryAutoSave: true,
+
+  // File-mutation tools (create/update/delete) are gated off by default
+  aiEnableFileWrite: false,
+  aiVerboseLogging: false,
+
+  // Primary engine defaults: OpenCode first, auto-fallback to BYOK
+  assistantEngine: "opencode",
+  opencodeFallbackToByok: true,
+
   // OpenCode Agent defaults
   opencodePort: 4096,        // OpenCode's actual documented default port for `opencode serve`
   opencodeAutoStart: true,
+
+  // MCP Connectors — all disabled by default (offline-first, opt-in). Ship with the
+  // research presets below so the user can flip them on in Settings -> Connectors.
+  connectors: [],
 };
 
 interface AppState {
@@ -258,6 +356,7 @@ interface AppState {
   setArtifactsWidth: (w: number) => void;
   setActiveArtifact: (a: Artifact | null) => void;
   addArtifact: (a: Artifact) => void;
+  deleteArtifact: (id: string) => void;
 
   // Agent actions
   toggleAgentPanel: () => void;
@@ -278,6 +377,11 @@ interface AppState {
   setShowSettings: (show: boolean) => void;
   updateSettings: (s: Partial<Settings>) => void;
 
+  // MCP Connector actions
+  addConnector: (c: Omit<McpConnector, "id" | "enabled" | "tools">) => void;
+  updateConnector: (id: string, patch: Partial<McpConnector>) => void;
+  removeConnector: (id: string) => void;
+
   // Assistant / Co-pilot States & Actions
   showAssistantPanel: boolean;
   assistantWidth: number;
@@ -291,10 +395,17 @@ interface AppState {
   assistantAbortController: AbortController | null;       // never persisted to localStorage
 
   // OpenCode Agent runtime state (never persisted to localStorage)
-  assistantMode: "study" | "opencode";                   // which tab is active
   opencodeInstalled: boolean;                            // result of check_opencode_installed
   opencodeServerPid: number | null;                      // PID of running opencode serve
   opencodeServerPassword: string | null;                 // in-memory only, never persisted
+  opencodeSessionId: string | null;                      // active opencode session (fused panel)
+  opencodeStatus: "off" | "starting" | "ready" | "error"; // server readiness for engine routing
+
+  // Destructive file-tool approval gate (Phase 2b)
+  pendingToolApprovals: PendingToolApproval[];
+  addPendingToolApproval: (approval: PendingToolApproval) => void;
+  resolveToolApproval: (id: string, status: "approved" | "rejected") => void;
+  clearToolApproval: (id: string) => void;
 
   sendAssistantMessage: (text: string) => Promise<void>;
   cancelAssistantMessage: () => void;
@@ -307,10 +418,18 @@ interface AppState {
   fetchAndSetAvailableModels: () => Promise<void>;        // fetches live models from provider
 
   // OpenCode Agent actions
-  setAssistantMode: (mode: "study" | "opencode") => void;
   checkOpencodeInstalled: () => Promise<void>;
   startOpencodeServer: () => Promise<void>;
   stopOpencodeServer: () => Promise<void>;
+  ensureOpencodeReady: () => Promise<void>;   // server + session up, routes study chat
+  resetOpencodeSession: () => void;           // starts a fresh opencode session on next turn
+
+  // Google Drive backup (BACKUP-0): account + OAuth flow
+  googleAccount: GoogleAccount | null;
+  backupSigningIn: boolean;
+  refreshGoogleAccount: () => Promise<void>;
+  connectGoogle: () => Promise<void>;
+  signOutGoogle: () => Promise<void>;
 
   // Session & Account States & Actions (TopBar)
   sessions: SessionTab[];
@@ -335,7 +454,7 @@ interface AppState {
   setShowLauncherModal: (show: boolean) => void;
   setShowPanelLayoutModal: (show: boolean) => void;
   applyPanelPreset: (preset: "default" | "focus" | "assistant" | "explorer") => void;
-  scaffoldWorkspaceTemplate: (folderPath: string) => Promise<void>;
+  scaffoldWorkspaceTemplate: (folderPath: string, templateId?: string) => Promise<void>;
 
   // Custom saved layouts (TICKET-B4)
   customLayouts: CustomLayout[];
@@ -344,10 +463,111 @@ interface AppState {
   deleteCustomLayout: (id: string) => void;
 }
 
+/**
+ * Renders the enabled connector registry into the OpenCode config shape opencode actually
+ * accepts (verified live on v1.18): "local" (stdio) and "remote" (streamable-http) entries.
+ * Secrets (headers/env) become `{env:VAR}` placeholders and the real values are returned in
+ * `env` so the Rust side can scope them to the sidecar child only — nothing secret is written
+ * to disk. Offline http connectors are skipped, mirroring the workspace-tools router.
+ *
+ * Always includes a `permission` block denying the `bash` tool by default: OpenCode's "ask"
+ * outcome only has a documented approval flow in its own TUI, not over the `serve` HTTP/SSE
+ * API this app drives, so a note or connector that prompt-injects the agent can't get it to
+ * run shell commands unattended. Edit/read/git-via-MCP tools stay allowed. A user who wants
+ * bash back can drop their own opencode.json in the vault — this export is skipped whenever
+ * a user-authored one already exists (see spawn_opencode_server).
+ *
+ * The payload carries a `_lsnManaged: true` marker so a future run can tell this file
+ * apart from a real user config. Without it, a file orphaned by an unclean shutdown
+ * (kill_opencode_server normally deletes it, but a crash/force-kill skips that) would
+ * look identical to a hand-authored config on the next launch and permanently block
+ * the export — silently freezing stale MCP servers/permissions in place.
+ */
+export function buildOpencodeMcpExport(
+  connectors: McpConnector[],
+): { config: string | null; env: Record<string, string> } {
+  const servers: Record<string, unknown> = {};
+  const env: Record<string, string> = {};
+  const used = new Set<string>();
+  let envIdx = 0;
+
+  const safeName = (raw: string, _id: string) => {
+    let base = (raw || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+    if (!base) base = "connector";
+    let name = base;
+    let n = 2;
+    while (used.has(name)) {
+      name = `${base}-${n++}`;
+    }
+    used.add(name);
+    return name;
+  };
+  const secretToPlaceholder = (value: string) => {
+    const varName = `LSN_MCP_${++envIdx}`;
+    env[varName] = value;
+    return `{env:${varName}}`;
+  };
+
+  for (const c of connectors) {
+    if (!c.enabled) continue;
+    if (c.kind === "http" && (typeof navigator === "undefined" || !navigator.onLine)) continue;
+
+    if (c.kind === "stdio") {
+      const command = (c.command || "").trim();
+      if (!command) continue;
+      const args = (c.args ?? []).filter((a) => a.trim() !== "");
+      const entry: Record<string, unknown> = {
+        type: "local",
+        command: [command, ...args],
+        enabled: true,
+      };
+      const cEnv = c.env ?? {};
+      const envKeys = Object.keys(cEnv).filter((k) => cEnv[k].trim() !== "");
+      if (envKeys.length > 0) {
+        const mapped: Record<string, string> = {};
+        for (const k of envKeys) {
+          mapped[k] = secretToPlaceholder(cEnv[k]);
+        }
+        entry.env = mapped;
+      }
+      servers[safeName(c.name, c.id)] = entry;
+    } else {
+      const url = (c.url || "").trim();
+      if (!url) continue;
+      const entry: Record<string, unknown> = { type: "remote", url };
+      const h = c.headers ?? {};
+      const headerKeys = Object.keys(h).filter((k) => h[k].trim() !== "");
+      if (headerKeys.length > 0) {
+        const mapped: Record<string, string> = {};
+        for (const k of headerKeys) {
+          mapped[k] = secretToPlaceholder(h[k]);
+        }
+        entry.headers = mapped;
+      }
+      servers[safeName(c.name, c.id)] = entry;
+    }
+  }
+
+  const payload: Record<string, unknown> = { _lsnManaged: true, permission: { bash: "deny" } };
+  if (Object.keys(servers).length > 0) payload.mcp = servers;
+  return { config: JSON.stringify(payload), env };
+}
+
 export const useStore = create<AppState>((set, get) => {
   // Load initial settings and pinned paths from localStorage
   const localSettings = localStorage.getItem("lsn_settings");
-  const initialSettings = localSettings ? { ...DEFAULT_SETTINGS, ...JSON.parse(localSettings) } : DEFAULT_SETTINGS;
+  const parsedSettings = localSettings ? JSON.parse(localSettings) : {};
+  // Merge persisted settings over defaults; seed the connector registry with presets only
+  // on a true first run (no `connectors` key at all). Once the registry exists — even as an
+  // empty array — the user's choice is respected.
+  const existingConnectors: McpConnector[] | undefined = parsedSettings?.connectors;
+  const initialConnectors: McpConnector[] =
+    Array.isArray(existingConnectors) ? existingConnectors : CONNECTOR_PRESETS;
+  const initialSettings = { ...DEFAULT_SETTINGS, ...parsedSettings, connectors: initialConnectors };
   const initialPinned = localStorage.getItem("lsn_pinned");
   const pinnedPaths = initialPinned ? JSON.parse(initialPinned) : [];
   const savedFolder = localStorage.getItem("lsn_last_folder");
@@ -458,6 +678,8 @@ export const useStore = create<AppState>((set, get) => {
       avatarLetter: "D",
       avatarColor: "#7c3aed"
     },
+    googleAccount: null,
+    backupSigningIn: false,
     showSearchModal: false,
     topbarViewMode: "split",
 
@@ -483,9 +705,23 @@ export const useStore = create<AppState>((set, get) => {
       // Full vault-index rescan (DATA-2) — fire-and-forget so a large vault's content
       // hashing doesn't delay the folder actually opening; incremental updates from
       // individual file operations keep the index current the rest of the time.
-      invoke("reindex_vault", { vaultRoot: path }).catch((err) => {
-        console.error("Failed to reindex vault:", err);
-      });
+      // Once the rescan lands, kick the lazy Memory-RAG embedding pass (debounced) so
+      // chunk rows written by this rescan get vectors without blocking the open.
+      invoke("reindex_vault", { vaultRoot: path })
+        .then(() => {
+          if (pendingEmbedRebuildTimer !== null) clearTimeout(pendingEmbedRebuildTimer);
+          pendingEmbedRebuildTimer = setTimeout(() => {
+            pendingEmbedRebuildTimer = null;
+            const s = get().settings;
+            if (!s.aiEnabled) return;
+            import("../services/agentKnowledge").then(({ rebuildEmbeddings }) => {
+              rebuildEmbeddings(path, s).catch(() => {});
+            });
+          }, 800);
+        })
+        .catch((err) => {
+          console.error("Failed to reindex vault:", err);
+        });
     },
 
     closeFolder: () => {
@@ -1042,12 +1278,13 @@ export const useStore = create<AppState>((set, get) => {
     setArtifactsWidth: (w) => set({ artifactsWidth: w }),
     setActiveArtifact: (a) => set({ activeArtifact: a }),
     addArtifact: (a) => set((s) => ({ artifacts: [...s.artifacts, a], activeArtifact: a })),
+    deleteArtifact: (id) =>
+      set((s) => ({
+        artifacts: s.artifacts.filter((a) => a.id !== id),
+        activeArtifact: s.activeArtifact?.id === id ? null : s.activeArtifact,
+      })),
     toggleAgentPanel: () => set((s) => ({ showAgentPanel: !s.showAgentPanel })),
     setAgentWidth: (w) => set({ agentWidth: w }),
-    setAgentMessages: (msgs) => set({ agentMessages: msgs }),
-    addAgentMessage: (msg) => set((s) => ({ agentMessages: [...s.agentMessages, msg] })),
-    setAgentContext: (ctx) => set({ agentContext: ctx }),
-    setAgentTask: (task) => set({ agentTask: task }),
     toggleWorkTreePanel: () => set((s) => ({ showWorkTreePanel: !s.showWorkTreePanel })),
     setWorkTreeWidth: (w) => set({ workTreeWidth: w }),
     refreshGitStatus: async () => {
@@ -1106,6 +1343,10 @@ export const useStore = create<AppState>((set, get) => {
         set({ diffContents: { ...get().diffContents, [tabId]: `// Failed to load diff: ${String(err)}` } });
       }
     },
+    setAgentMessages: (msgs) => set({ agentMessages: msgs }),
+    addAgentMessage: (msg) => set((s) => ({ agentMessages: [...s.agentMessages, msg] })),
+    setAgentContext: (ctx) => set({ agentContext: ctx }),
+    setAgentTask: (task) => set({ agentTask: task }),
     reorderPanels: (fromId, toId) => {
       const order = get().panelOrder;
       const fromIndex = order.indexOf(fromId);
@@ -1119,7 +1360,7 @@ export const useStore = create<AppState>((set, get) => {
       set({ panelOrder: nextOrder });
       localStorage.setItem("lsn_panel_order", JSON.stringify(nextOrder));
     },
-    // Settings
+// Settings
     setShowSettings: (show) => set({ showSettings: show }),
     updateSettings: (updated) => {
       const nextSettings = { ...get().settings, ...updated };
@@ -1139,6 +1380,26 @@ export const useStore = create<AppState>((set, get) => {
         accentHover: nextSettings.accentColor || theme.accentHover,
       });
     },
+
+    // MCP Connector actions
+    addConnector: (c) => {
+      const connector: McpConnector = { ...c, id: "conn-" + Date.now(), enabled: false, tools: [] };
+      const { updateSettings } = get();
+      updateSettings({ connectors: [...get().settings.connectors, connector] });
+    },
+    updateConnector: (id, patch) => {
+      const connectors = get().settings.connectors.map((c) => (c.id === id ? { ...c, ...patch } : c));
+      get().updateSettings({ connectors });
+      if (patch.enabled === false) {
+        // Tear the child process / http session down so a disabled connector never lingers.
+        invoke("stop_connector", { id }).catch(() => {});
+      }
+    },
+    removeConnector: (id) => {
+      const connectors = get().settings.connectors.filter((c) => c.id !== id);
+      get().updateSettings({ connectors });
+    },
+
     // Project actions
     addProject: (id, name, path) => {
       const project: Project = { id, name, path, lastOpened: new Date().toISOString() };
@@ -1186,10 +1447,27 @@ export const useStore = create<AppState>((set, get) => {
     availableModels: [],
 
     // OpenCode Agent runtime state — never persisted (no localStorage)
-    assistantMode: "study",
     opencodeInstalled: false,
     opencodeServerPid: null,
     opencodeServerPassword: null,
+    opencodeSessionId: null,
+    opencodeStatus: "off",
+
+    // Destructive file-tool approval gate
+    pendingToolApprovals: [],
+
+    addPendingToolApproval: (approval) =>
+      set((s) => ({ pendingToolApprovals: [...s.pendingToolApprovals, approval] })),
+
+    resolveToolApproval: (id, status) =>
+      set((s) => ({
+        pendingToolApprovals: s.pendingToolApprovals.map((p) =>
+          p.id === id && p.status === "pending" ? { ...p, status } : p
+        ),
+      })),
+
+    clearToolApproval: (id) =>
+      set((s) => ({ pendingToolApprovals: s.pendingToolApprovals.filter((p) => p.id !== id) })),
 
 
     sendAssistantMessage: async (text: string) => {
@@ -1217,7 +1495,6 @@ export const useStore = create<AppState>((set, get) => {
         return;
       }
 
-      // Build context attachments if present
       let contextPrefix = "";
       const activePath = store.activeLeftTabId || store.activeRightTabId;
       if (activePath && (text.includes("@") || text.includes("active"))) {
@@ -1226,19 +1503,7 @@ export const useStore = create<AppState>((set, get) => {
         contextPrefix += `[Attached Context - Note: ${noteName}]\n${activeContent}\n\n`;
       }
 
-      // Prepare conversation payload for AI
-      const systemMessage: ChatMessagePayload = {
-        role: "system",
-        content: store.settings.aiSystemPrompt || "You are an intelligent study assistant for Local Study Notebook.",
-      };
-
-      const historyPayload: ChatMessagePayload[] = [
-        systemMessage,
-        ...updatedMessages.slice(-10).map((m) => ({
-          role: m.role as "user" | "assistant",
-          content: m.role === "user" && m.id === userMsg.id ? `${contextPrefix}${m.content}` : m.content,
-        })),
-      ];
+      const scope = store.assistantTopicTitle || (store.currentFolderPath ? store.currentFolderPath.split(/[\\/]/).pop() || store.currentFolderPath : "global");
 
       const assistantMsgId = "msg-" + (Date.now() + 1);
       const assistantMsg: AssistantMessage = {
@@ -1253,26 +1518,104 @@ export const useStore = create<AppState>((set, get) => {
       const controller = new AbortController();
       set({ assistantAbortController: controller });
 
-      try {
-        const finalText = await streamAIResponse({
-          messages: historyPayload,
-          settings: store.settings,
-          onChunk: (accumulatedText) => {
-            set((state) => ({
-              assistantMessages: state.assistantMessages.map((m) =>
-                m.id === assistantMsgId ? { ...m, content: accumulatedText } : m
-              ),
-            }));
-          },
-          onStatusChange: (status) => {
-            set({ assistantStatusText: status });
-          },
-          signal: controller.signal,
-        });
+      let finalText = "";
+      let servedBy: "opencode" | "byok" = store.settings.assistantEngine;
 
-        // A successful request with no visible text usually means the provider blocked or
-        // filtered the output (e.g. Gemini safety filters) rather than the app failing —
-        // surface that instead of leaving a permanently blank chat bubble.
+      try {
+        // ─── OpenCode engine path ──────────────────────────────────────────────
+        if (store.settings.assistantEngine === "opencode") {
+          try {
+            const { streamOpencodeReply, reindexOpencodeVault } = await import("../services/opencodeClient");
+            await get().ensureOpencodeReady();
+            const { opencodeSessionId, opencodeServerPassword, settings, currentFolderPath } = get();
+            if (!opencodeSessionId || !opencodeServerPassword) throw new Error("no opencode session");
+
+            let payloadText = text;
+            const hasPriorUserTurn = store.assistantMessages.filter((m) => m.role === "user" && m.id !== userMsg.id).length > 0;
+            if (!hasPriorUserTurn && currentFolderPath) {
+              try {
+                const { fetchContextBundle, formatContextBundle } = await import("../services/agentKnowledge");
+                const bundScope = currentFolderPath.split(/[\\/]/).pop() || "vault";
+                const bundle = await fetchContextBundle({
+                  vaultRoot: currentFolderPath,
+                  scope: bundScope,
+                  queryText: text,
+                  limit: settings.ragTopK ?? 5,
+                });
+                if (bundle) {
+                  payloadText = [
+                    "## Workspace context (Memory-RAG bootstrap)",
+                    formatContextBundle(bundle),
+                    "Use this context to ground your work in the user's existing notes.",
+                    "",
+                    "---",
+                    "",
+                    text,
+                  ].join("\n\n");
+                }
+              } catch {
+                /* offline or embed-server down — send the plain message */
+              }
+            }
+
+            finalText = await streamOpencodeReply({
+              sessionId: opencodeSessionId,
+              port: settings.opencodePort,
+              password: opencodeServerPassword,
+              text: payloadText,
+              signal: controller.signal,
+              onChunk: (accumulatedText) => {
+                set((state) => ({
+                  assistantMessages: state.assistantMessages.map((m) =>
+                    m.id === assistantMsgId ? { ...m, content: accumulatedText } : m
+                  ),
+                }));
+              },
+              onStatusChange: (status) => set({ assistantStatusText: status }),
+              onToolCall: (tool, status) => set({ assistantStatusText: `🔧 ${tool} · ${status}` }),
+              onFileEdit: () => {
+                if (currentFolderPath) reindexOpencodeVault(currentFolderPath);
+              },
+            });
+          } catch (opencodeErr) {
+            const wasCancelled = opencodeErr instanceof DOMException && opencodeErr.name === "AbortError";
+            if (wasCancelled) throw opencodeErr;
+            if (store.settings.opencodeFallbackToByok) {
+              servedBy = "byok";
+            } else {
+              throw opencodeErr;
+            }
+          }
+        }
+
+        // ─── BYOK engine path (direct API or fallback from OpenCode) ───────────
+        if (servedBy === "byok") {
+          const { buildPromptWithContext } = await import("../services/agentKnowledge");
+          const { streamAIResponse } = await import("../services/aiProvider");
+          const historyPayload = await buildPromptWithContext({
+            messages: updatedMessages.map((m) => ({ role: m.role, content: m.content })),
+            settings: store.settings,
+            scope,
+            vaultRoot: store.currentFolderPath || undefined,
+            queryText: text,
+            attachment: contextPrefix || undefined,
+          });
+          finalText = await streamAIResponse({
+            messages: historyPayload,
+            settings: store.settings,
+            onChunk: (accumulatedText) => {
+              set((state) => ({
+                assistantMessages: state.assistantMessages.map((m) =>
+                  m.id === assistantMsgId ? { ...m, content: accumulatedText } : m
+                ),
+              }));
+            },
+            onStatusChange: (status) => set({ assistantStatusText: status }),
+            signal: controller.signal,
+          });
+        }
+
+        // ─── Post-processing: empty check, fallback notice, memory save ────────
         if (!finalText.trim()) {
           set((state) => ({
             assistantMessages: state.assistantMessages.map((m) =>
@@ -1285,6 +1628,20 @@ export const useStore = create<AppState>((set, get) => {
                 : m
             ),
           }));
+        } else {
+          const displayText =
+            servedBy !== store.settings.assistantEngine
+              ? `${finalText.trim()}\n\n---\n_Routed via BYOK fallback (OpenCode unavailable)._`
+              : finalText;
+          set((state) => ({
+            assistantMessages: state.assistantMessages.map((m) =>
+              m.id === assistantMsgId ? { ...m, content: displayText } : m
+            ),
+          }));
+          if (store.settings.memoryAutoSave !== false) {
+            const { persistConversationTurn } = await import("../services/agentKnowledge");
+            persistConversationTurn({ userText: text, assistantText: finalText, scope }, store.settings).catch(() => {});
+          }
         }
       } catch (err) {
         const wasCancelled = err instanceof DOMException && err.name === "AbortError";
@@ -1308,7 +1665,7 @@ export const useStore = create<AppState>((set, get) => {
     cancelAssistantMessage: () => {
       get().assistantAbortController?.abort();
     },
-    clearAssistantMessages: () => set({ assistantMessages: [] }),
+    clearAssistantMessages: () => { set({ assistantMessages: [] }); get().resetOpencodeSession(); },
     setAssistantWidth: (w) => set({ assistantWidth: w }),
     toggleAssistantPanel: () => set((s) => ({ showAssistantPanel: !s.showAssistantPanel })),
     setSelectedModel: (m) => set({ selectedModel: m }),
@@ -1329,8 +1686,6 @@ export const useStore = create<AppState>((set, get) => {
     // OpenCode Agent actions
     // ---------------------------------------------------------------------------
 
-    setAssistantMode: (mode) => set({ assistantMode: mode }),
-
     checkOpencodeInstalled: async () => {
       try {
         const installed = await invoke<boolean>("check_opencode_installed");
@@ -1340,9 +1695,12 @@ export const useStore = create<AppState>((set, get) => {
       }
     },
 
+    resetOpencodeSession: () => set({ opencodeSessionId: null }),
+
     startOpencodeServer: async () => {
       const { settings, currentFolderPath, opencodeServerPid } = get();
       if (opencodeServerPid !== null) return; // already running
+      set({ opencodeStatus: "starting", opencodeSessionId: null });
 
       const workspace = currentFolderPath || ".";
       // Generate a per-session random password (never persisted to disk).
@@ -1368,11 +1726,16 @@ export const useStore = create<AppState>((set, get) => {
       }
 
       try {
+        const { config: mcpOverride, env: mcpEnv } = buildOpencodeMcpExport(
+          get().settings.connectors ?? [],
+        );
         const pid = await invoke<number>("spawn_opencode_server", {
           port: settings.opencodePort,
           workspacePath: workspace,
           serverPassword: password,
           providerEnv,
+          mcpOverride,
+          mcpEnv,
         });
         set({ opencodeServerPid: pid, opencodeServerPassword: password });
       } catch (err) {
@@ -1388,7 +1751,79 @@ export const useStore = create<AppState>((set, get) => {
       } catch (err) {
         console.error("[OpenCode] Failed to stop server:", err);
       } finally {
-        set({ opencodeServerPid: null, opencodeServerPassword: null });
+        set({ opencodeServerPid: null, opencodeServerPassword: null, opencodeSessionId: null, opencodeStatus: "off" });
+      }
+    },
+
+    ensureOpencodeReady: async () => {
+      const { settings, opencodeInstalled, opencodeServerPid, opencodeSessionId, currentFolderPath } = get();
+      if (!opencodeInstalled) {
+        await get().checkOpencodeInstalled();
+        if (!get().opencodeInstalled) {
+          set({ opencodeStatus: "error" });
+          throw new Error("OpenCode is not installed.");
+        }
+      }
+      if (opencodeServerPid === null) {
+        set({ opencodeStatus: "starting" });
+        await get().startOpencodeServer();
+        if (get().opencodeServerPid === null) {
+          set({ opencodeStatus: "error" });
+          throw new Error("Failed to start the OpenCode server.");
+        }
+      }
+      if (opencodeSessionId) { set({ opencodeStatus: "ready" }); return; }
+      const { opencodeServerPassword } = get();
+      const baseUrl = `http://localhost:${settings.opencodePort}`;
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (opencodeServerPassword) headers["Authorization"] = `Basic ${btoa(`opencode:${opencodeServerPassword}`)}`;
+      for (let i = 0; i < 20; i++) {
+        try {
+          const res = await fetch(`${baseUrl}/session`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ workspaceDir: currentFolderPath || "." }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            set({ opencodeSessionId: data.id ?? data.sessionID ?? null, opencodeStatus: "ready" });
+            return;
+          }
+        } catch { /* retry */ }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      set({ opencodeStatus: "error" });
+      throw new Error("OpenCode server is not responding.");
+    },
+
+    // Google Drive backup (BACKUP-0)
+    refreshGoogleAccount: async () => {
+      try {
+        const acct = await invoke<GoogleAccount | null>("google_account");
+        set({ googleAccount: acct });
+      } catch (err) {
+        console.warn("Failed to check Google Drive account:", err);
+      }
+    },
+
+    connectGoogle: async () => {
+      set({ backupSigningIn: true });
+      try {
+        const acct = await invoke<GoogleAccount>("google_sign_in");
+        set({ googleAccount: acct, backupSigningIn: false });
+      } catch (err) {
+        set({ backupSigningIn: false });
+        throw err;
+      }
+    },
+
+    signOutGoogle: async () => {
+      try {
+        await invoke("google_sign_out");
+      } catch (err) {
+        console.warn("Google sign-out failed:", err);
+      } finally {
+        set({ googleAccount: null });
       }
     },
 
@@ -1493,53 +1928,11 @@ export const useStore = create<AppState>((set, get) => {
       localStorage.setItem("lsn_custom_layouts", JSON.stringify(customLayouts));
     },
 
-    scaffoldWorkspaceTemplate: async (folderPath: string) => {
+    scaffoldWorkspaceTemplate: async (folderPath: string, templateId?: string) => {
       try {
-        // Create default template directories via Tauri commands
-        await invoke("create_local_dir", { parentPath: folderPath, name: "Sources", vaultRoot: folderPath });
-        await invoke("create_local_dir", { parentPath: folderPath, name: "Guides", vaultRoot: folderPath });
-        await invoke("create_local_dir", { parentPath: folderPath, name: "_attachments", vaultRoot: folderPath });
-
-        // Content for Welcome.md
-        const welcomeContent = `# Welcome to Local Study Notebook 🚀
-
-Welcome to your offline-first, local-first study workspace!
-
-## 📁 Default Workspace Structure
-- **Sources/**: Store raw study documents, research notes, and web captures.
-- **Guides/**: Keep course outlines, exam prep summaries, and structured guides.
-- **_attachments/**: Media files, figures, and diagrams.
-
-## ⚡ Quick Guide
-- **Smart Markdown Editor**: Raw markdown syntax renders automatically when hovering or editing lines!
-- **Split-Screen Workspace**: Open notes side-by-side.
-- **Local File Explorer**: Fast workspace tree view with right-click context menu.
-- **AI Study Assistant**: Chat with your local study co-pilot.
-
----
-*Start learning!*`;
-
-        // Content for Study_Plan.md
-        const planContent = `# 📚 Sample Study Plan
-
-## Topic: Core Objectives
-- [ ] Review Chapter 1: Foundations
-- [ ] Create summary notes in \`Guides/\`
-- [ ] Self-quiz on key concepts
-
-## Notes & Hypotheses
-Add your personal study observations here...`;
-
-        // Write template files
-        const welcomePath = await invoke<string>("create_local_file", { dirPath: folderPath, name: "Welcome.md", vaultRoot: folderPath });
-        await invoke("write_local_file", { path: welcomePath, content: welcomeContent, vaultRoot: folderPath });
-
-        const guidesDir = `${folderPath}/Guides`;
-        const planPath = await invoke<string>("create_local_file", { dirPath: guidesDir, name: "Study_Plan.md", vaultRoot: folderPath });
-        await invoke("write_local_file", { path: planPath, content: planContent, vaultRoot: folderPath });
-
-        // Open newly created folder and open Welcome.md
+        await applyProjectTemplate(folderPath, templateId || "standard-study");
         await get().openFolder(folderPath);
+        const welcomePath = `${folderPath}/Welcome.md`;
         await get().openFile(welcomePath);
       } catch (err) {
         console.error("Failed to scaffold workspace template:", err);

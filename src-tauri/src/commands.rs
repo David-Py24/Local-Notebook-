@@ -1,6 +1,13 @@
+use crate::chunks;
 use crate::db::{DbState, LinkItem};
 use rusqlite::params;
+use std::sync::{Mutex, OnceLock};
 use tauri::{Manager, State};
+
+/// Tracks the project-local `opencode.json` we write for a connector export, so
+/// `kill_opencode_server` can remove it when the sidecar stops. This keeps the
+/// export non-destructive and leaves no artifact behind in the user's vault.
+static OPENCODE_MCP_CONFIG: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
 
 // Local version history (DATA-3): before overwriting a tracked file, the previous content
 // is copied into <app_data_dir>/history/<hash-of-path>/<timestamp>.<ext>, capped at the
@@ -107,6 +114,12 @@ fn remove_from_index_recursive(conn: &rusqlite::Connection, path_str: &str) -> R
         params![path_str, prefix_pattern],
     )
     .map_err(|e| e.to_string())?;
+    // Memory-RAG: drop this file's (or subtree's) chunks too; chunks_fts syncs itself.
+    conn.execute(
+        "DELETE FROM note_chunks WHERE path = ?1 OR path LIKE ?2",
+        params![path_str, prefix_pattern],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -136,6 +149,11 @@ fn reindex_after_rename(conn: &rusqlite::Connection, old_str: &str, new_str: &st
             params![new_file_path, old_file_path],
         )
         .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE note_chunks SET path = ?1 WHERE path = ?2",
+            params![new_file_path, old_file_path],
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -157,11 +175,35 @@ fn reindex_dir_recursive(conn: &rusqlite::Connection, dir: &std::path::Path, dep
         } else if let Ok(content) = std::fs::read_to_string(&path) {
             // Binary/non-UTF8 files are silently skipped — this index is for note content.
             if upsert_file_index(conn, &path, &content).is_ok() {
+                if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    // Memory-RAG: rebuild this file's text chunks. Embeddings stay NULL here;
+                    // they're filled lazily by rebuild_embeddings once an embed server is up.
+                    let _ = sync_chunks_for_file(conn, &path, &content);
+                }
                 count += 1;
             }
         }
     }
     Ok(count)
+}
+
+// Memory-RAG (AGENT_MEMORY_RAG_PLAN.md, M1): replace every stored chunk for a note with
+// fresh chunks. The chunks_fts shadow table stays in sync automatically via the triggers
+// declared in db.rs, so this function only touches note_chunks.
+fn sync_chunks_for_file(conn: &rusqlite::Connection, path: &std::path::Path, content: &str) -> Result<(), String> {
+    let path_str = path.to_string_lossy().into_owned();
+    conn.execute("DELETE FROM note_chunks WHERE path = ?1", params![&path_str])
+        .map_err(|e| e.to_string())?;
+
+    for (i, chunk) in chunks::chunk_markdown(content).iter().enumerate() {
+        conn.execute(
+            "INSERT INTO note_chunks (path, chunk_index, chunk_text, char_offset, token_count, embed_model, embedding, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
+            params![&path_str, i as i64, &chunk.text, chunk.char_offset as i64, chunk.token_count as i64, now_iso()],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -479,6 +521,26 @@ pub fn write_local_file(
 }
 
 #[tauri::command]
+pub fn export_markdown_to_pdf(
+    title: String,
+    content: String,
+    target_path: String,
+    vault_root: Option<String>,
+) -> Result<String, String> {
+    // The target may sit inside a not-yet-created folder (default _attachments/exports/);
+    // create parents up front so validate_vault_path can resolve, then re-validate.
+    if let Some(parent) = std::path::Path::new(&target_path).parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    let valid_path = validate_vault_path(&target_path, vault_root.as_deref())?;
+    let bytes = crate::pdf_export::render_markdown_to_pdf_bytes(&title, &content)?;
+    std::fs::write(&valid_path, &bytes).map_err(|e| e.to_string())?;
+    Ok(valid_path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 pub fn create_local_file(
     state: State<DbState>,
     dir_path: String,
@@ -688,6 +750,492 @@ pub fn search_vault(vault_root: String, query: String) -> Result<Vec<SearchResul
     Ok(results)
 }
 
+// Memory-RAG (M1): lazy embedding sync. The frontend pulls chunks whose embedding is
+// still NULL, batches them to the embed server, then writes the vectors back here. This
+// split keeps ALL AI HTTP in the frontend (consistent with aiProvider.ts) while the
+// vectors and retrieval stay in SQLite.
+
+#[derive(serde::Serialize)]
+pub struct UnembeddedChunk {
+    pub rowid: i64,
+    pub path: String,
+    pub chunk_index: i64,
+    pub text: String,
+}
+
+#[tauri::command]
+pub fn get_unembedded_chunks(state: State<DbState>, vault_root: String, limit: usize) -> Result<Vec<UnembeddedChunk>, String> {
+    let root = std::path::Path::new(&vault_root);
+    if !root.is_dir() {
+        return Err("Not a directory".to_string());
+    }
+    let root_str = root.to_string_lossy();
+    let prefix = format!(
+        "{}{}%",
+        root_str.trim_end_matches(std::path::MAIN_SEPARATOR),
+        std::path::MAIN_SEPARATOR
+    );
+
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT rowid, path, chunk_index, chunk_text
+             FROM note_chunks
+             WHERE embedding IS NULL AND path LIKE ?1
+             ORDER BY rowid
+             LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![prefix, limit.max(0) as i64], |row| {
+            Ok(UnembeddedChunk {
+                rowid: row.get(0)?,
+                path: row.get(1)?,
+                chunk_index: row.get(2)?,
+                text: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+#[derive(serde::Deserialize)]
+pub struct EmbeddedChunk {
+    pub rowid: i64,
+    pub embedding: Vec<f32>,
+}
+
+#[tauri::command]
+pub fn store_chunk_embeddings(state: State<DbState>, items: Vec<EmbeddedChunk>, embed_model: String) -> Result<usize, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    let mut updated = 0usize;
+    for item in items.iter() {
+        let bytes = crate::embeddings::pack_f32s(&item.embedding);
+        updated += conn
+            .execute(
+                "UPDATE note_chunks SET embedding = ?1, embed_model = ?2 WHERE rowid = ?3",
+                params![bytes.as_slice(), &embed_model, item.rowid],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(updated)
+}
+
+// ---------------------------------------------------------------------------
+// Memory-RAG (AGENT_MEMORY_RAG_PLAN.md, M2): hybrid retrieval + durable memory.
+//
+// Ranking model: FTS5 pre-filters candidates to a small set, then an optional query
+// embedding re-ranks them by cosine similarity when the embed server was reachable.
+// When no vectors exist (server down / index not built yet), results degrade gracefully
+// to pure keyword ranking. All AI HTTP stays in the frontend; Rust owns storage + math.
+// ---------------------------------------------------------------------------
+
+fn vault_path_prefix(root: &std::path::Path) -> String {
+    let root_str = root.to_string_lossy();
+    format!(
+        "{}{}%",
+        root_str.trim_end_matches(std::path::MAIN_SEPARATOR),
+        std::path::MAIN_SEPARATOR
+    )
+}
+
+/// Splits a free-text query into sanitized FTS5 terms (alphanumeric only, lowercased).
+/// Quoting each term neutralizes FTS5 operator syntax in user input.
+fn fts_terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+fn fts_match_query(query: &str) -> Option<String> {
+    let terms = fts_terms(query);
+    if terms.is_empty() {
+        return None;
+    }
+    let quoted: Vec<String> = terms.into_iter().map(|t| format!("\"{t}\"")).collect();
+    Some(quoted.join(" "))
+}
+
+#[derive(serde::Serialize)]
+pub struct RagHit {
+    pub path: String,
+    pub title: String,
+    pub snippet: String,
+    pub score: f32,
+    pub char_offset: i64,
+}
+
+fn title_from_path(path: &std::path::Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Untitled".to_string())
+}
+
+fn search_rag_internal(
+    conn: &rusqlite::Connection,
+    vault_root: &std::path::Path,
+    query_text: &str,
+    query_embedding: &[f32],
+    limit: usize,
+) -> Result<Vec<RagHit>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let match_query = match fts_match_query(query_text) {
+        Some(q) => q,
+        None => return Ok(Vec::new()),
+    };
+    let prefix = vault_path_prefix(vault_root);
+    const CANDIDATES: i64 = 50;
+
+    // 1. Keyword pre-filter (works fully offline).
+    let mut stmt = conn
+        .prepare(
+            "SELECT rowid, rank FROM chunks_fts
+             WHERE chunks_fts MATCH ?1
+               AND rowid IN (SELECT rowid FROM note_chunks WHERE path LIKE ?2)
+             ORDER BY rank
+             LIMIT ?3",
+        )
+        .map_err(|e| e.to_string())?;
+    let candidates: Vec<(i64, f32)> = stmt
+        .query_map(params![match_query, prefix, CANDIDATES], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect();
+    drop(stmt);
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 2. Load chunk metadata + optional stored vector for each candidate.
+    struct CandidateRow {
+        chunk: RagHit,
+        embedding: Option<Vec<f32>>,
+    }
+    let mut rows: Vec<CandidateRow> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, chunk_index, chunk_text, char_offset, embedding
+                 FROM note_chunks WHERE rowid = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        for (rowid, rank) in candidates.iter() {
+            let fetched = stmt
+                .query_row(params![rowid], |row| {
+                    let path: String = row.get(0)?;
+                    let _chunk_index: i64 = row.get(1)?;
+                    let chunk_text: String = row.get(2)?;
+                    let char_offset: i64 = row.get(3)?;
+                    let embedding: Option<Vec<u8>> = row.get(4)?;
+                    Ok((
+                        path,
+                        chunk_text,
+                        char_offset,
+                        embedding.map(|b| crate::embeddings::unpack_f32s(&b)),
+                    ))
+                })
+                .map_err(|e| e.to_string());
+            if let Ok((path, text, char_offset, embedding)) = fetched {
+                let snippet: String = text.chars().take(600).collect();
+                rows.push(CandidateRow {
+                    chunk: RagHit {
+                        title: title_from_path(std::path::Path::new(&path)),
+                        snippet,
+                        path: path.clone(),
+                        char_offset,
+                        score: *rank,
+                    },
+                    embedding,
+                });
+            }
+        }
+    }
+
+    // 3. Re-rank by cosine when possible; otherwise keep keyword (rank) order.
+    if !query_embedding.is_empty() {
+        for row in rows.iter_mut() {
+            if let Some(vec) = &row.embedding {
+                row.chunk.score = crate::embeddings::cosine(query_embedding, vec);
+            } else {
+                row.chunk.score = 0.0;
+            }
+        }
+        // Embedded hits first (cosine desc), then unembedded in keyword order.
+        rows.sort_by(|a, b| {
+            b.chunk
+                .score
+                .partial_cmp(&a.chunk.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // Recover stable keyword order for the unembedded tail.
+        rows.sort_by(|a, b| {
+            let a_embedded = a.embedding.is_some();
+            let b_embedded = b.embedding.is_some();
+            match (a_embedded, b_embedded) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (true, true) => b
+                    .chunk
+                    .score
+                    .partial_cmp(&a.chunk.score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                (false, false) => a
+                    .chunk
+                    .score
+                    .partial_cmp(&b.chunk.score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            }
+        });
+    }
+
+    Ok(rows
+        .into_iter()
+        .take(limit)
+        .map(|r| r.chunk)
+        .collect())
+}
+
+#[tauri::command]
+pub fn search_rag(
+    state: State<DbState>,
+    vault_root: String,
+    query_text: String,
+    query_embedding: Vec<f32>,
+    limit: usize,
+) -> Result<Vec<RagHit>, String> {
+    let root = std::path::Path::new(&vault_root);
+    if !root.is_dir() {
+        return Err("Not a directory".to_string());
+    }
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    search_rag_internal(&conn, root, &query_text, &query_embedding, limit)
+}
+
+#[derive(serde::Serialize)]
+pub struct MemoryItem {
+    pub id: i64,
+    pub scope: String,
+    pub kind: String,
+    pub content: String,
+    pub source: String,
+    pub topic_title: Option<String>,
+    pub created_at: String,
+    pub score: f32,
+}
+
+#[tauri::command]
+pub fn add_memory(
+    state: State<DbState>,
+    scope: String,
+    kind: String,
+    content: String,
+    source: String,
+    topic_title: Option<String>,
+    embedding: Vec<f32>,
+) -> Result<i64, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    let bytes = if embedding.is_empty() {
+        None
+    } else {
+        Some(crate::embeddings::pack_f32s(&embedding))
+    };
+    conn.execute(
+        "INSERT INTO memory_entries (scope, kind, content, source, topic_title, created_at, embedding)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![scope, kind, content, source, topic_title, now_iso(), bytes.as_deref()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn recall_memory_internal(
+    conn: &rusqlite::Connection,
+    scope: &str,
+    query_text: &str,
+    query_embedding: &[f32],
+    limit: usize,
+) -> Result<Vec<MemoryItem>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let like = query_text.trim();
+    let scope_filter = if scope.trim().is_empty() {
+        "%".to_string()
+    } else {
+        scope.to_string()
+    };
+
+    struct Row {
+        item: MemoryItem,
+        embedding: Option<Vec<f32>>,
+    }
+    let mut rows: Vec<Row> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, scope, kind, content, source, topic_title, created_at, embedding
+                 FROM memory_entries
+                 WHERE active = 1
+                   AND scope LIKE ?1
+                   AND (?2 = '' OR content LIKE '%' || ?2 || '%')
+                 ORDER BY created_at DESC
+                 LIMIT ?3",
+            )
+            .map_err(|e| e.to_string())?;
+        let collected = stmt
+            .query_map(params![scope_filter, like, limit as i64], |row| {
+                let id: i64 = row.get(0)?;
+                let scope: String = row.get(1)?;
+                let kind: String = row.get(2)?;
+                let content: String = row.get(3)?;
+                let source: String = row.get(4)?;
+                let topic_title: Option<String> = row.get(5)?;
+                let created_at: String = row.get(6)?;
+                let embedding: Option<Vec<u8>> = row.get(7)?;
+                Ok(Row {
+                    item: MemoryItem {
+                        id,
+                        scope,
+                        kind,
+                        content,
+                        source,
+                        topic_title,
+                        created_at,
+                        score: 0.0,
+                    },
+                    embedding: embedding.map(|b| crate::embeddings::unpack_f32s(&b)),
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        collected
+            .filter_map(Result::ok)
+            .take(limit)
+            .collect()
+    };
+
+    if !query_embedding.is_empty() {
+        for row in rows.iter_mut() {
+            if let Some(vec) = &row.embedding {
+                row.item.score = crate::embeddings::cosine(query_embedding, vec);
+            }
+        }
+        rows.sort_by(|a, b| {
+            b.item
+                .score
+                .partial_cmp(&a.item.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    Ok(rows.into_iter().take(limit).map(|r| r.item).collect())
+}
+
+#[tauri::command]
+pub fn recall_memory(
+    state: State<DbState>,
+    scope: String,
+    query_text: String,
+    query_embedding: Vec<f32>,
+    limit: usize,
+) -> Result<Vec<MemoryItem>, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    recall_memory_internal(&conn, &scope, &query_text, &query_embedding, limit)
+}
+
+fn backlinks_for_path(conn: &rusqlite::Connection, target_path: &str) -> Result<Vec<LinkItem>, String> {
+    let normalized_target = link_target_basename(target_path);
+    let mut stmt = conn
+        .prepare("SELECT id, source_path, target_path, link_text, line_number FROM links ORDER BY source_path, line_number")
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<LinkItem> = stmt
+        .query_map([], |row| {
+            Ok(LinkItem {
+                id: Some(row.get(0)?),
+                source_path: row.get(1)?,
+                target_path: row.get(2)?,
+                link_text: row.get(3)?,
+                line_number: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .filter(|link| link_target_basename(&link.target_path) == normalized_target)
+        .collect();
+    Ok(rows)
+}
+
+#[derive(serde::Serialize)]
+pub struct ActiveNoteContext {
+    pub path: String,
+    pub title: String,
+    pub excerpt: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct ContextBundle {
+    pub scope: String,
+    pub memory: Vec<MemoryItem>,
+    pub rag: Vec<RagHit>,
+    pub active_note: Option<ActiveNoteContext>,
+    pub backlinks: Vec<LinkItem>,
+}
+
+#[tauri::command]
+pub fn get_context_bundle(
+    state: State<DbState>,
+    vault_root: String,
+    scope: String,
+    query_text: String,
+    query_embedding: Vec<f32>,
+    active_note_path: Option<String>,
+    rag_limit: usize,
+) -> Result<ContextBundle, String> {
+    let root = std::path::Path::new(&vault_root);
+    if !root.is_dir() {
+        return Err("Not a directory".to_string());
+    }
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+
+    let memory = recall_memory_internal(&conn, "", &scope, &query_embedding, rag_limit)?;
+    let rag = search_rag_internal(&conn, root, &query_text, &query_embedding, rag_limit)?;
+
+    let active_note = match &active_note_path {
+        Some(path_str) if !path_str.trim().is_empty() => {
+            std::fs::read_to_string(path_str).ok().map(|content| {
+                let title = title_from_path(std::path::Path::new(path_str));
+                let excerpt: String = content.chars().take(2500).collect();
+                ActiveNoteContext {
+                    path: path_str.clone(),
+                    title,
+                    excerpt,
+                }
+            })
+        }
+        _ => None,
+    };
+
+    let backlinks = match &active_note_path {
+        Some(path_str) => backlinks_for_path(&conn, path_str)?,
+        None => Vec::new(),
+    };
+
+    Ok(ContextBundle {
+        scope,
+        memory,
+        rag,
+        active_note,
+        backlinks,
+    })
+}
+
 #[cfg(test)]
 mod backlink_tests {
     use super::*;
@@ -735,6 +1283,18 @@ mod index_tests {
                 last_indexed_at TEXT NOT NULL,
                 last_backed_up_at TEXT,
                 sync_status     TEXT NOT NULL DEFAULT 'not_tracked'
+            );
+            CREATE TABLE note_chunks (
+                rowid       INTEGER PRIMARY KEY AUTOINCREMENT,
+                path        TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_text  TEXT NOT NULL,
+                char_offset INTEGER NOT NULL,
+                token_count INTEGER NOT NULL,
+                embed_model TEXT,
+                embedding   BLOB,
+                indexed_at  TEXT NOT NULL,
+                UNIQUE(path, chunk_index)
             );",
         )
         .unwrap();
@@ -968,6 +1528,8 @@ pub fn spawn_opencode_server(
     workspace_path: String,
     server_password: String,
     provider_env: std::collections::HashMap<String, String>,
+    mcp_override: Option<String>,
+    mcp_env: Option<std::collections::HashMap<String, String>>,
 ) -> Result<u32, String> {
     let workspace = std::path::Path::new(&workspace_path);
     if !workspace.exists() {
@@ -992,6 +1554,63 @@ pub fn spawn_opencode_server(
     for (key, value) in &provider_env {
         if !value.is_empty() {
             cmd.env(key, value);
+        }
+    }
+
+    // OpenCode config export (§ MCP_CONNECTORS_PLAN 6.3): OpenCode has no CLI flag to
+    // register MCP servers or permissions for `serve` (verified: v1.18 accepts only
+    // project/global config), so we write a project-local `opencode.json` carrying the
+    // MCP connector registry plus a default `permission` block (bash denied — "ask" has
+    // no documented approval flow over `serve`'s HTTP/SSE API, only in OpenCode's own
+    // TUI) — but ONLY when the vault has no existing opencode config, so a user's own
+    // config (including their own permission choices) is never clobbered. Secrets
+    // (headers/env) are exported as `{env:VAR}` placeholders; the real values are
+    // injected into this child's environment only, so nothing secret hits disk.
+    //
+    // `kill_opencode_server` deletes this file on a clean stop, but an unclean exit
+    // (crash, force-kill, OS shutdown) can orphan it in the vault — and on the next
+    // launch `OPENCODE_MCP_CONFIG` starts empty, so this process has no memory of
+    // having written it. Without a way to tell "our own leftover export" apart from
+    // "a real user config", a mere `exists()` check would treat that orphan as sacred
+    // and skip the export forever, silently keeping stale MCP servers/permissions.
+    // So the file we write carries a `_lsnManaged: true` marker, and only a file at
+    // the exact export path bearing that marker is treated as safely overwritable;
+    // anything else that exists (marker-less, or one of the alternate config paths/
+    // extensions) is assumed to be the user's own and is left untouched.
+    if let Some(override_str) = mcp_override.filter(|s| !s.trim().is_empty()) {
+        let dot_opencode = workspace.join(".opencode");
+        let config_file = workspace.join("opencode.json");
+        let other_user_config_paths = [
+            workspace.join("opencode.jsonc"),
+            dot_opencode.join("opencode.json"),
+            dot_opencode.join("opencode.jsonc"),
+        ];
+        let is_our_own_export = std::fs::read_to_string(&config_file)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("_lsnManaged").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
+        let has_foreign_config = other_user_config_paths.iter().any(|p| p.exists())
+            || (config_file.exists() && !is_our_own_export);
+        if has_foreign_config {
+            eprintln!("[OpenCode] existing user-authored opencode config found; skipping config export (including default permissions)");
+        } else {
+            std::fs::write(&config_file, &override_str).map_err(|e| {
+                format!("Failed to write connector config for opencode serve: {e}")
+            })?;
+            if let Some(env) = mcp_env {
+                for (key, value) in env {
+                    if !value.is_empty() {
+                        cmd.env(key, value);
+                    }
+                }
+            }
+            if let Some(lock) = OPENCODE_MCP_CONFIG.get() {
+                lock.lock().map_err(|e| e.to_string())?.replace(config_file);
+            } else {
+                let _ = OPENCODE_MCP_CONFIG
+                    .set(Mutex::new(Some(config_file)));
+            }
         }
     }
 
@@ -1024,6 +1643,49 @@ pub fn kill_opencode_server(pid: u32) -> Result<(), String> {
             .status()
             .map_err(|e| format!("kill failed: {e}"))?;
     }
+
+    // Remove the connector-export config we wrote into the vault (if any).
+    let Ok(mut lock) = OPENCODE_MCP_CONFIG.get_or_init(Default::default).lock() else {
+        return Ok(());
+    };
+    if let Some(path) = lock.take() {
+        let _ = std::fs::remove_file(path);
+    }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// AI debug log (opt-in, "Verbose AI Tool Logging" in Settings)
+//
+// A single append-only plain-text file in the app-data dir. Written to only when
+// the frontend explicitly enables the setting — this is for diagnosing tool-calling/
+// agentic behavior (which tools were offered, which were called, what came back)
+// without needing to reconstruct raw SSE payloads by hand through browser DevTools.
+// ---------------------------------------------------------------------------
+
+fn ai_debug_log_path(app_handle: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Could not resolve app data dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("ai-debug.log"))
+}
+
+#[tauri::command]
+pub fn append_ai_debug_log(app_handle: tauri::AppHandle, line: String) -> Result<(), String> {
+    use std::io::Write;
+    let path = ai_debug_log_path(&app_handle)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    writeln!(file, "{line}").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_ai_debug_log_path(app_handle: tauri::AppHandle) -> Result<String, String> {
+    Ok(ai_debug_log_path(&app_handle)?.to_string_lossy().to_string())
 }
 

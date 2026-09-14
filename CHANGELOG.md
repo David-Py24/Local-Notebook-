@@ -2,6 +2,19 @@
 
 All notable changes to the Local Study Notebook are documented in this file.
 
+## [1.5.0] - 2026-09-11
+
+### Added
+- **Project Launcher Templates** (`projectTemplates.ts`, `WorkspaceLauncherModal.tsx`): select from pre-built workspace templates (**Standard Study Vault**, **Research & Literature Vault**, **Minimal Notebook**) when creating a new project.
+
+### Improved
+- **Context-Aware Markdown Syntax Hiding** (`markdownLivePreview.ts`): fine-tuned CodeMirror 6 Live Preview mode so inline syntax markers (`**`, `*`, `` ` ``, `~~`, `#`, `- [ ]`) hide dynamically per formatted word/element range when cursor moves away, unveiling syntax only when actively touched by the cursor.
+- **StudyBoard Paragraph & Bullet Structures** (`markdownListContinuation.ts`, `MarkdownEditor.tsx`, `index.css`): enhanced paragraph line-height and spacing, added multi-level bullet markers (`•`, `◦`, `▪`) based on indent level, auto-incrementing ordered lists (`1.`, `2.`), and polished task checkbox vertical alignment in both editor and preview modes.
+- **Tab Bar Navigation & Overflow** (`StudyBoard.tsx`): restricted visible active tabs with clean overflow deduplication in the `+X more` dropdown menu and added horizontal mouse wheel scrolling across the tab strip.
+- **Store Template Scaffolding** (`useStore.ts`): extended `scaffoldWorkspaceTemplate` action to accept template IDs for instant vault setup.
+
+---
+
 ## [1.4.0] - 2026-09-04
 
 ### Added

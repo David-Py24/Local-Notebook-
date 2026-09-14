@@ -1,5 +1,6 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useState } from "react";
 import { useStore, Artifact } from "../stores/useStore";
 
 export default function ArtifactsPanel() {
@@ -7,6 +8,30 @@ export default function ArtifactsPanel() {
   const activeArtifact = useStore((s) => s.activeArtifact);
   const setActiveArtifact = useStore((s) => s.setActiveArtifact);
   const toggleArtifactsPanel = useStore((s) => s.toggleArtifactsPanel);
+  const vaultRoot = useStore((s) => s.currentFolderPath);
+  const [exportNote, setExportNote] = useState<string | null>(null);
+
+  const doExport = async (format: "markdown" | "pdf") => {
+    if (!activeArtifact) return;
+    setExportNote(null);
+    if (!vaultRoot) {
+      setExportNote("Open a folder first — exports need a vault.");
+      return;
+    }
+    try {
+      const { exportArtifact } = await import("../services/agentKnowledge");
+      const written = await exportArtifact({
+        title: activeArtifact.title,
+        content: activeArtifact.content,
+        vaultRoot,
+        format,
+      });
+      useStore.getState().refreshExplorer();
+      setExportNote(`Exported to ${written.split(/[\\/]/).slice(-2).join("/")}`);
+    } catch (err) {
+      setExportNote(`Export failed: ${String(err)}`);
+    }
+  };
 
   return (
     <div className="flex h-full flex-col overflow-hidden panel-rounded bg-card border-l border-border/40">
@@ -32,16 +57,35 @@ export default function ArtifactsPanel() {
       <div className="flex-1 overflow-y-auto scrollbar-thin">
         {activeArtifact ? (
           <div className="flex flex-col h-full">
-            <div className="flex items-center justify-between border-b border-border/30 bg-bg/20 px-3 py-2">
+            <div className="flex items-center justify-between gap-2 border-b border-border/30 bg-bg/20 px-3 py-2">
               <button
                 onClick={() => setActiveArtifact(null)}
                 className="text-[10px] font-semibold uppercase text-muted hover:text-white cursor-pointer"
               >
                 ← Back to list
               </button>
-              <span className="text-[10px] font-mono text-muted uppercase">{activeArtifact.type}</span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => void doExport("markdown")}
+                  title="Export as Markdown into the vault"
+                  className="rounded border border-border/60 bg-bg/40 px-2 py-0.5 text-[10px] font-semibold text-muted hover:border-accent/70 hover:text-white cursor-pointer transition-colors"
+                >
+                  .md
+                </button>
+                <button
+                  onClick={() => void doExport("pdf")}
+                  title="Export as PDF into the vault"
+                  className="rounded border border-border/60 bg-bg/40 px-2 py-0.5 text-[10px] font-semibold text-muted hover:border-accent/70 hover:text-white cursor-pointer transition-colors"
+                >
+                  .pdf
+                </button>
+                <span className="text-[10px] font-mono text-muted uppercase">{activeArtifact.type}</span>
+              </div>
             </div>
             <h3 className="px-3 pt-3 text-sm font-semibold text-text">{activeArtifact.title}</h3>
+            {exportNote && (
+              <p className="px-3 pt-1.5 text-[10px] text-cyan-400/90">{exportNote}</p>
+            )}
             <div className="px-3 py-3 text-xs text-text/90 leading-relaxed markdown-preview">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{activeArtifact.content}</ReactMarkdown>
             </div>

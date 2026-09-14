@@ -7,9 +7,15 @@ function App() {
   const refreshExplorer = useStore((s) => s.refreshExplorer);
   const reduceMotion = useStore((s) => s.settings.reduceMotion);
   const onboardingComplete = useStore((s) => s.onboardingComplete);
+  const refreshGoogleAccount = useStore((s) => s.refreshGoogleAccount);
 
   const startupFolder = useStore((s) => s.settings.startupFolder);
   const openFolder = useStore((s) => s.openFolder);
+
+  // Restore the signed-in Google Drive account (refresh token lives in the OS Credential Manager)
+  useEffect(() => {
+    refreshGoogleAccount();
+  }, [refreshGoogleAccount]);
 
   useEffect(() => {
     if (!onboardingComplete) return;

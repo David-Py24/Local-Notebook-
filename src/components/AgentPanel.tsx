@@ -18,20 +18,77 @@ export default function AgentPanel() {
   const setAgentContext = useStore((s) => s.setAgentContext);
   const addAgentMessage = useStore((s) => s.addAgentMessage);
   const toggleAgentPanel = useStore((s) => s.toggleAgentPanel);
+  const pendingToolApprovals = useStore((s) => s.pendingToolApprovals);
+  const resolveToolApproval = useStore((s) => s.resolveToolApproval);
+  const clearToolApproval = useStore((s) => s.clearToolApproval);
 
   const [inputVal, setInputVal] = useState("");
 
   const handleSend = () => {
     const text = inputVal.trim();
     if (!text) return;
-    addAgentMessage({ id: "user-" + Date.now(), role: "user", text, timestamp: Date.now() });
     setInputVal("");
-    addAgentMessage({
-      id: "agent-" + Date.now(),
-      role: "agent",
-      text: `I've registered your ${agentTask} request. (Scaffold — agent processing will be wired here.)`,
-      timestamp: Date.now(),
-    });
+
+    const store = useStore.getState();
+    const task: AgentTask = agentTask;
+    const vaultRoot = store.currentFolderPath || "";
+
+    addAgentMessage({ id: "user-" + Date.now(), role: "user", text, timestamp: Date.now() });
+    const agentId = "agent-" + Date.now();
+    addAgentMessage({ id: agentId, role: "agent", text: "…", timestamp: Date.now() });
+
+    const activePath = store.activeLeftTabId || store.activeRightTabId;
+    const scope = activePath ? activePath.split(/[\\/]/).pop()?.replace(/\.md$/i, "") || "global" : "global";
+
+    const instruction =
+      task === "custom"
+        ? text
+        : task === "summarize"
+        ? "Summarize the target text below concisely, highlighting the key points, relationships, and any terms worth remembering. Use the retrieved context only as support."
+        : task === "improve"
+        ? "Improve the target text below: tighten wording, fix clarity and structure, and keep its meaning and voice. Output the revised text with a short list of the changes you made."
+        : "Assess the target text below for the user as a study aid: note strengths, gaps, unclear sections, and 1-3 concrete suggestions for improvement.";
+
+    const target = agentContext ?? `(No highlighted context)\nUser message: ${text}`;
+
+    (async () => {
+      const { runAgentTask, remember } = await import("../services/agentKnowledge");
+      let finalText = "";
+      try {
+        finalText = await runAgentTask({
+          task: instruction,
+          context: target,
+          scope,
+          vaultRoot,
+          onChunk: (t) => {
+            const s = useStore.getState();
+            s.setAgentMessages(s.agentMessages.map((m) => (m.id === agentId ? { ...m, text: t } : m)));
+          },
+        });
+      } catch (err) {
+        finalText = `⚠️ Agent run failed: ${String(err)}`;
+      } finally {
+        const s = useStore.getState();
+        s.setAgentMessages(
+          s.agentMessages.map((m) =>
+            m.id === agentId ? { ...m, text: finalText || "_No output produced._" } : m
+          )
+        );
+        // Persist the turn to durable memory (fire-and-forget).
+        if (finalText && s.settings.memoryAutoSave !== false) {
+          remember(
+            {
+              scope,
+              kind: "message",
+              content: `Task: ${instruction}\nResult: ${finalText.slice(0, 2000)}`,
+              source: "micro-agent",
+              topicTitle: scope,
+            },
+            s.settings
+          ).catch(() => {});
+        }
+      }
+    })();
   };
 
   return (
@@ -112,6 +169,48 @@ export default function AgentPanel() {
           ))
         )}
       </div>
+
+      {/* Pending file-tool approval gate (T2.1) */}
+      {pendingToolApprovals.length > 0 && (
+        <div className="space-y-2 px-3 py-2 border-t border-border/40 bg-bg/40 shrink-0">
+          {pendingToolApprovals
+            .filter((p) => p.status === "pending")
+            .map((p) => (
+              <div
+                key={p.id}
+                className="flex items-center justify-between gap-2 rounded-lg border border-amber-400/40 bg-amber-400/10 px-2.5 py-1.5 text-xs"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1 font-medium text-amber-300">
+                    <span>⚠️</span>
+                    <span className="uppercase tracking-wide text-[9px]">Approval Required</span>
+                  </div>
+                  <p className="mt-0.5 text-[11px] text-text/90 leading-snug break-words">{p.summary}</p>
+                </div>
+                <div className="flex shrink-0 items-center gap-1">
+                  <button
+                    onClick={() => {
+                      resolveToolApproval(p.id, "approved");
+                      setTimeout(() => clearToolApproval(p.id), 1200);
+                    }}
+                    className="rounded bg-emerald-500 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-emerald-400 cursor-pointer transition-colors"
+                  >
+                    Approve
+                  </button>
+                  <button
+                    onClick={() => {
+                      resolveToolApproval(p.id, "rejected");
+                      clearToolApproval(p.id);
+                    }}
+                    className="rounded border border-border bg-bg/60 px-2 py-0.5 text-[10px] font-semibold text-red-400 hover:bg-red-500/20 cursor-pointer transition-colors"
+                  >
+                    Deny
+                  </button>
+                </div>
+              </div>
+            ))}
+        </div>
+      )}
 
       {/* Input */}
       <div className="shrink-0 border-t border-border/30 p-2">

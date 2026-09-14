@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useStore } from "../stores/useStore";
+import { PROJECT_TEMPLATES } from "../utils/projectTemplates";
 
 export default function WorkspaceLauncherModal() {
   const showLauncherModal = useStore((s) => s.showLauncherModal);
@@ -10,6 +11,9 @@ export default function WorkspaceLauncherModal() {
   const projects = useStore((s) => s.projects);
   const openProject = useStore((s) => s.openProject);
   const currentFolderPath = useStore((s) => s.currentFolderPath);
+
+  const [showTemplatePicker, setShowTemplatePicker] = useState(false);
+  const [selectedTemplateId, setSelectedTemplateId] = useState("standard-study");
 
   if (!showLauncherModal && currentFolderPath) return null;
 
@@ -44,8 +48,9 @@ export default function WorkspaceLauncherModal() {
       // Create folder via Tauri command
       await useStore.getState().createFolder(parent, folderName.trim());
       
-      // Scaffold default template structure (Sources, Guides, _attachments, Welcome.md, Study_Plan.md)
-      await scaffoldWorkspaceTemplate(targetPath);
+      // Scaffold template structure based on chosen template
+      await scaffoldWorkspaceTemplate(targetPath, selectedTemplateId);
+      setShowTemplatePicker(false);
       setShowLauncherModal(false);
     } catch (err) {
       alert("Failed to create templated workspace: " + err);
@@ -60,7 +65,7 @@ export default function WorkspaceLauncherModal() {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md select-none animate-in fade-in duration-300">
       
-      {/* Container matching 800x600 layout in screenshot */}
+      {/* Container matching 800x600 layout */}
       <div className="relative flex w-[820px] h-[620px] rounded-[26px] border border-[#232323] bg-[#1C1C1C] text-text shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200">
         
         {/* Optional Close button in top-right when a folder is already open */}
@@ -128,39 +133,88 @@ export default function WorkspaceLauncherModal() {
           </div>
         </div>
 
-        {/* RIGHT PANEL: Flux Brand & Core Action buttons */}
-        <div className="flex flex-col w-1/2 h-full items-center justify-center p-12 bg-bg/10">
-          
-          {/* Stylized custom Flux vector logo matching mockup */}
-          <div className="flex flex-col items-center mb-8">
-            <svg className="w-24 h-24 text-blue-400 mb-4" viewBox="0 0 64 64" fill="none" stroke="currentColor" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 24h12a8 8 0 0 1 8 8v0a8 8 0 0 0 8 8h12" />
-              <polyline points="44 32 52 40 44 48" />
-              <path d="M52 40H40a8 8 0 0 1-8-8v0a8 8 0 0 0-8-8H12" />
-              <polyline points="20 32 12 24 20 16" />
-              <circle cx="12" cy="40" r="2.5" fill="currentColor" stroke="none" />
-            </svg>
-            
-            <h1 className="text-4xl font-semibold text-white tracking-tight">
-              Flux
-            </h1>
-          </div>
+        {/* RIGHT PANEL: Flux Brand & Core Action buttons / Template Selector */}
+        <div className="flex flex-col w-1/2 h-full items-center justify-center p-8 bg-bg/10 overflow-y-auto">
+          {showTemplatePicker ? (
+            <div className="w-full flex flex-col h-full justify-between">
+              <div>
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-lg font-semibold text-white">Select Workspace Template</h3>
+                  <button
+                    onClick={() => setShowTemplatePicker(false)}
+                    className="text-xs text-muted hover:text-white cursor-pointer"
+                  >
+                    ← Back
+                  </button>
+                </div>
+                <div className="space-y-3">
+                  {PROJECT_TEMPLATES.map((tmpl) => (
+                    <div
+                      key={tmpl.id}
+                      onClick={() => setSelectedTemplateId(tmpl.id)}
+                      className={`p-3.5 rounded-2xl border cursor-pointer transition-all ${
+                        selectedTemplateId === tmpl.id
+                          ? "border-accent bg-accent/10 shadow-sm"
+                          : "border-border/30 bg-card/20 hover:border-border"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-xs font-semibold text-white">{tmpl.name}</span>
+                        {selectedTemplateId === tmpl.id && <span className="text-accent text-xs">✓</span>}
+                      </div>
+                      <p className="text-[11px] text-muted leading-relaxed">{tmpl.description}</p>
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {tmpl.folders.map((f) => (
+                          <span key={f} className="text-[9px] font-mono bg-bg/60 border border-border/40 px-1.5 py-0.5 rounded text-cyan-400">
+                            {f}/
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <button
+                onClick={handleCreateTemplatedWorkspace}
+                className="w-full mt-4 flex items-center justify-center py-3 px-6 rounded-2xl bg-accent hover:bg-accent-hover text-sm font-semibold text-white transition-all cursor-pointer shadow-md"
+              >
+                Create Workspace
+              </button>
+            </div>
+          ) : (
+            <>
+              {/* Stylized custom Flux vector logo */}
+              <div className="flex flex-col items-center mb-8">
+                <svg className="w-24 h-24 text-blue-400 mb-4" viewBox="0 0 64 64" fill="none" stroke="currentColor" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 24h12a8 8 0 0 1 8 8v0a8 8 0 0 0 8 8h12" />
+                  <polyline points="44 32 52 40 44 48" />
+                  <path d="M52 40H40a8 8 0 0 1-8-8v0a8 8 0 0 0-8-8H12" />
+                  <polyline points="20 32 12 24 20 16" />
+                  <circle cx="12" cy="40" r="2.5" fill="currentColor" stroke="none" />
+                </svg>
+                
+                <h1 className="text-4xl font-semibold text-white tracking-tight">
+                  Flux
+                </h1>
+              </div>
 
-          {/* Action buttons matching card pills */}
-          <div className="w-full max-w-[280px] space-y-3.5">
-            <button
-              onClick={handleCreateTemplatedWorkspace}
-              className="w-full flex items-center justify-center py-4 px-6 rounded-2xl bg-[#232323] hover:bg-[#2E2E2E] active:scale-[0.98] text-sm font-medium text-white transition-all cursor-pointer"
-            >
-              Create new project
-            </button>
-            <button
-              onClick={handleOpenExistingFolder}
-              className="w-full flex items-center justify-center py-4 px-6 rounded-2xl bg-[#232323] hover:bg-[#2E2E2E] active:scale-[0.98] text-sm font-medium text-white transition-all cursor-pointer"
-            >
-              Open existing project
-            </button>
-          </div>
+              {/* Action buttons */}
+              <div className="w-full max-w-[280px] space-y-3.5">
+                <button
+                  onClick={() => setShowTemplatePicker(true)}
+                  className="w-full flex items-center justify-center py-4 px-6 rounded-2xl bg-[#232323] hover:bg-[#2E2E2E] active:scale-[0.98] text-sm font-medium text-white transition-all cursor-pointer"
+                >
+                  Create new project
+                </button>
+                <button
+                  onClick={handleOpenExistingFolder}
+                  className="w-full flex items-center justify-center py-4 px-6 rounded-2xl bg-[#232323] hover:bg-[#2E2E2E] active:scale-[0.98] text-sm font-medium text-white transition-all cursor-pointer"
+                >
+                  Open existing project
+                </button>
+              </div>
+            </>
+          )}
         </div>
 
       </div>

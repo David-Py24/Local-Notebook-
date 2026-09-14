@@ -2,7 +2,8 @@ import { useState, useEffect, useRef, useMemo } from "react";
 import { useStore, Tab, ViewMode } from "../stores/useStore";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import MarkdownEditor from "./MarkdownEditor";
+import remarkHighlight, { remarkHighlightRehypeHandlers } from "../utils/remarkHighlight";
+import MarkdownEditor, { MarkdownEditorHandle } from "./MarkdownEditor";
 import BacklinksPanel from "./BacklinksPanel";
 import EditorContextMenu from "./EditorContextMenu";
 import EdgeResizer from "./EdgeResizer";
@@ -136,6 +137,7 @@ function EditorPanel({ panel }: EditorPanelProps) {
   const [showOptions, setShowOptions] = useState(false);
   const [showMoreTabs, setShowMoreTabs] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const editorRef = useRef<MarkdownEditorHandle | null>(null);
   const [showTOC, setShowTOC] = useState(false);
   const [showFindBar, setShowFindBar] = useState(false);
   const [findQuery, setFindQuery] = useState("");
@@ -570,11 +572,17 @@ function EditorPanel({ panel }: EditorPanelProps) {
               <DiffView tabId={activeTab.id} staged={activeTab.diffStaged === true} />
             ) : viewMode === "preview" ? (
               <div className="markdown-preview leading-relaxed tracking-normal">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{draft || "*Empty document...*"}</ReactMarkdown>
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm, remarkHighlight]}
+                  remarkRehypeOptions={{ handlers: remarkHighlightRehypeHandlers } as any}
+                >
+                  {draft || "*Empty document...*"}
+                </ReactMarkdown>
               </div>
             ) : (
               <MarkdownEditor
                 key={activeTabId}
+                ref={editorRef}
                 value={draft}
                 onChange={(content) => setDraftContent(panel, content)}
                 livePreview={viewMode === "live"}
@@ -640,6 +648,8 @@ function EditorPanel({ panel }: EditorPanelProps) {
           activeTabId={activeTabId}
           panel={panel}
           draft={draft}
+          editorRef={editorRef}
+          viewMode={viewMode}
         />
       )}
     </div>
