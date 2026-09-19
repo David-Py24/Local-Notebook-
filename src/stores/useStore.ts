@@ -4,6 +4,7 @@ import { getThemeById, applyThemeToDocument } from "../themes";
 import type { Project, McpConnector, GitRepoStatus, GitStatusEntry } from "../types";
 import { streamAIResponse, fetchAvailableModels } from "../services/aiProvider";
 import { applyProjectTemplate } from "../utils/projectTemplates";
+import type { AgentRun, RunStatus } from "../services/agentOrchestrator";
 
 // Debounce window for the lazy Memory-RAG embedding pass that runs after vault reindex.
 let pendingEmbedRebuildTimer: ReturnType<typeof setTimeout> | null = null;
@@ -130,6 +131,46 @@ export interface AssistantMessage {
   timestamp: string;
 }
 
+// Persistent agent session (AGENTIC_ORCHESTRATION_PLAN.md Phase 1). Mirrors the
+// agent_sessions row shape returned by the Rust commands (camelCase serde).
+export interface AgentSession {
+  id: string;
+  title: string | null;
+  agent: string | null;
+  engine: string | null;
+  model: string | null;
+  status: string;
+  goal: string | null;
+  parentId: string | null;
+  projectPath: string | null;
+  context: string | null;
+  summary: string | null;
+  tokens: number;
+  cost: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+// Scheduled/recurring study task (Phase 3 backend is already in place, so the
+// store slice ships alongside the session slice).
+export interface ScheduledTask {
+  id: string;
+  name: string;
+  prompt: string;
+  model: string | null;
+  agent: string | null;
+  scope: string;
+  scheduleSel: string;
+  cron: string | null;
+  weekday: string | null;
+  time: string;
+  timezone: string | null;
+  disabled: boolean;
+  lastRunAt: number | null;
+  nextRun: number | null;
+  createdAt: number;
+}
+
 // Pending destructive file-write tool approval (Phase 2b approval gate). A tool call
 // suspends in `executeWorkspaceTool` until the user approves or rejects it.
 export interface PendingToolApproval {
@@ -148,6 +189,84 @@ const INITIAL_ASSISTANT_MESSAGES: AssistantMessage[] = [
     content: "Welcome to Local Study Notebook! I am your offline study assistant. You can ask me for study tips, markdown help, or note-taking advice.",
   },
 ];
+
+// Thread ⇄ agent_session porting (AGENTIC_ORCHESTRATION_PLAN.md Phase 1). The active
+// assistant thread is mirrored into the active `agent_session.context` JSON column AND a
+// localStorage map (`lsn_assistant_threads`, keyed by session id) during a transition
+// window so threads survive even while the DB is unreadable (e.g. tauri invoke mocked).
+function serializeThread(messages: AssistantMessage[]): string {
+  return JSON.stringify(messages);
+}
+
+function deserializeThread(raw: string | null | undefined): AssistantMessage[] | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      const valid = parsed.every(
+        (m) =>
+          m &&
+          typeof m.id === "string" &&
+          (m.role === "user" || m.role === "assistant") &&
+          typeof m.content === "string"
+      );
+      if (valid) return parsed as AssistantMessage[];
+    }
+  } catch {
+    // Not a valid thread payload — caller decides the fallback.
+  }
+  return null;
+}
+
+function readThreadMirror(): Record<string, AssistantMessage[]> {
+  try {
+    const raw = localStorage.getItem("lsn_assistant_threads");
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, AssistantMessage[]>;
+  } catch {
+    // Ignore corrupt localStorage mirror.
+  }
+  return {};
+}
+
+// Runs the goal loop (imported lazily to avoid a static service↔store cycle) and keeps
+// the store's live-run + session state in sync until the run finishes for any reason.
+// Returns the finished AgentRun so callers (scheduled-task dispatch) can log status.
+async function runGoalLoopWithHandlers(opts: {
+  sessionId: string;
+  goal: string;
+  engine: "opencode" | "byok";
+  abort: AbortController;
+  pausedRef: { value: boolean };
+}): Promise<AgentRun> {
+  const { runGoalLoop, setActiveGoalRun } = await import("../services/agentOrchestrator");
+  const store = useStore.getState();
+  const finished = await runGoalLoop({
+    sessionId: opts.sessionId,
+    goal: opts.goal,
+    engine: opts.engine,
+    settings: store.settings,
+    vaultRoot: store.currentFolderPath,
+    signal: opts.abort.signal,
+    pausedRef: opts.pausedRef,
+    onRun: (run) => useStore.setState({ agentRun: run }),
+    onStatus: (status) => {
+      setActiveGoalRun(null);
+      useStore.setState({
+        goalRunning: false,
+        goalPaused: false,
+        assistantStatusText: status === "done" ? "Goal complete." : status === "blocked" ? "Goal blocked." : status === "stopped" ? "Goal stopped." : "Goal failed.",
+      });
+      // Reflect the terminal status on the owning session so the Sessions panel shows it.
+      const reason = useStore.getState().agentRun?.lastVerdict?.reason;
+      const summary = reason ? `Goal: ${opts.goal}\n${reason}` : `Goal: ${opts.goal}`;
+      useStore.getState().patchAgentSession(opts.sessionId, { status, summary });
+    },
+  });
+  void finished;
+  return finished;
+}
 
 export interface Settings {
   fontSize: number;
@@ -177,6 +296,15 @@ export interface Settings {
   aiModelName: string;
   aiEnableWorkspaceTools: boolean;
   aiSystemPrompt: string;
+
+  // Goal mode / auditor (AGENTIC_ORCHESTRATION_PLAN.md Phase 2). The auditor is a cheap
+  // judge model; when empty, the main BYOK model is used. Goal loops cap spend via a
+  // token budget and 3 stuck strikes.
+  smallModel: string;
+  smallModelBaseUrl: string;
+  goalTokenBudget: number;
+  goalMaxIterations: number;
+  aiEnableAgentControls: boolean;
 
   // Primary assistant engine (fused panel): "opencode" (default) or "byok" (direct API)
   assistantEngine: "opencode" | "byok";
@@ -231,6 +359,14 @@ const DEFAULT_SETTINGS: Settings = {
   aiModelName: "hermes3:8b",
   aiEnableWorkspaceTools: true,
   aiSystemPrompt: "You are an intelligent study assistant for Local Study Notebook. Use workspace tools and context to provide accurate study summaries.",
+
+  // Goal mode defaults: auditor pins to the main model + URL until the user supplies
+  // a dedicated small model; budget 80k tokens / 12 iterations per goal run.
+  smallModel: "",
+  smallModelBaseUrl: "",
+  goalTokenBudget: 80000,
+  goalMaxIterations: 12,
+  aiEnableAgentControls: true,
 
   // Memory-RAG defaults
   embedBaseUrl: "http://localhost:11434",
@@ -394,9 +530,50 @@ interface AppState {
   availableModels: string[];                              // dynamically fetched from provider
   assistantAbortController: AbortController | null;       // never persisted to localStorage
 
+  // Persistent agent sessions (AGENTIC_ORCHESTRATION_PLAN.md Phase 1)
+  agentSessions: AgentSession[];
+  activeAgentSessionId: string | null;
+  scheduledTasks: ScheduledTask[];
+  loadAgentSessions: () => Promise<void>;
+  createAgentSession: (opts?: {
+    title?: string | null;
+    agent?: string | null;
+    engine?: string | null;
+    model?: string | null;
+    parentId?: string | null;
+  }) => Promise<AgentSession | null>;
+  patchAgentSession: (id: string, fields: Partial<AgentSession>) => Promise<void>;
+  archiveAgentSession: (id: string) => Promise<void>;
+  forkAgentSession: (sessionId: string) => Promise<AgentSession | null>;
+  setActiveAgentSession: (id: string | null) => void;
+  loadScheduledTasks: () => Promise<void>;
+  createScheduledTask: (opts: {
+    name: string;
+    prompt: string;
+    scheduleSel: string;
+    time?: string;
+    cron?: string;
+    weekday?: string;
+  }) => Promise<ScheduledTask | null>;
+
+  // Goal mode (AGENTIC_ORCHESTRATION_PLAN.md Phase 2) — live run + loop control
+  agentRun: AgentRun | null;
+  goalRunning: boolean;
+  goalPaused: boolean;
+  startGoalRun: (goal: string) => Promise<void>;
+  stopGoalRun: () => void;
+  pauseGoalRun: () => void;
+  resumeGoalRun: () => void;
+  patchScheduledTask: (id: string, fields: Partial<ScheduledTask>) => Promise<void>;
+  deleteScheduledTask: (id: string) => Promise<void>;
+  checkDueTasks: () => Promise<ScheduledTask[]>;
+  scheduledTaskRunning: boolean;                       // wait-for-idle guard: never overlap two runs
+  runScheduledTask: (task: ScheduledTask) => Promise<boolean>;
+
   // OpenCode Agent runtime state (never persisted to localStorage)
   opencodeInstalled: boolean;                            // result of check_opencode_installed
   opencodeServerPid: number | null;                      // PID of running opencode serve
+  opencodeServerPort: number | null;                     // actual port the sidecar bound (may differ from settings.opencodePort if that was busy)
   opencodeServerPassword: string | null;                 // in-memory only, never persisted
   opencodeSessionId: string | null;                      // active opencode session (fused panel)
   opencodeStatus: "off" | "starting" | "ready" | "error"; // server readiness for engine routing
@@ -665,6 +842,13 @@ export const useStore = create<AppState>((set, get) => {
     showAssistantPanel: true,
     assistantWidth: 380,
     assistantMessages: INITIAL_ASSISTANT_MESSAGES,
+    agentSessions: [],
+    activeAgentSessionId: null,
+    scheduledTasks: [],
+    scheduledTaskRunning: false,
+    agentRun: null,
+    goalRunning: false,
+    goalPaused: false,
     selectedModel: "Big Pickle",
     assistantTopicTitle: "Local Study Notebook implementation plan",
     filterQuery: "",
@@ -722,10 +906,19 @@ export const useStore = create<AppState>((set, get) => {
         .catch((err) => {
           console.error("Failed to reindex vault:", err);
         });
+      // Restore the vault's persisted artifact registry (P0.2) so AI output from a
+      // previous session reappears once the folder is open.
+      import("../services/agentKnowledge").then(({ loadPersistedArtifacts }) =>
+        loadPersistedArtifacts(path)
+          .then((list) => {
+            if (list) set({ artifacts: list });
+          })
+          .catch(() => {})
+      );
     },
 
     closeFolder: () => {
-      set({ currentFolderPath: null, explorerEntries: [], leftTabs: [], rightTabs: [], activeLeftTabId: null, activeRightTabId: null, gitStatus: null, gitStatusError: null });
+      set({ currentFolderPath: null, explorerEntries: [], leftTabs: [], rightTabs: [], activeLeftTabId: null, activeRightTabId: null, gitStatus: null, gitStatusError: null, artifacts: [], activeArtifact: null });
       localStorage.removeItem("lsn_last_folder");
     },
 
@@ -1277,16 +1470,339 @@ export const useStore = create<AppState>((set, get) => {
     toggleArtifactsPanel: () => set((s) => ({ showArtifactsPanel: !s.showArtifactsPanel })),
     setArtifactsWidth: (w) => set({ artifactsWidth: w }),
     setActiveArtifact: (a) => set({ activeArtifact: a }),
-    addArtifact: (a) => set((s) => ({ artifacts: [...s.artifacts, a], activeArtifact: a })),
-    deleteArtifact: (id) =>
+    addArtifact: (a) => {
+      set((s) => ({ artifacts: [...s.artifacts, a], activeArtifact: a }));
+      const { currentFolderPath, artifacts } = get();
+      if (currentFolderPath && artifacts.length) {
+        import("../services/agentKnowledge").then(({ persistArtifacts }) =>
+          persistArtifacts(currentFolderPath, artifacts).catch(() => {})
+        );
+      }
+    },
+    deleteArtifact: (id) => {
       set((s) => ({
         artifacts: s.artifacts.filter((a) => a.id !== id),
         activeArtifact: s.activeArtifact?.id === id ? null : s.activeArtifact,
-      })),
+      }));
+      const { currentFolderPath, artifacts } = get();
+      if (currentFolderPath) {
+        import("../services/agentKnowledge").then(({ persistArtifacts }) =>
+          persistArtifacts(currentFolderPath, artifacts).catch(() => {})
+        );
+      }
+    },
     toggleAgentPanel: () => set((s) => ({ showAgentPanel: !s.showAgentPanel })),
     setAgentWidth: (w) => set({ agentWidth: w }),
     toggleWorkTreePanel: () => set((s) => ({ showWorkTreePanel: !s.showWorkTreePanel })),
     setWorkTreeWidth: (w) => set({ workTreeWidth: w }),
+
+    // Persistent agent sessions + scheduled tasks (AGENTIC_ORCHESTRATION_PLAN.md Phase 1)
+    loadAgentSessions: async () => {
+      try {
+        const list = await invoke<AgentSession[]>("list_agent_sessions");
+        set((s) => ({
+          agentSessions: list,
+          activeAgentSessionId:
+            s.activeAgentSessionId && list.some((x) => x.id === s.activeAgentSessionId)
+              ? s.activeAgentSessionId
+              : list[0]?.id ?? null,
+        }));
+      } catch (err) {
+        set((s) => ({ agentSessions: s.agentSessions }));
+      }
+    },
+    createAgentSession: async (opts) => {
+      try {
+        const session = await invoke<AgentSession>("create_agent_session", {
+          title: opts?.title ?? null,
+          agent: opts?.agent ?? null,
+          engine: opts?.engine ?? "opencode",
+          model: opts?.model ?? null,
+          parentId: opts?.parentId ?? null,
+        });
+        set((s) => ({
+          agentSessions: [session, ...s.agentSessions],
+          activeAgentSessionId: session.id,
+        }));
+        return session;
+      } catch (err) {
+        console.error("create_agent_session failed", err);
+        return null;
+      }
+    },
+    patchAgentSession: async (id, fields) => {
+      try {
+        const updated = await invoke<AgentSession>("patch_agent_session", { id, fields });
+        set((s) => ({
+          agentSessions: s.agentSessions.map((x) => (x.id === id ? updated : x)),
+        }));
+      } catch (err) {
+        console.error("patch_agent_session failed", err);
+      }
+    },
+    archiveAgentSession: async (id) => {
+      try {
+        await invoke<void>("archive_agent_session", { id });
+        set((s) => {
+          const agentSessions = s.agentSessions.filter((x) => x.id !== id);
+          return {
+            agentSessions,
+            activeAgentSessionId:
+              s.activeAgentSessionId === id ? (agentSessions[0]?.id ?? null) : s.activeAgentSessionId,
+          };
+        });
+      } catch (err) {
+        console.error("archive_agent_session failed", err);
+      }
+    },
+    forkAgentSession: async (sessionId) => {
+      try {
+        const child = await invoke<AgentSession>("fork_agent_session", { sessionId });
+        set((s) => ({
+          agentSessions: [child, ...s.agentSessions],
+          activeAgentSessionId: child.id,
+        }));
+        return child;
+      } catch (err) {
+        console.error("fork_agent_session failed", err);
+        return null;
+      }
+    },
+    setActiveAgentSession: (id) => {
+      set((s) => {
+        const sess = s.agentSessions.find((x) => x.id === id);
+        const restored = sess
+          ? deserializeThread(sess.context) ??
+            (readThreadMirror()[sess.id] as AssistantMessage[] | undefined) ??
+            null
+          : null;
+        return {
+          activeAgentSessionId: id,
+          assistantMessages: restored ?? s.assistantMessages,
+        };
+      });
+    },
+
+    // Goal mode (AGENTIC_ORCHESTRATION_PLAN.md Phase 2). The loop service owns the
+    // state machine; the store owns the live run + pause/stop control surface.
+    startGoalRun: async (goal) => {
+      const goalText = goal.trim();
+      if (!goalText) return;
+      const store = get();
+      if (store.goalRunning) return;
+
+      let sessionId = store.activeAgentSessionId;
+      if (!sessionId) {
+        const created = await store.createAgentSession({
+          title: goalText.length > 40 ? `${goalText.slice(0, 40)}…` : goalText,
+          engine: store.settings.assistantEngine,
+        });
+        if (!created) return;
+        sessionId = created.id;
+      }
+
+      const abort = new AbortController();
+      const pausedRef = { value: false };
+      set((s) => ({
+        agentRun: {
+          id: "",
+          sessionId: sessionId as string,
+          goal: goalText,
+          status: "running",
+          iterations: 0,
+          stuckStrikes: 0,
+          tokenEstimate: 0,
+          lastVerdict: null,
+          startedAt: Date.now(),
+          finishedAt: null,
+        },
+        goalRunning: true,
+        goalPaused: false,
+        assistantStatusText: `🎯 Running goal…`,
+      }));
+
+      const control = { abort, paused: pausedRef };
+      await import("../services/agentOrchestrator").then(({ setActiveGoalRun }) =>
+        setActiveGoalRun(control)
+      );
+
+      runGoalLoopWithHandlers({
+        sessionId: sessionId as string,
+        goal: goalText,
+        engine: store.settings.assistantEngine,
+        abort,
+        pausedRef,
+      }).catch((err) => console.error("goal run loop failed", err));
+    },
+    stopGoalRun: () => {
+      import("../services/agentOrchestrator").then(({ getActiveGoalRun, setActiveGoalRun }) => {
+        const ctrl = getActiveGoalRun();
+        ctrl?.abort.abort();
+        setActiveGoalRun(null);
+      });
+      set({ goalPaused: false });
+    },
+    pauseGoalRun: () => {
+      import("../services/agentOrchestrator").then(({ getActiveGoalRun }) => {
+        const ctrl = getActiveGoalRun();
+        if (ctrl) ctrl.paused.value = true;
+      });
+      set({ goalPaused: true });
+    },
+    resumeGoalRun: () => {
+      import("../services/agentOrchestrator").then(({ getActiveGoalRun }) => {
+        const ctrl = getActiveGoalRun();
+        if (ctrl) ctrl.paused.value = false;
+      });
+      set({ goalPaused: false });
+    },
+    loadScheduledTasks: async () => {
+      try {
+        const list = await invoke<ScheduledTask[]>("list_scheduled_tasks");
+        set({ scheduledTasks: list });
+      } catch (err) {
+        console.error("list_scheduled_tasks failed", err);
+      }
+    },
+    createScheduledTask: async (opts) => {
+      try {
+        const task = await invoke<ScheduledTask>("create_scheduled_task", {
+          name: opts.name,
+          prompt: opts.prompt,
+          model: null,
+          agent: null,
+          scope: "session",
+          scheduleSel: opts.scheduleSel,
+          cron: opts.cron ?? null,
+          weekday: opts.weekday ?? null,
+          time: opts.time ?? "09:00",
+          timezone: null,
+          disabled: false,
+        });
+        set((s) => ({ scheduledTasks: [task, ...s.scheduledTasks] }));
+        return task;
+      } catch (err) {
+        console.error("create_scheduled_task failed", err);
+        return null;
+      }
+    },
+    patchScheduledTask: async (id, fields) => {
+      try {
+        const updated = await invoke<ScheduledTask>("patch_scheduled_task", { id, fields });
+        set((s) => ({
+          scheduledTasks: s.scheduledTasks.map((x) => (x.id === id ? updated : x)),
+        }));
+      } catch (err) {
+        console.error("patch_scheduled_task failed", err);
+      }
+    },
+    deleteScheduledTask: async (id) => {
+      try {
+        await invoke<void>("delete_scheduled_task", { id });
+        set((s) => ({ scheduledTasks: s.scheduledTasks.filter((x) => x.id !== id) }));
+      } catch (err) {
+        console.error("delete_scheduled_task failed", err);
+      }
+    },
+    checkDueTasks: async () => {
+      try {
+        const due = await invoke<ScheduledTask[]>("check_due_tasks");
+        return due;
+      } catch (err) {
+        console.error("check_due_tasks failed", err);
+        return [];
+      }
+    },
+    runScheduledTask: async (task) => {
+      // Wait-for-idle contract (AGENTIC_ORCHESTRATION_PLAN.md §5.3): never overlap two
+      // runs on the same engine. If a goal or another scheduled run is active, skip this
+      // task — the next 60s tick will retry it via check_due_tasks (next_run unchanged).
+      const store = get();
+      if (store.goalRunning || store.scheduledTaskRunning) return false;
+      set({ scheduledTaskRunning: true });
+
+      let sessionId: string | null = null;
+      let status = "failed";
+      try {
+        // Scope the task to the currently-open vault when one is open (Memory-RAG context
+        // inside the orchestrator resolves the vault root from the store).
+        const created = await store.createAgentSession({
+          title: task.name,
+          agent: store.settings.assistantEngine === "opencode" ? "build" : null,
+          engine: store.settings.assistantEngine,
+        });
+        if (!created) {
+          console.error("runScheduledTask: session create failed");
+          return false;
+        }
+        sessionId = created.id;
+
+        // Emulate the manual goal-run control wiring so Stop/Pause in the panel applies.
+        const abort = new AbortController();
+        const pausedRef = { value: false };
+        set({
+          goalRunning: true,
+          goalPaused: false,
+          agentRun: {
+            id: "",
+            sessionId: created.id,
+            goal: task.prompt,
+            status: "running",
+            iterations: 0,
+            stuckStrikes: 0,
+            tokenEstimate: 0,
+            lastVerdict: null,
+            startedAt: Date.now(),
+            finishedAt: null,
+          },
+        });
+        await import("../services/agentOrchestrator").then(({ setActiveGoalRun }) =>
+          setActiveGoalRun({ abort, paused: pausedRef })
+        );
+
+        const finished = await runGoalLoopWithHandlers({
+          sessionId: created.id,
+          goal: task.prompt,
+          engine: store.settings.assistantEngine,
+          abort,
+          pausedRef,
+        });
+        status = finished.status;
+        await invoke("log_task_run", {
+          taskId: task.id,
+          sessionId: created.id,
+          status: finished.status,
+          summary: finished.lastVerdict?.reason ?? (finished.status === "done" ? "Goal completed." : null),
+        });
+
+        // Advance the schedule after a firing so recurring tasks get a fresh next_run
+        // (compute_next_run runs from "now" in the backend). One-shot 'once' tasks are
+        // turned off so they don't re-fire on later ticks.
+        if (task.scheduleSel === "once") {
+          await store.patchScheduledTask(task.id, { disabled: true });
+        } else {
+          await store.patchScheduledTask(task.id, {
+            scheduleSel: task.scheduleSel,
+            cron: task.cron ?? undefined,
+            weekday: task.weekday ?? undefined,
+            time: task.time,
+          });
+        }
+        return true;
+      } catch (err) {
+        console.error("runScheduledTask failed", err);
+        await invoke("log_task_run", {
+          taskId: task.id,
+          sessionId,
+          status,
+          summary: String(err),
+        }).catch(() => {});
+        return false;
+      } finally {
+        set({ scheduledTaskRunning: false, goalRunning: false, goalPaused: false });
+        get().loadScheduledTasks();
+      }
+    },
     refreshGitStatus: async () => {
       const folderPath = get().currentFolderPath;
       if (!folderPath || !get().showWorkTreePanel) return;
@@ -1449,6 +1965,7 @@ export const useStore = create<AppState>((set, get) => {
     // OpenCode Agent runtime state — never persisted (no localStorage)
     opencodeInstalled: false,
     opencodeServerPid: null,
+    opencodeServerPort: null,
     opencodeServerPassword: null,
     opencodeSessionId: null,
     opencodeStatus: "off",
@@ -1473,6 +1990,19 @@ export const useStore = create<AppState>((set, get) => {
     sendAssistantMessage: async (text: string) => {
       if (!text.trim()) return;
       const store = get();
+
+      // Ensure a session exists so the thread has a durable home. Auto-creates a
+      // persistent agent_session when the panel has never been given one.
+      if (!store.activeAgentSessionId) {
+        const created = await get().createAgentSession({
+          title: store.assistantTopicTitle || `Session ${store.agentSessions.length + 1}`,
+          engine: store.settings.assistantEngine,
+        });
+        if (!created) {
+          set({ assistantStatusText: "" });
+          return;
+        }
+      }
 
       const userMsg: AssistantMessage = {
         id: "msg-" + Date.now(),
@@ -1525,9 +2055,9 @@ export const useStore = create<AppState>((set, get) => {
         // ─── OpenCode engine path ──────────────────────────────────────────────
         if (store.settings.assistantEngine === "opencode") {
           try {
-            const { streamOpencodeReply, reindexOpencodeVault } = await import("../services/opencodeClient");
+            const { streamOpencodeReply, reindexOpencodeVault, resolveOpencodeModel } = await import("../services/opencodeClient");
             await get().ensureOpencodeReady();
-            const { opencodeSessionId, opencodeServerPassword, settings, currentFolderPath } = get();
+            const { opencodeSessionId, opencodeServerPassword, opencodeServerPort, settings, currentFolderPath } = get();
             if (!opencodeSessionId || !opencodeServerPassword) throw new Error("no opencode session");
 
             let payloadText = text;
@@ -1560,8 +2090,9 @@ export const useStore = create<AppState>((set, get) => {
 
             finalText = await streamOpencodeReply({
               sessionId: opencodeSessionId,
-              port: settings.opencodePort,
+              port: opencodeServerPort ?? settings.opencodePort,
               password: opencodeServerPassword,
+              model: resolveOpencodeModel(settings),
               text: payloadText,
               signal: controller.signal,
               onChunk: (accumulatedText) => {
@@ -1645,6 +2176,10 @@ export const useStore = create<AppState>((set, get) => {
         }
       } catch (err) {
         const wasCancelled = err instanceof DOMException && err.name === "AbortError";
+        const isOpenCodePath = servedBy === "opencode";
+        const fallbackMessage = isOpenCodePath
+          ? `⚠️ OpenCode Agent error: ${String(err)}.\n\nConfirm the OpenCode CLI is installed (\`winget install SST.opencode\`) and close other OpenCode servers hogging the port in **Settings -> OpenCode Agent**.`
+          : `⚠️ Unable to connect to AI server at \`${store.settings.aiBaseUrl}\` (${String(err)}).\n\nCheck your endpoint configuration in **Settings -> AI & BYOK Model**.`;
         set((state) => ({
           assistantMessages: state.assistantMessages.map((m) =>
             m.id === assistantMsgId
@@ -1652,14 +2187,28 @@ export const useStore = create<AppState>((set, get) => {
                   ...m,
                   content: wasCancelled
                     ? m.content || "_Cancelled._"
-                    : m.content ||
-                      `⚠️ Unable to connect to AI server at \`${store.settings.aiBaseUrl}\` (${String(err)}).\n\nCheck your endpoint configuration in **Settings -> AI & BYOK Model**.`,
+                    : m.content || fallbackMessage,
                 }
               : m
           ),
         }));
       } finally {
         set({ isAssistantStreaming: false, assistantStatusText: "", assistantAbortController: null });
+
+        // Persist the thread: mirror into active agent_session.context + localStorage.
+        const sessionId = get().activeAgentSessionId;
+        if (sessionId) {
+          const thread = get().assistantMessages;
+          get()
+            .patchAgentSession(sessionId, { context: serializeThread(thread) })
+            .catch(() => {});
+          if (typeof localStorage !== "undefined") {
+            const mirror = readThreadMirror();
+            mirror[sessionId] = thread;
+            localStorage.setItem("lsn_assistant_threads", JSON.stringify(mirror));
+            localStorage.setItem("lsn_active_thread_id", sessionId);
+          }
+        }
       }
     },
     cancelAssistantMessage: () => {
@@ -1729,7 +2278,7 @@ export const useStore = create<AppState>((set, get) => {
         const { config: mcpOverride, env: mcpEnv } = buildOpencodeMcpExport(
           get().settings.connectors ?? [],
         );
-        const pid = await invoke<number>("spawn_opencode_server", {
+        const { pid, port } = await invoke<{ pid: number; port: number }>("spawn_opencode_server", {
           port: settings.opencodePort,
           workspacePath: workspace,
           serverPassword: password,
@@ -1737,7 +2286,7 @@ export const useStore = create<AppState>((set, get) => {
           mcpOverride,
           mcpEnv,
         });
-        set({ opencodeServerPid: pid, opencodeServerPassword: password });
+        set({ opencodeServerPid: pid, opencodeServerPort: port, opencodeServerPassword: password });
       } catch (err) {
         console.error("[OpenCode] Failed to start server:", err);
       }
@@ -1751,7 +2300,7 @@ export const useStore = create<AppState>((set, get) => {
       } catch (err) {
         console.error("[OpenCode] Failed to stop server:", err);
       } finally {
-        set({ opencodeServerPid: null, opencodeServerPassword: null, opencodeSessionId: null, opencodeStatus: "off" });
+        set({ opencodeServerPid: null, opencodeServerPort: null, opencodeServerPassword: null, opencodeSessionId: null, opencodeStatus: "off" });
       }
     },
 
@@ -1773,8 +2322,8 @@ export const useStore = create<AppState>((set, get) => {
         }
       }
       if (opencodeSessionId) { set({ opencodeStatus: "ready" }); return; }
-      const { opencodeServerPassword } = get();
-      const baseUrl = `http://localhost:${settings.opencodePort}`;
+      const { opencodeServerPassword, opencodeServerPort } = get();
+      const baseUrl = `http://localhost:${opencodeServerPort ?? settings.opencodePort}`;
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (opencodeServerPassword) headers["Authorization"] = `Basic ${btoa(`opencode:${opencodeServerPassword}`)}`;
       for (let i = 0; i < 20; i++) {

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useStore, AgentTask } from "../stores/useStore";
@@ -23,6 +23,19 @@ export default function AgentPanel() {
   const clearToolApproval = useStore((s) => s.clearToolApproval);
 
   const [inputVal, setInputVal] = useState("");
+  const [statusText, setStatusText] = useState("");
+  const [running, setRunning] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const handleStop = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    // Resolve any in-flight approval so a tool wait doesn't deadlock after Stop.
+    const s = useStore.getState();
+    s.pendingToolApprovals
+      .filter((p) => p.status === "pending")
+      .forEach((p) => s.resolveToolApproval(p.id, "rejected"));
+  };
 
   const handleSend = () => {
     const text = inputVal.trim();
@@ -36,6 +49,11 @@ export default function AgentPanel() {
     addAgentMessage({ id: "user-" + Date.now(), role: "user", text, timestamp: Date.now() });
     const agentId = "agent-" + Date.now();
     addAgentMessage({ id: agentId, role: "agent", text: "…", timestamp: Date.now() });
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setRunning(true);
+    setStatusText("Starting...");
 
     const activePath = store.activeLeftTabId || store.activeRightTabId;
     const scope = activePath ? activePath.split(/[\\/]/).pop()?.replace(/\.md$/i, "") || "global" : "global";
@@ -64,10 +82,19 @@ export default function AgentPanel() {
             const s = useStore.getState();
             s.setAgentMessages(s.agentMessages.map((m) => (m.id === agentId ? { ...m, text: t } : m)));
           },
+          onStatusChange: (status) => setStatusText(status),
+          onToolCall: (tool) => setStatusText(`🔧 ${tool}…`),
+          signal: controller.signal,
         });
       } catch (err) {
-        finalText = `⚠️ Agent run failed: ${String(err)}`;
+        finalText =
+          err instanceof DOMException && err.name === "AbortError"
+            ? "⛔ Stopped by user."
+            : `⚠️ Agent run failed: ${String(err)}`;
       } finally {
+        setRunning(false);
+        setStatusText("");
+        abortRef.current = null;
         const s = useStore.getState();
         s.setAgentMessages(
           s.agentMessages.map((m) =>
@@ -169,6 +196,22 @@ export default function AgentPanel() {
           ))
         )}
       </div>
+
+      {/* Running status + Stop */}
+      {running && (
+        <div className="shrink-0 flex items-center justify-between gap-2 border-t border-border/30 bg-bg/20 px-3 py-1.5">
+          <div className="flex min-w-0 items-center gap-2 text-[11px] font-medium text-muted">
+            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent animate-pulse" />
+            <span className="truncate">{statusText || "Running agent..."}</span>
+          </div>
+          <button
+            onClick={handleStop}
+            className="shrink-0 rounded border border-border/60 bg-bg/60 px-2 py-0.5 text-[10px] font-semibold text-red-400 hover:bg-red-500/10 cursor-pointer transition-colors"
+          >
+            Stop
+          </button>
+        </div>
+      )}
 
       {/* Pending file-tool approval gate (T2.1) */}
       {pendingToolApprovals.length > 0 && (

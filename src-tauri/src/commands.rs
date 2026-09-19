@@ -40,7 +40,7 @@ fn prune_history(history_dir: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-fn snapshot_previous_version(history_root: &std::path::Path, valid_path: &std::path::Path) -> Result<(), String> {
+pub fn snapshot_previous_version(history_root: &std::path::Path, valid_path: &std::path::Path) -> Result<(), String> {
     if !valid_path.exists() {
         return Ok(()); // brand-new file — nothing to snapshot yet
     }
@@ -82,7 +82,7 @@ fn now_iso() -> String {
     chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string()
 }
 
-fn upsert_file_index(conn: &rusqlite::Connection, path: &std::path::Path, content: &str) -> Result<(), String> {
+pub fn upsert_file_index(conn: &rusqlite::Connection, path: &std::path::Path, content: &str) -> Result<(), String> {
     let path_str = path.to_string_lossy();
     let hash = content_hash(content);
     let size = content.len() as i64;
@@ -492,6 +492,113 @@ pub fn read_local_file(path: String, vault_root: Option<String>) -> Result<Strin
     std::fs::read_to_string(valid_path).map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileLinesResult {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub total_lines: usize,
+    pub content: String,
+    pub truncated: bool,
+}
+
+pub fn read_local_file_lines(
+    path: String,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    vault_root: Option<String>,
+) -> Result<FileLinesResult, String> {
+    let valid_path = validate_vault_path(&path, vault_root.as_deref())?;
+    let content = std::fs::read_to_string(&valid_path).map_err(|e| e.to_string())?;
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+
+    let one_based_start = start_line.unwrap_or(1);
+    let one_based_end = end_line.unwrap_or(total_lines);
+    let safe_start = one_based_start.max(1);
+    let safe_end = one_based_end.max(safe_start);
+
+    let max_lines = 500;
+    let truncated = safe_end - safe_start + 1 > max_lines;
+    let slice_end = (safe_start + max_lines - 1).min(safe_end);
+
+    let selected = lines
+        .iter()
+        .skip(safe_start - 1)
+        .take(slice_end - safe_start + 1)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(FileLinesResult {
+        path: valid_path.to_string_lossy().into_owned(),
+        start_line: safe_start,
+        end_line: slice_end,
+        total_lines,
+        content: selected,
+        truncated,
+    })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalFileInfo {
+    pub path: String,
+    pub exists: bool,
+    pub is_dir: bool,
+    pub size_bytes: u64,
+    pub line_count: Option<usize>,
+    pub mtime: Option<String>,
+    pub extension: Option<String>,
+}
+
+pub fn get_local_file_info(
+    path: String,
+    vault_root: Option<String>,
+) -> Result<LocalFileInfo, String> {
+    let valid_path = validate_vault_path(&path, vault_root.as_deref())?;
+    let path_str = valid_path.to_string_lossy().into_owned();
+
+    let metadata = std::fs::metadata(&valid_path);
+    let metadata = match metadata {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LocalFileInfo {
+                path: path_str,
+                exists: false,
+                is_dir: false,
+                size_bytes: 0,
+                line_count: None,
+                mtime: None,
+                extension: None,
+            });
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+
+    let line_count = if metadata.is_file() {
+        std::fs::read_to_string(&valid_path)
+            .ok()
+            .map(|s| s.lines().count())
+    } else {
+        None
+    };
+
+    Ok(LocalFileInfo {
+        path: path_str,
+        exists: true,
+        is_dir: metadata.is_dir(),
+        size_bytes: metadata.len(),
+        line_count,
+        mtime: metadata.modified().ok().map(format_system_time),
+        extension: valid_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(String::from),
+    })
+}
+
 #[tauri::command]
 pub fn write_local_file(
     app_handle: tauri::AppHandle,
@@ -875,7 +982,7 @@ fn title_from_path(path: &std::path::Path) -> String {
         .unwrap_or_else(|| "Untitled".to_string())
 }
 
-fn search_rag_internal(
+pub fn search_rag_internal(
     conn: &rusqlite::Connection,
     vault_root: &std::path::Path,
     query_text: &str,
@@ -1056,7 +1163,7 @@ pub fn add_memory(
     Ok(conn.last_insert_rowid())
 }
 
-fn recall_memory_internal(
+pub fn recall_memory_internal(
     conn: &rusqlite::Connection,
     scope: &str,
     query_text: &str,
@@ -1150,7 +1257,7 @@ pub fn recall_memory(
     recall_memory_internal(&conn, &scope, &query_text, &query_embedding, limit)
 }
 
-fn backlinks_for_path(conn: &rusqlite::Connection, target_path: &str) -> Result<Vec<LinkItem>, String> {
+pub fn backlinks_for_path(conn: &rusqlite::Connection, target_path: &str) -> Result<Vec<LinkItem>, String> {
     let normalized_target = link_target_basename(target_path);
     let mut stmt = conn
         .prepare("SELECT id, source_path, target_path, link_text, line_number FROM links ORDER BY source_path, line_number")
@@ -1515,13 +1622,38 @@ pub fn check_opencode_installed() -> bool {
         .unwrap_or(false)
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeSpawn {
+    pub pid: u32,
+    pub port: u16,
+}
+
+/// Finds a free TCP port at or after `start` by probe-binding 127.0.0.1.
+/// Used so the OpenCode sidecar can pick a free port when the configured one
+/// is already taken by a stale/foreign `opencode serve` (a known failure mode:
+/// the child silently fails to bind, and the readiness probe would otherwise
+/// 401 against the *other* server on the same port).
+fn find_free_port(start: u16) -> Result<u16, String> {
+    for port in start..=(start.saturating_add(50)) {
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return Ok(port);
+        }
+    }
+    Err(format!(
+        "No free port found starting at {start} (ports {start}–{} all in use)",
+        start.saturating_add(50)
+    ))
+}
+
 /// Spawns `opencode serve --port <port>` in the given workspace directory.
 ///
 /// `provider_env` is a map of env var → value for the user's BYOK credentials
 /// (e.g. {"OPENAI_API_KEY": "sk-...", "GOOGLE_GENERATIVE_AI_API_KEY": "AIza..."}).
 /// `server_password` is injected as OPENCODE_SERVER_PASSWORD so the local HTTP
 /// endpoint is authenticated even though it only binds to localhost.
-/// Returns the child PID on success, or an error string on failure.
+/// Returns the child PID **and the port actually bound** (which may differ from
+/// `port` if that one is already in use) on success, or an error string on failure.
 #[tauri::command]
 pub fn spawn_opencode_server(
     port: u16,
@@ -1530,7 +1662,7 @@ pub fn spawn_opencode_server(
     provider_env: std::collections::HashMap<String, String>,
     mcp_override: Option<String>,
     mcp_env: Option<std::collections::HashMap<String, String>>,
-) -> Result<u32, String> {
+) -> Result<OpenCodeSpawn, String> {
     let workspace = std::path::Path::new(&workspace_path);
     if !workspace.exists() {
         return Err(format!(
@@ -1539,10 +1671,12 @@ pub fn spawn_opencode_server(
         ));
     }
 
+    let actual_port = find_free_port(port)?;
+
     let mut cmd = std::process::Command::new("opencode");
     cmd.arg("serve")
         .arg("--port")
-        .arg(port.to_string())
+        .arg(actual_port.to_string())
         // Scope OpenCode's file tools to the user's vault.
         .current_dir(workspace)
         // Authenticate the local HTTP endpoint per spec §"Corrected: Local Server Authentication"
@@ -1618,7 +1752,10 @@ pub fn spawn_opencode_server(
         .spawn()
         .map_err(|e| format!("Failed to spawn opencode serve: {e}"))?;
 
-    Ok(child.id())
+    Ok(OpenCodeSpawn {
+        pid: child.id(),
+        port: actual_port,
+    })
 }
 
 /// Kills a running OpenCode server process by PID.
@@ -1689,3 +1826,974 @@ pub fn get_ai_debug_log_path(app_handle: tauri::AppHandle) -> Result<String, Str
     Ok(ai_debug_log_path(&app_handle)?.to_string_lossy().to_string())
 }
 
+
+// ---------------------------------------------------------------------------
+// Agent Orchestration Layer (Phase 1-3): persistent agent sessions, goal runs,
+// and scheduled tasks. Thin persist/query/clock commands — no AI HTTP here.
+// ---------------------------------------------------------------------------
+
+fn now_millis() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSession {
+    pub id: String,
+    pub title: Option<String>,
+    pub agent: Option<String>,
+    pub engine: Option<String>,
+    pub model: Option<String>,
+    pub status: String,
+    pub goal: Option<String>,
+    pub parent_id: Option<String>,
+    pub project_path: Option<String>,
+    pub context: Option<String>,
+    pub summary: Option<String>,
+    pub tokens: i64,
+    pub cost: f64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+fn session_from_row(row: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
+    Ok(AgentSession {
+        id: row.get("id")?,
+        title: row.get("title")?,
+        agent: row.get("agent")?,
+        engine: row.get("engine")?,
+        model: row.get("model")?,
+        status: row.get("status")?,
+        goal: row.get("goal")?,
+        parent_id: row.get("parent_id")?,
+        project_path: row.get("project_path")?,
+        context: row.get("context")?,
+        summary: row.get("summary")?,
+        tokens: row.get("tokens").unwrap_or(0),
+        cost: row.get("cost").unwrap_or(0.0),
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+fn create_agent_session_internal(
+    conn: &rusqlite::Connection,
+    title: Option<String>,
+    agent: Option<String>,
+    engine: Option<String>,
+    model: Option<String>,
+    parent_id: Option<String>,
+) -> Result<AgentSession, String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_millis();
+    conn.execute(
+        "INSERT INTO agent_sessions (id, title, agent, engine, model, status, goal, parent_id, context, summary, tokens, cost, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'idle', NULL, ?6, NULL, NULL, 0, 0, ?7, ?7)",
+        rusqlite::params![id, title, agent, engine, model, parent_id, now],
+    )
+    .map_err(|e| format!("Failed to create agent session: {e}"))?;
+
+    conn.query_row(
+        "SELECT id, title, agent, engine, model, status, goal, parent_id, project_path, context, summary, tokens, cost, created_at, updated_at
+         FROM agent_sessions WHERE id = ?1",
+        [&id],
+        session_from_row,
+    )
+    .map_err(|e| format!("Failed to read back agent session: {e}"))
+}
+
+fn list_agent_sessions_internal(conn: &rusqlite::Connection) -> Result<Vec<AgentSession>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, title, agent, engine, model, status, goal, parent_id, project_path, context, summary, tokens, cost, created_at, updated_at
+             FROM agent_sessions WHERE status != 'archived' ORDER BY updated_at DESC",
+        )
+        .map_err(|e| format!("Failed to prepare list_agent_sessions: {e}"))?;
+    let rows = stmt
+        .query_map([], session_from_row)
+        .map_err(|e| format!("Failed to query agent sessions: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+fn get_agent_session_internal(
+    conn: &rusqlite::Connection,
+    id: String,
+) -> Result<AgentSession, String> {
+    conn.query_row(
+        "SELECT id, title, agent, engine, model, status, goal, parent_id, project_path, context, summary, tokens, cost, created_at, updated_at
+         FROM agent_sessions WHERE id = ?1",
+        [&id],
+        session_from_row,
+    )
+    .map_err(|e| format!("Agent session not found: {e}"))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPatch {
+    pub title: Option<String>,
+    pub goal: Option<String>,
+    pub summary: Option<String>,
+    pub status: Option<String>,
+    pub context: Option<String>,
+    pub tokens: Option<i64>,
+    pub cost: Option<f64>,
+}
+
+fn patch_agent_session_internal(
+    conn: &rusqlite::Connection,
+    id: String,
+    fields: SessionPatch,
+) -> Result<AgentSession, String> {
+    let now = now_millis();
+    conn.execute(
+        "UPDATE agent_sessions
+         SET title = COALESCE(?2, title),
+             goal = COALESCE(?3, goal),
+             summary = COALESCE(?4, summary),
+             status = COALESCE(?5, status),
+             context = COALESCE(?6, context),
+             tokens = COALESCE(?7, tokens),
+             cost = COALESCE(?8, cost),
+             updated_at = ?9
+         WHERE id = ?1",
+        rusqlite::params![
+            id,
+            fields.title,
+            fields.goal,
+            fields.summary,
+            fields.status,
+            fields.context,
+            fields.tokens,
+            fields.cost,
+            now
+        ],
+    )
+    .map_err(|e| format!("Failed to patch agent session: {e}"))?;
+
+    conn.query_row(
+        "SELECT id, title, agent, engine, model, status, goal, parent_id, project_path, context, summary, tokens, cost, created_at, updated_at
+         FROM agent_sessions WHERE id = ?1",
+        [&id],
+        session_from_row,
+    )
+    .map_err(|e| format!("Failed to read back agent session: {e}"))
+}
+
+fn archive_agent_session_internal(conn: &rusqlite::Connection, id: String) -> Result<(), String> {
+    conn.execute(
+        "UPDATE agent_sessions SET status = 'archived', updated_at = ?2 WHERE id = ?1",
+        rusqlite::params![id, now_millis()],
+    )
+    .map_err(|e| format!("Failed to archive agent session: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn create_agent_session(
+    state: State<DbState>,
+    title: Option<String>,
+    agent: Option<String>,
+    engine: Option<String>,
+    model: Option<String>,
+    parent_id: Option<String>,
+) -> Result<AgentSession, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    create_agent_session_internal(&conn, title, agent, engine, model, parent_id)
+}
+
+#[tauri::command]
+pub fn fork_agent_session(state: State<DbState>, session_id: String) -> Result<AgentSession, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    fork_agent_session_internal(&conn, session_id)
+}
+
+fn fork_agent_session_internal(
+    conn: &rusqlite::Connection,
+    session_id: String,
+) -> Result<AgentSession, String> {
+    let parent = get_agent_session_internal(conn, session_id.clone())?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_millis();
+    let child_title = parent.title.as_ref().map(|t| format!("{t} (fork)"));
+    conn.execute(
+        "INSERT INTO agent_sessions (id, title, agent, engine, model, status, goal, parent_id, project_path, context, summary, tokens, cost, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'idle', ?6, ?7, ?8, ?9, NULL, 0, 0, ?10, ?10)",
+        rusqlite::params![
+            id,
+            child_title,
+            parent.agent,
+            parent.engine,
+            parent.model,
+            parent.goal,
+            Some(session_id.clone()), // child links to the source session it was forked from.
+            parent.project_path,
+            parent.context,
+            now
+        ],
+    )
+    .map_err(|e| format!("Failed to fork agent session: {e}"))?;
+
+    conn.query_row(
+        "SELECT id, title, agent, engine, model, status, goal, parent_id, project_path, context, summary, tokens, cost, created_at, updated_at
+         FROM agent_sessions WHERE id = ?1",
+        [&id],
+        session_from_row,
+    )
+    .map_err(|e| format!("Failed to read back forked agent session: {e}"))
+}
+
+#[tauri::command]
+pub fn list_agent_sessions(state: State<DbState>) -> Result<Vec<AgentSession>, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    list_agent_sessions_internal(&conn)
+}
+
+#[tauri::command]
+pub fn get_agent_session(state: State<DbState>, id: String) -> Result<AgentSession, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    get_agent_session_internal(&conn, id)
+}
+
+#[tauri::command]
+pub fn patch_agent_session(
+    state: State<DbState>,
+    id: String,
+    fields: SessionPatch,
+) -> Result<AgentSession, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    patch_agent_session_internal(&conn, id, fields)
+}
+
+#[tauri::command]
+pub fn archive_agent_session(state: State<DbState>, id: String) -> Result<(), String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    archive_agent_session_internal(&conn, id)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRun {
+    pub id: String,
+    pub session_id: String,
+    pub goal: String,
+    pub status: String,
+    pub iterations: i64,
+    pub stuck_strikes: i64,
+    pub token_budget: i64,
+    pub auditor_model: Option<String>,
+    pub result_summary: Option<String>,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+fn start_agent_run_internal(
+    conn: &rusqlite::Connection,
+    session_id: String,
+    goal: String,
+    token_budget: Option<i64>,
+) -> Result<AgentRun, String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_millis();
+    conn.execute(
+        "INSERT INTO agent_runs (id, session_id, goal, status, iterations, stuck_strikes, token_budget, started_at)
+         VALUES (?1, ?2, ?3, 'running', 0, 0, ?4, ?5)",
+        rusqlite::params![id, session_id, goal, token_budget.unwrap_or(80000), now],
+    )
+    .map_err(|e| format!("Failed to start agent run: {e}"))?;
+
+    let run = conn
+        .query_row(
+            "SELECT id, session_id, goal, status, iterations, stuck_strikes, token_budget, auditor_model, result_summary, started_at, finished_at
+             FROM agent_runs WHERE id = ?1",
+            [&id],
+            |row| {
+                Ok(AgentRun {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    goal: row.get(2)?,
+                    status: row.get(3)?,
+                    iterations: row.get(4)?,
+                    stuck_strikes: row.get(5)?,
+                    token_budget: row.get(6)?,
+                    auditor_model: row.get(7)?,
+                    result_summary: row.get(8)?,
+                    started_at: row.get(9)?,
+                    finished_at: row.get(10)?,
+                })
+            },
+        )
+        .map_err(|e| format!("Failed to read back agent run: {e}"))?;
+
+    conn.execute(
+        "UPDATE agent_sessions SET status = 'working', updated_at = ?2 WHERE id = ?1",
+        rusqlite::params![session_id, now],
+    )
+    .map_err(|e| format!("Failed to mark session working: {e}"))?;
+
+    Ok(run)
+}
+
+fn record_run_turn_internal(
+    conn: &rusqlite::Connection,
+    run_id: String,
+    iterations: i64,
+    stuck_strikes: i64,
+    status: String,
+) -> Result<(), String> {
+    let finished_at = if status == "done" || status == "blocked" || status == "failed" || status == "stopped" {
+        Some(now_millis())
+    } else {
+        None
+    };
+    conn.execute(
+        "UPDATE agent_runs SET iterations = ?2, stuck_strikes = ?3, status = ?4, finished_at = ?5 WHERE id = ?1",
+        rusqlite::params![run_id, iterations, stuck_strikes, status, finished_at],
+    )
+    .map_err(|e| format!("Failed to record run turn: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn start_agent_run(
+    state: State<DbState>,
+    session_id: String,
+    goal: String,
+    token_budget: Option<i64>,
+) -> Result<AgentRun, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    start_agent_run_internal(&conn, session_id, goal, token_budget)
+}
+
+#[tauri::command]
+pub fn record_run_turn(
+    state: State<DbState>,
+    run_id: String,
+    iterations: i64,
+    stuck_strikes: i64,
+    status: String,
+) -> Result<(), String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    record_run_turn_internal(&conn, run_id, iterations, stuck_strikes, status)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTask {
+    pub id: String,
+    pub name: String,
+    pub prompt: String,
+    pub model: Option<String>,
+    pub agent: Option<String>,
+    pub scope: String,
+    pub schedule_sel: String,
+    pub cron: Option<String>,
+    pub weekday: Option<String>,
+    pub time: String,
+    pub timezone: Option<String>,
+    pub disabled: bool,
+    pub last_run_at: Option<i64>,
+    pub next_run: Option<i64>,
+    pub created_at: i64,
+}
+
+fn task_from_row(row: &rusqlite::Row) -> rusqlite::Result<ScheduledTask> {
+    Ok(ScheduledTask {
+        id: row.get("id")?,
+        name: row.get("name")?,
+        prompt: row.get("prompt")?,
+        model: row.get("model")?,
+        agent: row.get("agent")?,
+        scope: row.get("scope")?,
+        schedule_sel: row.get("schedule_sel")?,
+        cron: row.get("cron")?,
+        weekday: row.get("weekday")?,
+        time: row.get("time")?,
+        timezone: row.get("timezone")?,
+        disabled: row.get("disabled").map(|v: i64| v != 0).unwrap_or(false),
+        last_run_at: row.get("last_run_at")?,
+        next_run: row.get("next_run")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+fn create_scheduled_task_internal(
+    conn: &rusqlite::Connection,
+    name: String,
+    prompt: String,
+    model: Option<String>,
+    agent: Option<String>,
+    scope: Option<String>,
+    schedule_sel: String,
+    cron: Option<String>,
+    weekday: Option<String>,
+    time: String,
+    timezone: Option<String>,
+    disabled: Option<bool>,
+) -> Result<ScheduledTask, String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_millis();
+    let next_run = compute_next_run(&schedule_sel, &cron, &weekday, &time);
+    conn.execute(
+        "INSERT INTO scheduled_tasks (id, name, prompt, model, agent, scope, schedule_sel, cron, weekday, time, timezone, disabled, next_run, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        rusqlite::params![
+            id, name, prompt, model, agent,
+            scope.unwrap_or_else(|| "session".to_string()),
+            schedule_sel, cron, weekday, time, timezone,
+            if disabled.unwrap_or(false) { 1 } else { 0 },
+            next_run, now
+        ],
+    )
+    .map_err(|e| format!("Failed to create scheduled task: {e}"))?;
+
+    conn.query_row(
+        "SELECT id, name, prompt, model, agent, scope, schedule_sel, cron, weekday, time, timezone, disabled, last_run_at, next_run, created_at
+         FROM scheduled_tasks WHERE id = ?1",
+        [&id],
+        task_from_row,
+    )
+    .map_err(|e| format!("Failed to read back scheduled task: {e}"))
+}
+
+fn list_scheduled_tasks_internal(conn: &rusqlite::Connection) -> Result<Vec<ScheduledTask>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, prompt, model, agent, scope, schedule_sel, cron, weekday, time, timezone, disabled, last_run_at, next_run, created_at
+             FROM scheduled_tasks ORDER BY created_at DESC",
+        )
+        .map_err(|e| format!("Failed to prepare list_scheduled_tasks: {e}"))?;
+    let rows = stmt
+        .query_map([], task_from_row)
+        .map_err(|e| format!("Failed to query scheduled tasks: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskPatch {
+    pub name: Option<String>,
+    pub prompt: Option<String>,
+    pub model: Option<String>,
+    pub agent: Option<String>,
+    pub schedule_sel: Option<String>,
+    pub cron: Option<String>,
+    pub weekday: Option<String>,
+    pub time: Option<String>,
+    pub timezone: Option<String>,
+    pub disabled: Option<bool>,
+}
+
+fn patch_scheduled_task_internal(
+    conn: &rusqlite::Connection,
+    id: String,
+    fields: TaskPatch,
+) -> Result<ScheduledTask, String> {
+    let schedule_sel = fields.schedule_sel.clone().unwrap_or_else(|| "once".to_string());
+    let cron = fields.cron.clone();
+    let weekday = fields.weekday.clone();
+    let time = fields.time.clone().unwrap_or_else(|| "09:00".to_string());
+    let next_run = compute_next_run(&schedule_sel, &cron, &weekday, &time);
+    conn.execute(
+        "UPDATE scheduled_tasks
+         SET name = COALESCE(?2, name),
+             prompt = COALESCE(?3, prompt),
+             model = COALESCE(?4, model),
+             agent = COALESCE(?5, agent),
+             schedule_sel = COALESCE(?6, schedule_sel),
+             cron = COALESCE(?7, cron),
+             weekday = COALESCE(?8, weekday),
+             time = COALESCE(?9, time),
+             timezone = COALESCE(?10, timezone),
+             disabled = ?11,
+             next_run = ?12
+         WHERE id = ?1",
+        rusqlite::params![
+            id, fields.name, fields.prompt, fields.model, fields.agent,
+            fields.schedule_sel, fields.cron, fields.weekday, fields.time, fields.timezone,
+            if fields.disabled.unwrap_or(false) { 1 } else { 0 },
+            next_run
+        ],
+    )
+    .map_err(|e| format!("Failed to patch scheduled task: {e}"))?;
+
+    conn.query_row(
+        "SELECT id, name, prompt, model, agent, scope, schedule_sel, cron, weekday, time, timezone, disabled, last_run_at, next_run, created_at
+         FROM scheduled_tasks WHERE id = ?1",
+        [&id],
+        task_from_row,
+    )
+    .map_err(|e| format!("Failed to read back scheduled task: {e}"))
+}
+
+fn delete_scheduled_task_internal(conn: &rusqlite::Connection, id: String) -> Result<(), String> {
+    conn.execute("DELETE FROM task_run_log WHERE task_id = ?1", [&id])
+        .map_err(|e| format!("Failed to delete task run log: {e}"))?;
+    conn.execute("DELETE FROM scheduled_tasks WHERE id = ?1", [&id])
+        .map_err(|e| format!("Failed to delete scheduled task: {e}"))?;
+    Ok(())
+}
+
+fn check_due_tasks_internal(conn: &rusqlite::Connection) -> Result<Vec<ScheduledTask>, String> {
+    let now = now_millis();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, prompt, model, agent, scope, schedule_sel, cron, weekday, time, timezone, disabled, last_run_at, next_run, created_at
+             FROM scheduled_tasks
+             WHERE disabled = 0 AND next_run IS NOT NULL AND next_run <= ?1
+             ORDER BY next_run ASC",
+        )
+        .map_err(|e| format!("Failed to prepare check_due_tasks: {e}"))?;
+    let rows = stmt
+        .query_map([now], task_from_row)
+        .map_err(|e| format!("Failed to query due tasks: {e}"))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+fn log_task_run_internal(
+    conn: &rusqlite::Connection,
+    task_id: String,
+    session_id: Option<String>,
+    status: String,
+    summary: Option<String>,
+) -> Result<(), String> {
+    let now = now_millis();
+    let log_id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "UPDATE scheduled_tasks SET last_run_at = ?2 WHERE id = ?1",
+        rusqlite::params![task_id, now],
+    )
+    .map_err(|e| format!("Failed to update task last_run_at: {e}"))?;
+    conn.execute(
+        "INSERT INTO task_run_log (id, task_id, session_id, status, result_summary, started_at, finished_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        rusqlite::params![log_id, task_id, session_id, status, summary, now],
+    )
+    .map_err(|e| format!("Failed to log task run: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn create_scheduled_task(
+    state: State<DbState>,
+    name: String,
+    prompt: String,
+    model: Option<String>,
+    agent: Option<String>,
+    scope: Option<String>,
+    schedule_sel: String,
+    cron: Option<String>,
+    weekday: Option<String>,
+    time: String,
+    timezone: Option<String>,
+    disabled: Option<bool>,
+) -> Result<ScheduledTask, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    create_scheduled_task_internal(
+        &conn, name, prompt, model, agent, scope, schedule_sel, cron, weekday, time, timezone, disabled,
+    )
+}
+
+#[tauri::command]
+pub fn list_scheduled_tasks(state: State<DbState>) -> Result<Vec<ScheduledTask>, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    list_scheduled_tasks_internal(&conn)
+}
+
+#[tauri::command]
+pub fn patch_scheduled_task(
+    state: State<DbState>,
+    id: String,
+    fields: TaskPatch,
+) -> Result<ScheduledTask, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    patch_scheduled_task_internal(&conn, id, fields)
+}
+
+#[tauri::command]
+pub fn delete_scheduled_task(state: State<DbState>, id: String) -> Result<(), String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    delete_scheduled_task_internal(&conn, id)
+}
+
+#[tauri::command]
+pub fn check_due_tasks(state: State<DbState>) -> Result<Vec<ScheduledTask>, String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    check_due_tasks_internal(&conn)
+}
+
+#[tauri::command]
+pub fn log_task_run(
+    state: State<DbState>,
+    task_id: String,
+    session_id: Option<String>,
+    status: String,
+    summary: Option<String>,
+) -> Result<(), String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    log_task_run_internal(&conn, task_id, session_id, status, summary)
+}
+
+/// Computes the next epoch-ms timestamp for a schedule selector.
+/// 'once' → 24h from now; 'daily' → next occurrence of `time` today or tomorrow;
+/// 'weekly' → next selected weekday at `time`; 'cron' → naive +24h (real cron parser
+/// is out of scope); anything else → None (never auto-runs).
+fn compute_next_run(
+    kind: &str,
+    cron: &Option<String>,
+    weekday: &Option<String>,
+    time: &str,
+) -> Option<i64> {
+    use chrono::{Datelike, Timelike};
+    let now = chrono::Utc::now();
+    let hm = time.split(':').collect::<Vec<_>>();
+    let hour: u32 = hm.first().and_then(|h| h.parse().ok()).unwrap_or(9);
+    let minute: u32 = hm.get(1).and_then(|m| m.parse().ok()).unwrap_or(0);
+
+    match kind {
+        "once" | "cron" => {
+            let _ = cron;
+            Some(
+                (now + chrono::Duration::days(1))
+                    .with_hour(hour.min(23))
+                    .and_then(|d| d.with_minute(minute.min(59)))
+                    .and_then(|d| d.with_second(0))
+                    .unwrap_or(now + chrono::Duration::days(1))
+                    .timestamp_millis(),
+            )
+        }
+        "daily" => {
+            let mut next = now
+                .with_hour(hour.min(23))
+                .and_then(|d| d.with_minute(minute.min(59)))
+                .and_then(|d| d.with_second(0))
+                .unwrap_or(now);
+            if next <= now {
+                next = next + chrono::Duration::days(1);
+            }
+            Some(next.timestamp_millis())
+        }
+"weekly" => {
+            let weekday = weekday.as_deref().unwrap_or_default();
+            let days = weekday
+                .split(',')
+                .filter_map(|d| d.trim().parse::<u32>().ok())
+                .collect::<Vec<_>>();
+            if days.is_empty() {
+                return Some(
+                    (now + chrono::Duration::days(7))
+                        .with_hour(hour.min(23))
+                        .and_then(|d| d.with_minute(minute.min(59)))
+                        .and_then(|d| d.with_second(0))
+                        .unwrap_or(now + chrono::Duration::days(7))
+                        .timestamp_millis(),
+                );
+            }
+            let today = now.weekday().num_days_from_monday() as u32;
+            for offset in 0..=7u32 {
+                let candidate_day = (today + offset) % 7;
+                if days.contains(&candidate_day) {
+                    let mut candidate = now
+                        .with_hour(hour.min(23))
+                        .and_then(|d| d.with_minute(minute.min(59)))
+                        .and_then(|d| d.with_second(0))
+                        .unwrap_or(now);
+                    candidate = candidate + chrono::Duration::days(i64::from(offset));
+                    if candidate <= now {
+                        candidate = candidate + chrono::Duration::days(7);
+                    }
+                    return Some(candidate.timestamp_millis());
+                }
+            }
+            None
+        }
+_ => None,
+    }
+}
+
+#[cfg(test)]
+mod agent_orchestration_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Minimal schema mirroring the agent tables created in db.rs, enough for the
+    /// internal helpers to round-trip against.
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_sessions (
+                 id            TEXT PRIMARY KEY,
+                 title         TEXT,
+                 agent         TEXT,
+                 engine        TEXT,
+                 model         TEXT,
+                 status        TEXT NOT NULL DEFAULT 'idle',
+                 goal          TEXT,
+                 parent_id     TEXT REFERENCES agent_sessions(id),
+                 project_path  TEXT,
+                 context       TEXT,
+                 summary       TEXT,
+                 tokens        INTEGER DEFAULT 0,
+                 cost          REAL DEFAULT 0,
+                 created_at    INTEGER NOT NULL,
+                 updated_at    INTEGER NOT NULL
+             );
+             CREATE TABLE agent_runs (
+                 id             TEXT PRIMARY KEY,
+                 session_id     TEXT NOT NULL REFERENCES agent_sessions(id),
+                 goal           TEXT NOT NULL,
+                 status         TEXT NOT NULL DEFAULT 'running',
+                 iterations     INTEGER DEFAULT 0,
+                 stuck_strikes  INTEGER DEFAULT 0,
+                 token_budget   INTEGER DEFAULT 80000,
+                 auditor_model  TEXT,
+                 result_summary TEXT,
+                 started_at     INTEGER NOT NULL,
+                 finished_at    INTEGER
+             );
+             CREATE TABLE scheduled_tasks (
+                 id            TEXT PRIMARY KEY,
+                 name          TEXT NOT NULL,
+                 prompt        TEXT NOT NULL,
+                 model         TEXT,
+                 agent         TEXT,
+                 scope         TEXT NOT NULL DEFAULT 'session',
+                 schedule_sel  TEXT NOT NULL,
+                 cron          TEXT,
+                 weekday       TEXT,
+                 time          TEXT,
+                 timezone      TEXT,
+                 disabled      INTEGER NOT NULL DEFAULT 0,
+                 last_run_at   INTEGER,
+                 next_run      INTEGER,
+                 created_at    INTEGER NOT NULL
+             );
+             CREATE TABLE task_run_log (
+                 id            TEXT PRIMARY KEY,
+                 task_id       TEXT REFERENCES scheduled_tasks(id),
+                 session_id    TEXT,
+                 status        TEXT,
+                 result_summary TEXT,
+                 started_at    INTEGER NOT NULL,
+                 finished_at   INTEGER
+             );
+             CREATE INDEX idx_agent_runs_session ON agent_runs(session_id);
+             CREATE INDEX idx_task_next_run ON scheduled_tasks(next_run);
+             CREATE INDEX idx_task_log_task ON task_run_log(task_id);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn create_list_patch_archive_session_round_trip() {
+        let conn = test_conn();
+        let created = create_agent_session_internal(
+            &conn,
+            Some("Review Physics".to_string()),
+            Some("assistant".to_string()),
+            Some("opencode".to_string()),
+            Some("provider/model".to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(created.status, "idle");
+        assert_eq!(created.title.as_deref(), Some("Review Physics"));
+
+        let listed = list_agent_sessions_internal(&conn).unwrap();
+        assert_eq!(listed.len(), 1);
+
+        let patched = patch_agent_session_internal(
+            &conn,
+            created.id.clone(),
+            SessionPatch {
+                title: Some("Review Physics v2".to_string()),
+                goal: Some("Summarize chapter 3".to_string()),
+                summary: None,
+                status: Some("working".to_string()),
+                context: None,
+                tokens: Some(42),
+                cost: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(patched.title.as_deref(), Some("Review Physics v2"));
+        assert_eq!(patched.goal.as_deref(), Some("Summarize chapter 3"));
+        assert_eq!(patched.status, "working");
+        assert_eq!(patched.tokens, 42);
+
+        let fetched = get_agent_session_internal(&conn, created.id).unwrap();
+        assert_eq!(fetched.title.as_deref(), Some("Review Physics v2"));
+
+        archive_agent_session_internal(&conn, fetched.id).unwrap();
+        let listed_after_archive = list_agent_sessions_internal(&conn).unwrap();
+        assert!(listed_after_archive.is_empty());
+    }
+
+    #[test]
+    fn fork_session_inherits_parent_and_links_lineage() {
+        let conn = test_conn();
+        let parent = create_agent_session_internal(
+            &conn,
+            Some("Parent chain".to_string()),
+            Some("assistant".to_string()),
+            Some("opencode".to_string()),
+            Some("model-x".to_string()),
+            None,
+        )
+        .unwrap();
+        patch_agent_session_internal(
+            &conn,
+            parent.id.clone(),
+            SessionPatch {
+                title: None,
+                goal: Some("Fork target goal".to_string()),
+                summary: None,
+                status: None,
+                context: Some("[{\"role\":\"user\",\"content\":\"hi\"}]".to_string()),
+                tokens: None,
+                cost: None,
+            },
+        )
+        .unwrap();
+
+        let child = fork_agent_session_internal(&conn, parent.id.clone()).unwrap();
+        assert_ne!(child.id, parent.id);
+        assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(child.goal.as_deref(), Some("Fork target goal"));
+        assert_eq!(child.context.as_deref(), Some("[{\"role\":\"user\",\"content\":\"hi\"}]"));
+        assert_eq!(child.engine.as_deref(), Some("opencode"));
+        assert_eq!(child.status, "idle");
+        // Fork title appends the (fork) marker.
+        assert_eq!(child.title.as_deref(), Some("Parent chain (fork)"));
+
+        // Forking the child keeps lineage chaining to the immediate source (the child).
+        let grandchild = fork_agent_session_internal(&conn, child.id.clone()).unwrap();
+        assert_eq!(grandchild.parent_id.as_deref(), Some(child.id.as_str()));
+    }
+
+    #[test]
+    fn start_and_record_agent_run_with_session() {
+        let conn = test_conn();
+        let session =
+            create_agent_session_internal(&conn, None, None, None, None, None).unwrap();
+
+        let run = start_agent_run_internal(
+            &conn,
+            session.id.clone(),
+            "Write notes for chapter 4".to_string(),
+            Some(5000),
+        )
+        .unwrap();
+        assert_eq!(run.status, "running");
+        assert_eq!(run.token_budget, 5000);
+
+        let session_after = get_agent_session_internal(&conn, session.id).unwrap();
+        assert_eq!(session_after.status, "working");
+
+        record_run_turn_internal(&conn, run.id.clone(), 3, 2, "done".to_string()).unwrap();
+        let finished: Option<i64> = conn
+            .query_row(
+                "SELECT finished_at FROM agent_runs WHERE id = ?1",
+                [&run.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(finished.is_some());
+    }
+
+    #[test]
+    fn scheduled_task_crud_and_due_check() {
+        let conn = test_conn();
+        let task = create_scheduled_task_internal(
+            &conn,
+            "Morning review".to_string(),
+            "Summarize yesterday's notes".to_string(),
+            None,
+            None,
+            None,
+            "daily".to_string(),
+            None,
+            None,
+            "09:00".to_string(),
+            Some("local".to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(task.schedule_sel, "daily");
+        assert!(task.next_run.is_some());
+
+        let listed = list_scheduled_tasks_internal(&conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        let first = &listed[0];
+        assert_eq!(first.id, task.id);
+
+        patch_scheduled_task_internal(
+            &conn,
+            task.id.clone(),
+            TaskPatch {
+                name: Some("Morning review (new)".to_string()),
+                prompt: None,
+                model: None,
+                agent: None,
+                schedule_sel: None,
+                cron: None,
+                weekday: None,
+                time: Some("10:30".to_string()),
+                timezone: None,
+                disabled: None,
+            },
+        )
+        .unwrap();
+        let patched = get_agent_session_internal(&conn, "nope".to_string());
+        assert!(patched.is_err());
+
+        let due = check_due_tasks_internal(&conn).unwrap();
+        assert!(due.is_empty(), "daily task is not due yet");
+
+        log_task_run_internal(
+            &conn,
+            task.id.clone(),
+            Some("session-1".to_string()),
+            "done".to_string(),
+            Some("All good".to_string()),
+        )
+        .unwrap();
+        let last_run: Option<i64> = conn
+            .query_row(
+                "SELECT last_run_at FROM scheduled_tasks WHERE id = ?1",
+                [&task.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(last_run.is_some());
+
+        delete_scheduled_task_internal(&conn, task.id).unwrap();
+        let listed_after = list_scheduled_tasks_internal(&conn).unwrap();
+        assert!(listed_after.is_empty());
+    }
+
+    #[test]
+    fn find_free_port_skips_occupied_ports() {
+        // Occupy a port so the helper must skip it and pick a later one.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let occupied = listener.local_addr().unwrap().port();
+        let free = find_free_port(occupied).unwrap();
+        assert!(free > occupied, "helper must skip the occupied port");
+        // The picked port must actually be bindable.
+        let probe = std::net::TcpListener::bind(("127.0.0.1", free));
+        assert!(probe.is_ok(), "reported port {free} is still in use");
+    }
+}

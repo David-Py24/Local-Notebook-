@@ -5,10 +5,12 @@ mod drive;
 mod embeddings;
 mod git;
 mod mcp;
+mod mcp_bridge;
 mod pdf_export;
 
 use db::DbState;
 use mcp::McpState;
+use mcp_bridge::McpBridgeState;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -29,6 +31,7 @@ pub fn run() {
             app.manage(db_state);
             app.manage(drive::DriveState::default());
             app.manage(McpState::default());
+            app.manage(McpBridgeState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -66,12 +69,30 @@ pub fn run() {
             mcp::call_connector_tool,
             mcp::test_connector,
             mcp::stop_connector,
+            // MCP bridge: workspace tools -> OpenCode
+            mcp_bridge::start_mcp_bridge,
+            mcp_bridge::stop_mcp_bridge,
             // Git work-tree status + file diff (Work-Tree panel)
             git::git_status,
             git::git_diff_file,
             // AI debug log (opt-in "Verbose AI Tool Logging" setting)
             commands::append_ai_debug_log,
-            commands::get_ai_debug_log_path
+            commands::get_ai_debug_log_path,
+            // Agent Orchestration Layer (AGENTIC_ORCHESTRATION_PLAN.md, Phase 1-3)
+            commands::create_agent_session,
+            commands::list_agent_sessions,
+            commands::get_agent_session,
+            commands::patch_agent_session,
+            commands::fork_agent_session,
+            commands::archive_agent_session,
+            commands::start_agent_run,
+            commands::record_run_turn,
+            commands::create_scheduled_task,
+            commands::list_scheduled_tasks,
+            commands::patch_scheduled_task,
+            commands::delete_scheduled_task,
+            commands::check_due_tasks,
+            commands::log_task_run
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

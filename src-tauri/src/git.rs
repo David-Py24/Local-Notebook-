@@ -15,19 +15,19 @@ pub enum FileChangeKind {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitStatusEntry {
-    path: String,
-    kind: FileChangeKind,
-    staged: bool,
-    old_path: Option<String>,
+    pub path: String,
+    pub kind: FileChangeKind,
+    pub staged: bool,
+    pub old_path: Option<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitRepoStatus {
-    is_repo: bool,
-    root: String,
-    branch: Option<String>,
-    entries: Vec<GitStatusEntry>,
+    pub is_repo: bool,
+    pub root: String,
+    pub branch: Option<String>,
+    pub entries: Vec<GitStatusEntry>,
 }
 
 fn normalize(path: &std::path::Path) -> String {

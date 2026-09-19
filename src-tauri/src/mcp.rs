@@ -111,7 +111,7 @@ fn jsonrpc_client_info() -> Value {
     json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
         "capabilities": {},
-        "clientInfo": { "name": "local-study-notebook", "version": "1.4.0" }
+        "clientInfo": { "name": "local-study-notebook", "version": "1.5.0" }
     })
 }
 

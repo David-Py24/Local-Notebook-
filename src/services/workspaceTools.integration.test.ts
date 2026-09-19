@@ -1,12 +1,28 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// Only the Tauri IPC boundary and the Zustand store are mocked — everything else
-// (executeWorkspaceTool's dispatch, resolveVaultPath, path building) runs for real.
-// This is the exact call shape a live model's create_note tool call goes through,
-// minus the LLM and the Rust binary — so it proves the fix works for the real
-// integration point, not just the isolated resolveVaultPath unit tests.
+type PendingApproval = {
+  id: string;
+  tool: string;
+  args: Record<string, any>;
+  summary: string;
+  status: "pending" | "approved" | "rejected";
+};
+
+interface StoreState {
+  currentFolderPath: string;
+  settings: { aiEnableFileWrite: boolean; aiEnabled: boolean; connectors: unknown[]; excludedFolders: string };
+  activeLeftTabId: string | null;
+  activeRightTabId: string | null;
+  activePanel: "left" | "right";
+  leftDraft: string;
+  rightDraft: string;
+  pendingToolApprovals: PendingApproval[];
+  addPendingToolApproval: (approval: PendingApproval) => void;
+  resolveToolApproval: (id: string, status: "approved" | "rejected") => void;
+}
 
 const invokeCalls: Array<{ cmd: string; args: unknown }> = [];
+let existingFileContent = "";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn((cmd: string, args: unknown) => {
@@ -14,24 +30,34 @@ vi.mock("@tauri-apps/api/core", () => ({
     if (cmd === "create_local_file") return Promise.resolve("ok");
     if (cmd === "write_local_file") return Promise.resolve();
     if (cmd === "reindex_vault") return Promise.resolve();
+    if (cmd === "read_local_file") return Promise.resolve(existingFileContent);
     return Promise.resolve();
   }),
 }));
 
 const WIN_VAULT = "C:\\Users\\Ghing\\Downloads\\Ideaverse\\My Study Notebook";
 
+const storeState: StoreState = {
+  currentFolderPath: WIN_VAULT,
+  settings: { aiEnableFileWrite: true, aiEnabled: false, connectors: [], excludedFolders: "" },
+  activeLeftTabId: null,
+  activeRightTabId: null,
+  activePanel: "left",
+  leftDraft: "",
+  rightDraft: "",
+  pendingToolApprovals: [],
+  addPendingToolApproval(approval) {
+    this.pendingToolApprovals.push(approval);
+  },
+  resolveToolApproval(id, status) {
+    const item = this.pendingToolApprovals.find((p) => p.id === id);
+    if (item) item.status = status;
+  },
+};
+
 vi.mock("../stores/useStore", () => ({
   useStore: {
-    getState: () => ({
-      currentFolderPath: WIN_VAULT,
-      settings: { aiEnableFileWrite: true, aiEnabled: false, connectors: [] },
-      activeLeftTabId: null,
-      activeRightTabId: null,
-      activePanel: "left",
-      leftDraft: "",
-      rightDraft: "",
-      pendingToolApprovals: [],
-    }),
+    getState: () => storeState,
   },
 }));
 
@@ -40,6 +66,8 @@ import { executeWorkspaceTool } from "./workspaceTools";
 describe("executeWorkspaceTool('create_note') — end-to-end path resolution", () => {
   beforeEach(() => {
     invokeCalls.length = 0;
+    existingFileContent = "";
+    storeState.pendingToolApprovals.length = 0;
   });
 
   it("resolves a nested path under a Windows vault root and calls Rust with forward-slash paths", async () => {
@@ -86,5 +114,47 @@ describe("executeWorkspaceTool('create_note') — end-to-end path resolution", (
 
     expect(result).toMatch(/Refusing path/);
     expect(invokeCalls).toHaveLength(0);
+  });
+});
+
+describe("executeWorkspaceTool('append_file') — approval gate resolution (regression for the micro-agent hang)", () => {
+  beforeEach(() => {
+    invokeCalls.length = 0;
+    existingFileContent = "";
+    storeState.pendingToolApprovals.length = 0;
+  });
+
+  it("blocks on a pending approval and only writes after the user approves", async () => {
+    existingFileContent = "existing body";
+
+    const promise = executeWorkspaceTool("append_file", { path: "Notes/A.md", content: "more" });
+
+    await vi.waitFor(() => {
+      expect(storeState.pendingToolApprovals.length).toBe(1);
+      expect(storeState.pendingToolApprovals[0].status).toBe("pending");
+    });
+    expect(invokeCalls.some((c) => c.cmd === "write_local_file")).toBe(false);
+
+    storeState.resolveToolApproval(storeState.pendingToolApprovals[0].id, "approved");
+
+    const result = await promise;
+    expect(result).not.toMatch(/Error/i);
+    expect(invokeCalls.some((c) => c.cmd === "write_local_file")).toBe(true);
+  });
+
+  it("no-ops the write and returns a decline message when the user denies", async () => {
+    existingFileContent = "existing body";
+
+    const promise = executeWorkspaceTool("append_file", { path: "Notes/A.md", content: "more" });
+
+    await vi.waitFor(() => {
+      expect(storeState.pendingToolApprovals.length).toBe(1);
+    });
+
+    storeState.resolveToolApproval(storeState.pendingToolApprovals[0].id, "rejected");
+
+    const result = await promise;
+    expect(result).toMatch(/declined/i);
+    expect(invokeCalls.some((c) => c.cmd === "write_local_file")).toBe(false);
   });
 });

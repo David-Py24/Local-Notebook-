@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Settings } from "../stores/useStore";
+import type { Artifact } from "../stores/useStore";
 import { embedTexts, streamAIResponse, ChatMessagePayload } from "./aiProvider";
 
 // ---------------------------------------------------------------------------
@@ -292,6 +293,40 @@ function slugify(title: string): string {
 }
 
 /**
+ * Persists the artifact registry to `<vault>/.lsn_artifacts/index.json` so AI output
+ * survives app restarts. The `.lsn_artifacts` folder starts with `.`, so the Rust
+ * `reindex_dir_recursive` walk (which skips dot-entries) never indexes it.
+ */
+export async function persistArtifacts(vaultRoot: string, artifacts: Artifact[]): Promise<void> {
+  if (!vaultRoot) return;
+  try {
+    await invoke("create_local_dir", { parentPath: vaultRoot, name: ".lsn_artifacts", vaultRoot });
+  } catch {
+    // already exists (or races) — the write below errors loudly if it truly can't.
+  }
+  await invoke("write_local_file", {
+    path: `${vaultRoot.replace(/[\\/]+$/, "")}/.lsn_artifacts/index.json`,
+    content: JSON.stringify(artifacts),
+    vaultRoot,
+  });
+}
+
+/** Reads the artifact registry back; returns null when no persisted registry exists. */
+export async function loadPersistedArtifacts(vaultRoot: string): Promise<Artifact[] | null> {
+  if (!vaultRoot) return null;
+  try {
+    const text = await invoke<string>("read_local_file", {
+      path: `${vaultRoot.replace(/[\\/]+$/, "")}/.lsn_artifacts/index.json`,
+      vaultRoot,
+    });
+    const parsed = JSON.parse(text) as unknown;
+    return Array.isArray(parsed) ? (parsed as Artifact[]) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Exports an artifact (title + content) into `<vault>/_attachments/exports/`.
  * `.md` is written with the existing local-file API; `pdf` is rendered by the Rust
  * `export_markdown_to_pdf` command. Returns the absolute written path.
@@ -343,6 +378,8 @@ export async function runAgentTask(opts: {
   vaultRoot: string;
   onChunk?: (text: string) => void;
   onStatusChange?: (status: string) => void;
+  onToolCall?: (tool: string) => void;
+  signal?: AbortSignal;
 }): Promise<string> {
   const { useStore } = await import("../stores/useStore");
   const store = useStore.getState();
@@ -378,6 +415,8 @@ export async function runAgentTask(opts: {
       opts.onChunk?.(t);
     },
     onStatusChange: opts.onStatusChange,
+    onToolCall: (name) => opts.onToolCall?.(name),
+    signal: opts.signal,
   });
   return out;
 }

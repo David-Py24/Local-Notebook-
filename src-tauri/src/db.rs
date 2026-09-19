@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use rusqlite::Connection;
+
+const SCHEMA_VERSION: i32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultFile {
@@ -23,7 +25,7 @@ pub struct LinkItem {
 }
 
 pub struct DbState {
-    pub vault_index: Mutex<Connection>,
+    pub vault_index: Arc<Mutex<Connection>>,
 }
 
 impl DbState {
@@ -33,97 +35,187 @@ impl DbState {
         let conn = Connection::open(&vault_index_path)
             .map_err(|e| format!("Failed to open vault_index.db: {e}"))?;
 
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA foreign_keys=ON;
+        // Migration ladder using PRAGMA user_version
+        let current_version: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
 
-             CREATE TABLE IF NOT EXISTS files (
-                 path            TEXT PRIMARY KEY,
-                 content_hash    TEXT NOT NULL,
-                 size_bytes      INTEGER NOT NULL,
-                 mtime           TEXT NOT NULL,
-                 last_indexed_at TEXT NOT NULL,
-                 last_backed_up_at TEXT,
-                 sync_status     TEXT NOT NULL DEFAULT 'not_tracked'
-             );
+        if current_version < 1 {
+            // Split into multiple execute_batch calls to avoid parser issues with giant strings
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA foreign_keys=ON;
 
-             CREATE TABLE IF NOT EXISTS links (
-                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                 source_path   TEXT NOT NULL,
-                 target_path   TEXT NOT NULL,
-                 link_text     TEXT NOT NULL,
-                 line_number   INTEGER NOT NULL DEFAULT 1
-             );
+                 CREATE TABLE IF NOT EXISTS files (
+                     path            TEXT PRIMARY KEY,
+                     content_hash    TEXT NOT NULL,
+                     size_bytes      INTEGER NOT NULL,
+                     mtime           TEXT NOT NULL,
+                     last_indexed_at TEXT NOT NULL,
+                     last_backed_up_at TEXT,
+                     sync_status     TEXT NOT NULL DEFAULT 'not_tracked'
+                 );
 
-             CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_path);
-             CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_path);
+                 CREATE TABLE IF NOT EXISTS links (
+                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source_path   TEXT NOT NULL,
+                     target_path   TEXT NOT NULL,
+                     link_text     TEXT NOT NULL,
+                     line_number   INTEGER NOT NULL DEFAULT 1
+                 );
 
-             -- Memory-RAG (AGENT_MEMORY_RAG_PLAN.md, Phase 0): chunked note text with
-             -- lazy f32 embeddings, an FTS5 shadow table kept in sync via triggers, and
-             -- durable agent memory + a context audit log. All additive / non-breaking.
-             CREATE TABLE IF NOT EXISTS note_chunks (
-                 rowid       INTEGER PRIMARY KEY AUTOINCREMENT,
-                 path        TEXT NOT NULL,
-                 chunk_index INTEGER NOT NULL,
-                 chunk_text  TEXT NOT NULL,
-                 char_offset INTEGER NOT NULL,
-                 token_count INTEGER NOT NULL,
-                 embed_model TEXT,
-                 embedding   BLOB,
-                 indexed_at  TEXT NOT NULL,
-                 UNIQUE(path, chunk_index)
-             );
+                 CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_path);
+                 CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_path);"
+            )
+            .map_err(|e| format!("Failed to create base tables: {e}"))?;
 
-             CREATE INDEX IF NOT EXISTS idx_chunks_path ON note_chunks(path);
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS note_chunks (
+                     rowid       INTEGER PRIMARY KEY AUTOINCREMENT,
+                     path        TEXT NOT NULL,
+                     chunk_index INTEGER NOT NULL,
+                     chunk_text  TEXT NOT NULL,
+                     char_offset INTEGER NOT NULL,
+                     token_count INTEGER NOT NULL,
+                     embed_model TEXT,
+                     embedding   BLOB,
+                     indexed_at  TEXT NOT NULL,
+                     UNIQUE(path, chunk_index)
+                 );
 
-             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                 chunk_text,
-                 content='note_chunks',
-                 content_rowid='rowid'
-             );
+                 CREATE INDEX IF NOT EXISTS idx_chunks_path ON note_chunks(path);
 
-             CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON note_chunks BEGIN
-                 INSERT INTO chunks_fts(rowid, chunk_text) VALUES (new.rowid, new.chunk_text);
-             END;
-             CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON note_chunks BEGIN
-                 INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text) VALUES('delete', old.rowid, old.chunk_text);
-             END;
-             CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON note_chunks BEGIN
-                 INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text) VALUES('delete', old.rowid, old.chunk_text);
-                 INSERT INTO chunks_fts(rowid, chunk_text) VALUES (new.rowid, new.chunk_text);
-             END;
+                 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                     chunk_text,
+                     content='note_chunks',
+                     content_rowid='rowid'
+                 );
 
-             CREATE TABLE IF NOT EXISTS memory_entries (
-                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                 scope            TEXT NOT NULL,
-                 kind             TEXT NOT NULL,
-                 role             TEXT,
-                 content          TEXT NOT NULL,
-                 source           TEXT NOT NULL,
-                 topic_title      TEXT,
-                 active           INTEGER NOT NULL DEFAULT 1,
-                 access_count     INTEGER NOT NULL DEFAULT 0,
-                 last_accessed_at TEXT,
-                 created_at       TEXT NOT NULL,
-                 embedding        BLOB
-             );
+                 CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON note_chunks BEGIN
+                     INSERT INTO chunks_fts(rowid, chunk_text) VALUES (new.rowid, new.chunk_text);
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON note_chunks BEGIN
+                     INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text) VALUES('delete', old.rowid, old.chunk_text);
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON note_chunks BEGIN
+                     INSERT INTO chunks_fts(chunks_fts, rowid, chunk_text) VALUES('delete', old.rowid, old.chunk_text);
+                     INSERT INTO chunks_fts(rowid, chunk_text) VALUES (new.rowid, new.chunk_text);
+                 END;"
+            )
+            .map_err(|e| format!("Failed to create chunks tables: {e}"))?;
 
-             CREATE INDEX IF NOT EXISTS idx_memory_scope  ON memory_entries(scope);
-             CREATE INDEX IF NOT EXISTS idx_memory_active ON memory_entries(active);
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS memory_entries (
+                     id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                     scope            TEXT NOT NULL,
+                     kind             TEXT NOT NULL,
+                     role             TEXT,
+                     content          TEXT NOT NULL,
+                     source           TEXT NOT NULL,
+                     topic_title      TEXT,
+                     active           INTEGER NOT NULL DEFAULT 1,
+                     access_count     INTEGER NOT NULL DEFAULT 0,
+                     last_accessed_at TEXT,
+                     created_at       TEXT NOT NULL,
+                     embedding        BLOB
+                 );
 
-             CREATE TABLE IF NOT EXISTS context_log (
-                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                 turn_hash   TEXT NOT NULL,
-                 scope       TEXT NOT NULL,
-                 bundle_json TEXT NOT NULL,
-                 created_at  TEXT NOT NULL
-             );",
-        )
-        .map_err(|e| format!("Failed to initialize vault_index tables: {e}"))?;
+                 CREATE INDEX IF NOT EXISTS idx_memory_scope  ON memory_entries(scope);
+                 CREATE INDEX IF NOT EXISTS idx_memory_active ON memory_entries(active);
+
+                 CREATE TABLE IF NOT EXISTS context_log (
+                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     turn_hash   TEXT NOT NULL,
+                     scope       TEXT NOT NULL,
+                     bundle_json TEXT NOT NULL,
+                     created_at  TEXT NOT NULL
+                 );"
+            )
+            .map_err(|e| format!("Failed to create memory tables: {e}"))?;
+
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS agent_sessions (
+                     id            TEXT PRIMARY KEY,
+                     title         TEXT,
+                     agent         TEXT,
+                     engine        TEXT,
+                     model         TEXT,
+                     status        TEXT NOT NULL DEFAULT 'idle',
+                     goal          TEXT,
+                     parent_id     TEXT REFERENCES agent_sessions(id),
+                     project_path  TEXT,
+                     context       TEXT,
+                     summary       TEXT,
+                     tokens        INTEGER DEFAULT 0,
+                     cost          REAL DEFAULT 0,
+                     created_at    INTEGER NOT NULL,
+                     updated_at    INTEGER NOT NULL
+                 );
+
+                 CREATE TABLE IF NOT EXISTS agent_runs (
+                     id             TEXT PRIMARY KEY,
+                     session_id     TEXT NOT NULL REFERENCES agent_sessions(id),
+                     goal           TEXT NOT NULL,
+                     status         TEXT NOT NULL DEFAULT 'running',
+                     iterations     INTEGER DEFAULT 0,
+                     stuck_strikes  INTEGER DEFAULT 0,
+                     token_budget   INTEGER DEFAULT 80000,
+                     auditor_model  TEXT,
+                     result_summary TEXT,
+                     started_at     INTEGER NOT NULL,
+                     finished_at    INTEGER
+                 );
+
+                 CREATE INDEX IF NOT EXISTS idx_agent_runs_session ON agent_runs(session_id);
+
+                 CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                     id            TEXT PRIMARY KEY,
+                     name          TEXT NOT NULL,
+                     prompt        TEXT NOT NULL,
+                     model         TEXT,
+                     agent         TEXT,
+                     scope         TEXT NOT NULL DEFAULT 'session',
+                     schedule_sel  TEXT NOT NULL,
+                     cron          TEXT,
+                     weekday       TEXT,
+                     time          TEXT,
+                     timezone      TEXT,
+                     disabled      INTEGER NOT NULL DEFAULT 0,
+                     last_run_at   INTEGER,
+                     next_run      INTEGER,
+                     created_at    INTEGER NOT NULL
+                 );
+
+                 CREATE TABLE IF NOT EXISTS task_run_log (
+                     id            TEXT PRIMARY KEY,
+                     task_id       TEXT REFERENCES scheduled_tasks(id),
+                     session_id    TEXT,
+                     status        TEXT,
+                     result_summary TEXT,
+                     started_at    INTEGER NOT NULL,
+                     finished_at   INTEGER
+                 );
+
+                 CREATE INDEX IF NOT EXISTS idx_task_next_run ON scheduled_tasks(next_run);
+                 CREATE INDEX IF NOT EXISTS idx_task_log_task ON task_run_log(task_id);"
+            )
+            .map_err(|e| format!("Failed to create agent tables: {e}"))?;
+
+            conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))
+                .map_err(|e| format!("Failed to set user_version: {e}"))?;
+        } else {
+            // Schema already at target version; ensure PRAGMAs are applied
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA foreign_keys=ON;"
+            )
+            .map_err(|e| format!("Failed to apply PRAGMAs: {e}"))?;
+        }
 
         Ok(Self {
-            vault_index: Mutex::new(conn),
+            vault_index: Arc::new(Mutex::new(conn)),
         })
     }
 }

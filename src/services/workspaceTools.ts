@@ -52,6 +52,22 @@ function isOnline(): boolean {
   return typeof navigator === "undefined" ? true : !!navigator.onLine;
 }
 
+const CONNECTOR_TOOLS_TTL_MS = 60_000;
+const connectorToolsCache = new Map<string, { at: number; tools: McpTool[] }>();
+
+function connectorCacheKey(c: McpConnector): string {
+  return `${c.id}|${JSON.stringify({
+    name: c.name,
+    kind: c.kind,
+    command: c.command,
+    args: c.args,
+    cwd: c.cwd,
+    url: c.url,
+    headers: c.headers,
+    env: c.env,
+  })}`;
+}
+
 function mcpResultToString(result: McpCallResult): string {
   const parts = result.content
     .map((c) => (c.type === "text" && c.text ? c.text : `[${c.type} content not renderable as text]`))
@@ -77,22 +93,33 @@ export async function buildEffectiveTools(): Promise<ToolDefinition[]> {
   const connectors = useStore.getState().settings.connectors.filter((c) => c.enabled);
   for (const connector of connectors) {
     if (connector.kind === "http" && !isOnline()) continue;
-    try {
-      const mcpTools = await invoke<McpTool[]>("list_connector_tools", {
-        config: connectorToConfig(connector),
-      });
-      for (const t of mcpTools) {
-        tools.push({
-          type: "function",
-          function: {
-            name: `${connector.name}/${t.name}`,
-            description: t.description,
-            parameters: t.input_schema,
-          },
+    // TTL-cache per connector identity+config so tools/list isn't re-pinged on every
+    // turn. Editing a connector changes its fingerprint and bypasses the cache.
+    const key = connectorCacheKey(connector);
+    const cached = connectorToolsCache.get(key);
+    let mcpTools: McpTool[] | null = null;
+    if (cached && Date.now() - cached.at < CONNECTOR_TOOLS_TTL_MS) {
+      mcpTools = cached.tools;
+    } else {
+      try {
+        mcpTools = await invoke<McpTool[]>("list_connector_tools", {
+          config: connectorToConfig(connector),
         });
+        connectorToolsCache.set(key, { at: Date.now(), tools: mcpTools });
+      } catch (err) {
+        console.warn(`[MCP] Skipping connector "${connector.name}":`, err);
+        continue;
       }
-    } catch (err) {
-      console.warn(`[MCP] Skipping connector "${connector.name}":`, err);
+    }
+    for (const t of mcpTools) {
+      tools.push({
+        type: "function",
+        function: {
+          name: `${connector.name}/${t.name}`,
+          description: t.description,
+          parameters: t.input_schema,
+        },
+      });
     }
   }
   return tools;
@@ -806,7 +833,7 @@ export async function executeWorkspaceTool(name: string, args: Record<string, an
 
     // ---- Phase 2b: file-mutation tools (gated + approval-required) ----
 
-    if (name === "append_note") {
+    if (name === "append_note" || name === "append_file") {
       if (!vaultRoot) return "Error: No active workspace folder opened.";
       if (!useStore.getState().settings.aiEnableFileWrite) {
         return "Error: File write tools are disabled. Enable 'Allow AI file writes' in Settings -> AI.";

@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { useStore } from "./stores/useStore";
+import { useScheduler } from "./services/useScheduler";
 import Layout from "./components/Layout";
 
 function App() {
@@ -16,6 +17,9 @@ function App() {
   useEffect(() => {
     refreshGoogleAccount();
   }, [refreshGoogleAccount]);
+
+  // Scheduled study tasks clock (Phase 3): fires due tasks while the app is open.
+  useScheduler();
 
   useEffect(() => {
     if (!onboardingComplete) return;

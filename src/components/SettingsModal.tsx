@@ -8,7 +8,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { testAIConnection } from "../services/aiProvider";
 import { getProviderPreset } from "../services/providerPresets";
 
-type SettingSection = "general" | "appearance" | "editor" | "files" | "project" | "backup" | "ai_byok" | "connectors" | "about";
+type SettingSection = "general" | "appearance" | "editor" | "files" | "project" | "backup" | "ai_byok" | "connectors" | "tasks" | "about";
 type UpdateStatus = "idle" | "checking" | "up-to-date" | "available" | "downloading" | "error";
 
 /** Shows the local debug log's file path once "Verbose AI tool logging" is enabled. */
@@ -39,6 +39,70 @@ export default function SettingsModal() {
   const [fetchModelsStatus, setFetchModelsStatus] = useState<"idle" | "fetching" | "done" | "empty">("idle");
   const [reindexStatus, setReindexStatus] = useState<string | null>(null);
   const currentFolderPath = useStore((s) => s.currentFolderPath);
+
+  // ── Scheduled Tasks (Phase 3) ──────────────────────────────────────
+  const scheduledTasks = useStore((s) => s.scheduledTasks);
+  const createScheduledTask = useStore((s) => s.createScheduledTask);
+  const patchScheduledTask = useStore((s) => s.patchScheduledTask);
+  const deleteScheduledTask = useStore((s) => s.deleteScheduledTask);
+  const scheduledTaskRunning = useStore((s) => s.scheduledTaskRunning);
+  const [taskName, setTaskName] = useState("");
+  const [taskPrompt, setTaskPrompt] = useState("");
+  const [taskSchedule, setTaskSchedule] = useState<"once" | "daily" | "weekly" | "cron">("daily");
+  const [taskTime, setTaskTime] = useState("09:00");
+  const [taskWeekday, setTaskWeekday] = useState("0");
+  const [taskCron, setTaskCron] = useState("");
+  const [taskFormError, setTaskFormError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (showSettings) {
+      useStore.getState().loadScheduledTasks();
+    }
+  }, [showSettings]);
+
+  const handleCreateTask = async () => {
+    if (!taskName.trim() || !taskPrompt.trim()) {
+      setTaskFormError("Name and prompt are required.");
+      return;
+    }
+    setTaskFormError(null);
+    await createScheduledTask({
+      name: taskName.trim(),
+      prompt: taskPrompt.trim(),
+      scheduleSel: taskSchedule,
+      time: taskTime,
+      weekday: taskSchedule === "weekly" ? taskWeekday : undefined,
+      cron: taskSchedule === "cron" ? taskCron : undefined,
+    });
+    setTaskName("");
+    setTaskPrompt("");
+  };
+
+  const scheduleLabel = (t: { scheduleSel: string; time: string; weekday: string | null; cron: string | null }) => {
+    switch (t.scheduleSel) {
+      case "once":
+        return `Once at ${t.time}`;
+      case "daily":
+        return `Daily at ${t.time}`;
+      case "weekly":
+        return `Weekly ${(t.weekday || "0").split(",").map(dayName).filter(Boolean).join(",")} at ${t.time}`;
+      case "cron":
+        return `Cron: ${t.cron || "(none)"}`;
+      default:
+        return t.scheduleSel;
+    }
+  };
+
+  const dayName = (d: string) => {
+    const names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const n = parseInt(d, 10);
+    return Number.isNaN(n) ? "" : names[((n % 7) + 7) % 7];
+  };
+
+  const formatRunTime = (ms: number | null) => {
+    if (ms == null) return "never";
+    return new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  };
 
 
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
@@ -247,6 +311,7 @@ export default function SettingsModal() {
     { id: "backup", label: "Backup & Drive" },
     { id: "ai_byok", label: "AI & BYOK Model" },
     { id: "connectors", label: "Connectors & Research" },
+    { id: "tasks", label: "Scheduled Tasks" },
     { id: "about", label: "About" },
   ];
 
@@ -950,6 +1015,87 @@ export default function SettingsModal() {
                 />
               </div>
 
+              {/* ─── Goal Mode & Auditor ─────────────────── */}
+              <div className="pt-4 border-t border-border/40 space-y-3">
+                <div>
+                  <h4 className="text-xs font-semibold text-white">🎯 Goal Mode &amp; Auditor</h4>
+                  <p className="text-[10px] text-muted mt-0.5">
+                    Autonomous study goals run a capped loop with a cheap auditor judging done / stuck / keep-going. Leave the model blank to use the main BYOK model.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 items-end">
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-text">Auditor Model</label>
+                    <div className="relative">
+                      <input
+                        type="text"
+                        value={settings.smallModel}
+                        onChange={(e) => updateSettings({ smallModel: e.target.value })}
+                        placeholder={settings.aiModelName || "hermes3:8b"}
+                        className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 pr-14 text-xs text-text outline-none focus:border-accent font-mono"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => updateSettings({ smallModel: "" })}
+                        title="Use the main BYOK model"
+                        className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded bg-bg/60 px-1.5 py-0.5 text-[9px] text-muted hover:text-text cursor-pointer"
+                      >
+                        auto
+                      </button>
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-text">Auditor Base URL</label>
+                    <input
+                      type="text"
+                      value={settings.smallModelBaseUrl}
+                      onChange={(e) => updateSettings({ smallModelBaseUrl: e.target.value })}
+                      placeholder={settings.aiBaseUrl || "http://localhost:11434/v1"}
+                      className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent font-mono"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 items-end">
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-text">Token Budget</label>
+                    <input
+                      type="number"
+                      min={1000}
+                      step={1000}
+                      value={settings.goalTokenBudget}
+                      onChange={(e) => updateSettings({ goalTokenBudget: parseInt(e.target.value) || 80000 })}
+                      className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-text">Max Iterations</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={settings.goalMaxIterations}
+                      onChange={(e) => updateSettings({ goalMaxIterations: parseInt(e.target.value) || 12 })}
+                      className="w-full rounded border border-border bg-bg/50 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between py-1">
+                  <div className="flex flex-col">
+                    <label className="text-xs font-medium text-white">Agent Control Tools</label>
+                    <span className="text-[10px] text-muted">Expose create/fork session &amp; set-goal meta tools to the agent.</span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={settings.aiEnableAgentControls}
+                    onChange={(e) => updateSettings({ aiEnableAgentControls: e.target.checked })}
+                    className="w-4 h-4 rounded border-border bg-bg/50 text-accent focus:ring-accent cursor-pointer"
+                  />
+                </div>
+              </div>
+
               {/* ─── Memory-RAG (Agent Knowledge) ─────────────────── */}
               <div className="pt-4 border-t border-border/40 space-y-3">
                 <div>
@@ -1434,6 +1580,150 @@ export default function SettingsModal() {
             </div>
           )}
 
+          {activeSection === "tasks" && (
+            <div className="space-y-5">
+              <div>
+                <h3 className="text-base font-semibold text-white">Scheduled Tasks</h3>
+                <p className="text-xs text-muted">
+                  Recurring study tasks fire while the app is open. Each run creates an agent session and
+                  executes in goal mode with the built-in auditor. Runs never overlap the Study Assistant.
+                </p>
+              </div>
+
+              {taskFormError && (
+                <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                  {taskFormError}
+                </div>
+              )}
+
+              {/* Create form */}
+              <div className="rounded-md border border-border bg-bg/30 p-4 space-y-3">
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-medium">Task Name</label>
+                  <input
+                    value={taskName}
+                    onChange={(e) => setTaskName(e.target.value)}
+                    placeholder="Morning review"
+                    className="w-full rounded border border-border bg-bg/50 px-3 py-2 text-xs text-text outline-none focus:border-accent"
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-medium">Prompt / Goal</label>
+                  <textarea
+                    value={taskPrompt}
+                    onChange={(e) => setTaskPrompt(e.target.value)}
+                    placeholder="Summarize yesterday's notes into a new note."
+                    rows={3}
+                    className="w-full resize-y rounded border border-border bg-bg/50 px-3 py-2 text-xs text-text outline-none focus:border-accent"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-xs font-medium">Schedule</label>
+                    <select
+                      value={taskSchedule}
+                      onChange={(e) => setTaskSchedule(e.target.value as typeof taskSchedule)}
+                      className="w-full rounded border border-border bg-bg/50 px-3 py-2 text-xs text-text outline-none focus:border-accent cursor-pointer"
+                    >
+                      <option value="once">Once</option>
+                      <option value="daily">Daily</option>
+                      <option value="weekly">Weekly</option>
+                      <option value="cron">Cron</option>
+                    </select>
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-xs font-medium">Time (HH:mm)</label>
+                    <input
+                      value={taskTime}
+                      onChange={(e) => setTaskTime(e.target.value)}
+                      placeholder="09:00"
+                      className="w-full rounded border border-border bg-bg/50 px-3 py-2 text-xs text-text outline-none focus:border-accent"
+                    />
+                  </div>
+                </div>
+                {taskSchedule === "weekly" && (
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-xs font-medium">Weekday (0=Mon … 6=Sun, comma-separated)</label>
+                    <input
+                      value={taskWeekday}
+                      onChange={(e) => setTaskWeekday(e.target.value)}
+                      placeholder="0,2,4"
+                      className="w-full rounded border border-border bg-bg/50 px-3 py-2 text-xs text-text outline-none focus:border-accent"
+                    />
+                  </div>
+                )}
+                {taskSchedule === "cron" && (
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-xs font-medium">Cron Expression (naive daily in engine)</label>
+                    <input
+                      value={taskCron}
+                      onChange={(e) => setTaskCron(e.target.value)}
+                      placeholder="0 9 * * *"
+                      className="w-full rounded border border-border bg-bg/50 px-3 py-2 text-xs text-text outline-none focus:border-accent"
+                    />
+                  </div>
+                )}
+                <button
+                  onClick={handleCreateTask}
+                  className="rounded bg-accent px-3 py-1.5 text-xs font-medium text-white hover:bg-accent-hover cursor-pointer transition-colors"
+                >
+                  Create Task
+                </button>
+              </div>
+
+              {/* Registry list */}
+              <div className="space-y-2">
+                {scheduledTasks.length === 0 && (
+                  <div className="rounded-md border border-dashed border-border bg-bg/30 px-4 py-6 text-center text-[11px] text-muted">
+                    No scheduled tasks yet. Add one above.
+                  </div>
+                )}
+
+                {scheduledTasks.map((t) => (
+                  <div key={t.id} className="flex items-center justify-between rounded-md border border-border bg-bg/30 px-3 py-2.5">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className={`truncate text-xs font-medium text-text ${t.disabled ? "opacity-50" : ""}`}>{t.name}</span>
+                        <span className={`shrink-0 rounded px-1.5 py-px text-[9px] font-semibold uppercase ${t.disabled ? "bg-bg/60 text-muted" : "bg-emerald-500/15 text-emerald-400"}`}>
+                          {t.disabled ? "off" : "on"}
+                        </span>
+                      </div>
+                      <p className="mt-0.5 truncate text-[10px] text-muted">{scheduleLabel(t)} · next run {formatRunTime(t.nextRun)}</p>
+                    </div>
+                    <div className="ml-3 flex shrink-0 items-center gap-2">
+                      {t.lastRunAt != null && (
+                        <span className="text-[9px] text-muted" title={`Last run ${new Date(t.lastRunAt).toLocaleString()}`}>
+                          ↻ {new Date(t.lastRunAt).toLocaleDateString()}
+                        </span>
+                      )}
+                      <button
+                        onClick={() => patchScheduledTask(t.id, { disabled: !t.disabled })}
+                        className="rounded border border-border bg-bg/60 px-2 py-1 text-[10px] font-medium text-text hover:bg-card hover:text-white cursor-pointer transition-colors"
+                        title={t.disabled ? "Enable" : "Disable"}
+                      >
+                        {t.disabled ? "Enable" : "Disable"}
+                      </button>
+                      <button
+                        onClick={() => deleteScheduledTask(t.id)}
+                        className="rounded border border-border bg-bg/60 px-2 py-1 text-[10px] font-medium text-red-400 hover:bg-red-500/10 cursor-pointer transition-colors"
+                        title="Delete task"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {scheduledTaskRunning && (
+                <div className="flex items-center gap-2 rounded-md border border-accent/30 bg-accent/10 px-3 py-2 text-xs text-accent">
+                  <span className="h-2 w-2 animate-pulse rounded-full bg-accent" />
+                  A scheduled task is running — new runs wait for it to finish.
+                </div>
+              )}
+            </div>
+          )}
+
           {activeSection === "about" && (
             <div className="space-y-6">
               <div>
@@ -1443,7 +1733,7 @@ export default function SettingsModal() {
 
               <div className="rounded-md border border-border bg-bg/40 p-4 space-y-1.5 text-xs">
                 <p><span className="text-muted">Name:</span> <span className="text-text">Local Study Notebook</span></p>
-                <p><span className="text-muted">Version:</span> <span className="text-text">1.4.0</span></p>
+                <p><span className="text-muted">Version:</span> <span className="text-text">1.5.0</span></p>
                 <p><span className="text-muted">Framework:</span> <span className="text-text">Tauri v2 · React · TypeScript</span></p>
                 <p><span className="text-muted">Data:</span> <span className="text-text">Stored locally in the app data directory.</span></p>
               </div>

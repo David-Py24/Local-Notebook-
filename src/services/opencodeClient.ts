@@ -70,6 +70,29 @@ export function opencodeAuthHeaders(password: string | null): Record<string, str
   return headers;
 }
 
+// OpenCode provider IDs differ from the app's BYOK provider labels. Maps a BYOK
+// setup to an OpenCode model ref (`{providerID, modelID}`) so the sidecar uses the
+// same tool-capable model the user configured for BYOK instead of OpenCode's own
+// default (which can route to an OpenRouter endpoint with no tool support).
+const PROVIDER_ID_MAP: Record<string, string> = {
+  openai: "openai",
+  anthropic: "anthropic",
+  gemini: "google",
+  openrouter: "openrouter",
+  ollama_hermes: "ollama",
+  ollama: "ollama",
+};
+
+export function resolveOpencodeModel(settings: {
+  aiProvider?: string;
+  aiModelName?: string;
+}): { providerID: string; modelID: string } | null {
+  const providerID = PROVIDER_ID_MAP[(settings.aiProvider || "").toLowerCase()];
+  const modelID = (settings.aiModelName || "").trim();
+  if (!providerID || !modelID) return null;
+  return { providerID, modelID };
+}
+
 const FILE_EDIT_TOOLS = ["write", "edit", "patch", "delete"];
 
 function isFileEditTool(tool: string): boolean {
@@ -95,13 +118,14 @@ export async function streamOpencodeReply(options: {
   port: number;
   password: string | null;
   text: string;
+  model?: { providerID: string; modelID: string } | null;
   signal?: AbortSignal;
   onChunk: (text: string) => void;
   onStatusChange?: (status: string) => void;
   onToolCall?: (tool: string, status: string) => void;
   onFileEdit?: () => void;
 }): Promise<string> {
-  const { sessionId, port, password, text, signal } = options;
+  const { sessionId, port, password, text, model, signal } = options;
   const baseUrl = opencodeBaseUrl(port);
   const headers = opencodeAuthHeaders(password);
   const maxReconnects = 3;
@@ -268,7 +292,10 @@ export async function streamOpencodeReply(options: {
         const res = await fetch(`${baseUrl}/session/${sessionId}/message`, {
           method: "POST",
           headers,
-          body: JSON.stringify({ parts: [{ type: "text", text }] }),
+          body: JSON.stringify({
+            parts: [{ type: "text", text }],
+            ...(model ? { model } : {}),
+          }),
           signal: controller.signal,
         });
         if (!res.ok) {
