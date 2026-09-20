@@ -46,6 +46,10 @@ function App() {
         unlisten = await appWindow.onCloseRequested(async (event) => {
           event.preventDefault();
           await useStore.getState().flushPendingSave();
+          // Best-effort sidecar teardown so dirty exits don't orphan an `opencode serve`
+          // that then hogs a port for the next launch (OPENCODE_HTTP500_DIAGNOSIS_PLAN.md,
+          // workstream C). Fire-and-forget: the app teardown continues immediately.
+          void useStore.getState().stopOpencodeServer();
           if (unlisten) {
             unlisten();
           }

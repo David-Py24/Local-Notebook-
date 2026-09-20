@@ -7,8 +7,15 @@ import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater
 import { relaunch } from "@tauri-apps/plugin-process";
 import { testAIConnection } from "../services/aiProvider";
 import { getProviderPreset } from "../services/providerPresets";
+import {
+  addStudyTool,
+  deleteStudyTool,
+  getStudyTools,
+  setStudyToolEnabled,
+} from "../services/studyTools";
+import type { StudyTool } from "../services/studyTools";
 
-type SettingSection = "general" | "appearance" | "editor" | "files" | "project" | "backup" | "ai_byok" | "connectors" | "tasks" | "about";
+type SettingSection = "general" | "appearance" | "editor" | "files" | "project" | "backup" | "ai_byok" | "agent_models" | "connectors" | "tasks" | "study_tools" | "about";
 type UpdateStatus = "idle" | "checking" | "up-to-date" | "available" | "downloading" | "error";
 
 /** Shows the local debug log's file path once "Verbose AI tool logging" is enabled. */
@@ -39,6 +46,14 @@ export default function SettingsModal() {
   const [fetchModelsStatus, setFetchModelsStatus] = useState<"idle" | "fetching" | "done" | "empty">("idle");
   const [reindexStatus, setReindexStatus] = useState<string | null>(null);
   const currentFolderPath = useStore((s) => s.currentFolderPath);
+  const opencodeInstalled = useStore((s) => s.opencodeInstalled);
+  const opencodeBinaryVersion = useStore((s) => s.opencodeBinaryVersion);
+  const opencodeStatus = useStore((s) => s.opencodeStatus);
+  const opencodeServerPort = useStore((s) => s.opencodeServerPort);
+  const opencodeServerPid = useStore((s) => s.opencodeServerPid);
+  const startOpencodeServerAct = useStore((s) => s.startOpencodeServer);
+  const restartOpencodeServer = useStore((s) => s.restartOpencodeServer);
+  const [opencodeRestartMsg, setOpencodeRestartMsg] = useState<string | null>(null);
 
   // ── Scheduled Tasks (Phase 3) ──────────────────────────────────────
   const scheduledTasks = useStore((s) => s.scheduledTasks);
@@ -54,9 +69,15 @@ export default function SettingsModal() {
   const [taskCron, setTaskCron] = useState("");
   const [taskFormError, setTaskFormError] = useState<string | null>(null);
 
+  const [studyTools, setStudyTools] = useState<StudyTool[]>(() => getStudyTools());
+  const [newToolName, setNewToolName] = useState("");
+  const [newToolDesc, setNewToolDesc] = useState("");
+  const [studyToolError, setStudyToolError] = useState<string | null>(null);
+
   useEffect(() => {
     if (showSettings) {
       useStore.getState().loadScheduledTasks();
+      setStudyTools(getStudyTools());
     }
   }, [showSettings]);
 
@@ -262,7 +283,7 @@ export default function SettingsModal() {
     if (result.ok) {
       setTestConnectionStatus("success");
       // Auto-fetch models on a successful connection for Gemini / OpenRouter
-      if (settings.aiProvider === "gemini" || settings.aiProvider === "openrouter") {
+      if (settings.aiProvider === "gemini" || settings.aiProvider === "openrouter" || settings.aiProvider === "opencode_zen") {
         await fetchAndSetAvailableModels();
       }
     } else {
@@ -310,8 +331,10 @@ export default function SettingsModal() {
     { id: "project", label: "Project" },
     { id: "backup", label: "Backup & Drive" },
     { id: "ai_byok", label: "AI & BYOK Model" },
+    { id: "agent_models", label: "Agent Models & Display" },
     { id: "connectors", label: "Connectors & Research" },
     { id: "tasks", label: "Scheduled Tasks" },
+    { id: "study_tools", label: "Study Tools" },
     { id: "about", label: "About" },
   ];
 
@@ -832,6 +855,7 @@ export default function SettingsModal() {
                   }}
                   className="w-full rounded border border-border bg-bg/50 px-3 py-2 text-xs text-text outline-none focus:border-accent cursor-pointer"
                 >
+                  <option value="opencode_zen">OpenCode Zen (API Gateway: https://opencode.ai/zen/v1)</option>
                   <option value="ollama_hermes">Local Nous Hermes / Ollama (Offline / Local Proxy)</option>
                   <option value="openrouter">OpenRouter (Online Hermes 3 / Llama 3.3 / Free Models)</option>
                   <option value="openai">OpenAI (GPT-4o / GPT-4o-mini)</option>
@@ -866,6 +890,13 @@ export default function SettingsModal() {
                 />
                 <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
                   <span className="text-[10px] text-muted">Presets:</span>
+                  <button
+                    type="button"
+                    onClick={() => updateSettings({ aiModelName: "big-pickle" })}
+                    className="rounded border border-border/60 bg-bg/40 px-1.5 py-0.5 text-[10px] text-purple-400 hover:border-purple-400 font-mono cursor-pointer"
+                  >
+                    big-pickle (OpenCode Zen)
+                  </button>
                   <button
                     type="button"
                     onClick={() => updateSettings({ aiModelName: "nousresearch/hermes-3-llama-3.1-405b" })}
@@ -967,7 +998,7 @@ export default function SettingsModal() {
                 >
                   Test Connection
                 </button>
-                {(settings.aiProvider === "gemini" || settings.aiProvider === "openrouter") && (
+                {(settings.aiProvider === "gemini" || settings.aiProvider === "openrouter" || settings.aiProvider === "opencode_zen") && (
                   <button
                     type="button"
                     onClick={handleFetchModels}
@@ -1229,12 +1260,16 @@ export default function SettingsModal() {
                   <div className="flex flex-col">
                     <label className="text-xs font-medium text-text">OpenCode Status</label>
                     <span className="text-[10px] text-muted">
-                      {(() => {
-                        // Detect platform for the correct install command
-                        const isWin = navigator.userAgent.toLowerCase().includes("windows");
-                        return isWin ? "Install: winget install SST.opencode" : "Install: curl -fsSL https://opencode.ai/install | bash";
-                      })()}
-                    </span>
+                    {opencodeInstalled
+                      ? opencodeBinaryVersion
+                        ? `Installed: ${opencodeBinaryVersion}`
+                        : "Installed on PATH"
+                      : (() => {
+                          // Detect platform for the correct install command (only shown when the CLI is missing)
+                          const isWin = navigator.userAgent.toLowerCase().includes("windows");
+                          return isWin ? "Not installed — winget install SST.opencode" : "Not installed — curl -fsSL https://opencode.ai/install | bash";
+                        })()}
+                  </span>
                   </div>
                   <div className="flex items-center gap-1.5">
                     <span className={`text-[10px] font-medium ${settings.opencodePort > 0 ? "text-muted" : "text-red-400"}`}>
@@ -1259,6 +1294,43 @@ export default function SettingsModal() {
                   </span>
                 </div>
 
+                {/* Runtime status + one-click recovery (OPENCODE_HTTP500_DIAGNOSIS_PLAN.md workstream C/D) */}
+                <div className="flex items-start justify-between gap-2 rounded-md border border-border/40 bg-bg/40 p-2.5">
+                  <div className="flex flex-col gap-0.5 min-w-0">
+                    <label className="text-xs font-medium text-white">Server Status</label>
+                    <span className="text-[10px] text-muted break-words">
+                      {opencodeStatus === "ready"
+                        ? `running on port ${opencodeServerPort ?? settings.opencodePort}${opencodeBinaryVersion ? ` · v${opencodeBinaryVersion}` : ""}`
+                        : opencodeStatus === "starting"
+                          ? "starting…"
+                          : opencodeStatus === "error"
+                            ? "error"
+                            : "stopped"}
+                      {opencodeServerPid === null ? " — no sidecar running" : ""}
+                    </span>
+                  </div>
+                  <button
+                    onClick={async () => {
+                      setOpencodeRestartMsg(null);
+                      try {
+                        if (opencodeServerPid === null) {
+                          await startOpencodeServerAct();
+                          setOpencodeRestartMsg("Server started.");
+                        } else {
+                          await restartOpencodeServer();
+                          setOpencodeRestartMsg("Server restarted — a fresh session starts on the next message.");
+                        }
+                      } catch (err) {
+                        setOpencodeRestartMsg(`Restart failed: ${String(err)}`);
+                      }
+                    }}
+                    className="rounded-md border border-border bg-card px-3 py-1.5 text-[11px] font-medium text-accent hover:border-accent/60 whitespace-nowrap"
+                  >
+                    Restart server
+                  </button>
+                </div>
+                {opencodeRestartMsg && <p className="text-[10px] text-accent/90">{opencodeRestartMsg}</p>}
+
                 {/* Auto-start toggle */}
                 <div className="flex items-center justify-between py-1">
                   <div className="flex flex-col">
@@ -1271,6 +1343,225 @@ export default function SettingsModal() {
                     onChange={(e) => updateSettings({ opencodeAutoStart: e.target.checked })}
                     className="w-4 h-4 rounded border-border bg-bg/50 text-accent focus:ring-accent cursor-pointer"
                   />
+                </div>
+
+                {/* Auto-retry on a fresh session */}
+                <div className="flex items-center justify-between py-1">
+                  <div className="flex flex-col">
+                    <label className="text-xs font-medium text-white">Auto-retry on fresh session</label>
+                    <span className="text-[10px] text-muted">When the agent fails with a server error (HTTP 5xx), retry the message once on a fresh session before falling back.</span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={settings.opencodeAutoRetry !== false}
+                    onChange={(e) => updateSettings({ opencodeAutoRetry: e.target.checked })}
+                    className="w-4 h-4 rounded border-border bg-bg/50 text-accent focus:ring-accent cursor-pointer"
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeSection === "agent_models" && (
+            <div className="space-y-6">
+              <div>
+                <h3 className="text-base font-semibold text-white">Agent Models & Display Settings</h3>
+                <p className="text-xs text-muted">
+                  Customize how AI models are displayed, filter OpenCode Zen vs. BYOK providers, and configure custom model aliases.
+                </p>
+              </div>
+
+              {/* Section 1: Model Badge Display Mode */}
+              <div className="space-y-3 rounded-md border border-border bg-card p-4">
+                <h4 className="text-xs font-semibold uppercase tracking-wider text-accent">Composer Model Badge Display Style</h4>
+                <p className="text-[11px] text-muted">
+                  Choose how model labels appear in the bottom composer bar.
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
+                  {[
+                    { id: "auto_collapse", label: "Auto-Collapse", desc: "Icon pill when space is tight, expands on click/hover" },
+                    { id: "compact_pill", label: "Always Compact Pill", desc: "Icon badge only to save max toolbar space" },
+                    { id: "full_badge", label: "Always Full Badge", desc: "Full model name label always expanded" },
+                  ].map((mode) => (
+                    <button
+                      key={mode.id}
+                      onClick={() => {
+                        const cur = settings.agentModelSettings || {
+                          modelDisplayMode: "auto_collapse",
+                          showZenModels: true,
+                          showByokModels: true,
+                          enabledProviders: {},
+                          modelAliases: {},
+                        };
+                        updateSettings({
+                          agentModelSettings: { ...cur, modelDisplayMode: mode.id as any },
+                        });
+                      }}
+                      className={`flex flex-col items-start p-2.5 rounded-lg border text-left cursor-pointer transition-all ${
+                        (settings.agentModelSettings?.modelDisplayMode || "auto_collapse") === mode.id
+                          ? "border-accent bg-accent/15 text-white shadow-sm"
+                          : "border-border/60 bg-bg/40 text-muted hover:text-text hover:border-border"
+                      }`}
+                    >
+                      <span className="text-xs font-medium">{mode.label}</span>
+                      <span className="text-[10px] text-muted/80 mt-1 leading-tight">{mode.desc}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Section 2: OpenCode Zen vs BYOK Category Filters */}
+              <div className="space-y-3 rounded-md border border-border bg-card p-4">
+                <h4 className="text-xs font-semibold uppercase tracking-wider text-accent">Model Category & Provider Visibility</h4>
+                <p className="text-[11px] text-muted">
+                  Toggle model categories and specific providers in the model selector dropdown.
+                </p>
+
+                <div className="flex flex-wrap gap-4 pt-1 border-b border-border/40 pb-3">
+                  <label className="flex items-center gap-2 cursor-pointer text-xs font-medium text-white">
+                    <input
+                      type="checkbox"
+                      checked={settings.agentModelSettings?.showZenModels ?? true}
+                      onChange={(e) => {
+                        const cur = settings.agentModelSettings || {
+                          modelDisplayMode: "auto_collapse",
+                          showZenModels: true,
+                          showByokModels: true,
+                          enabledProviders: {},
+                          modelAliases: {},
+                        };
+                        updateSettings({
+                          agentModelSettings: { ...cur, showZenModels: e.target.checked },
+                        });
+                      }}
+                      className="w-4 h-4 rounded border-border bg-bg/50 text-accent focus:ring-accent"
+                    />
+                    <span className="flex items-center gap-1">
+                      <span>Enable OpenCode Zen Models</span>
+                      <span className="rounded bg-amber-500/20 px-1.5 py-0.2 text-[9px] font-bold text-amber-300">⚡ Zen</span>
+                    </span>
+                  </label>
+
+                  <label className="flex items-center gap-2 cursor-pointer text-xs font-medium text-white">
+                    <input
+                      type="checkbox"
+                      checked={settings.agentModelSettings?.showByokModels ?? true}
+                      onChange={(e) => {
+                        const cur = settings.agentModelSettings || {
+                          modelDisplayMode: "auto_collapse",
+                          showZenModels: true,
+                          showByokModels: true,
+                          enabledProviders: {},
+                          modelAliases: {},
+                        };
+                        updateSettings({
+                          agentModelSettings: { ...cur, showByokModels: e.target.checked },
+                        });
+                      }}
+                      className="w-4 h-4 rounded border-border bg-bg/50 text-accent focus:ring-accent"
+                    />
+                    <span className="flex items-center gap-1">
+                      <span>Enable BYOK Models</span>
+                      <span className="rounded bg-blue-500/15 px-1.5 py-0.2 text-[9px] font-medium text-blue-300">BYOK</span>
+                    </span>
+                  </label>
+                </div>
+
+                {/* Individual Provider Toggles */}
+                <div className="space-y-2 pt-1">
+                  <span className="text-[11px] font-medium text-muted uppercase tracking-wider">Active Providers Checklist</span>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {[
+                      { id: "opencode_zen", label: "OpenCode Zen (API Gateway)", icon: "☯️", cat: "BYOK" },
+                      { id: "opencode_big_pickle", label: "Big Pickle (OpenCode Zen)", icon: "🥒", cat: "Zen" },
+                      { id: "opencode_zen_smart", label: "OpenCode Zen Smart", icon: "⚡", cat: "Zen" },
+                      { id: "opencode_zen_fast", label: "OpenCode Zen Fast", icon: "🚀", cat: "Zen" },
+                      { id: "opencode_zen_deepseek", label: "DeepSeek R1 (OpenCode Zen)", icon: "🧠", cat: "Zen" },
+                      { id: "ollama_hermes", label: "Nous Hermes 3 (Local)", icon: "🦙", cat: "BYOK" },
+                      { id: "openrouter", label: "Nous Hermes 3 (OpenRouter)", icon: "🌐", cat: "BYOK" },
+                      { id: "openai", label: "OpenAI GPT-4o Mini", icon: "⚡", cat: "BYOK" },
+                      { id: "anthropic", label: "Claude Sonnet 5", icon: "✨", cat: "BYOK" },
+                      { id: "gemini", label: "Google Gemini", icon: "💎", cat: "BYOK" },
+                    ].map((prov) => {
+                      const enabledProviders = settings.agentModelSettings?.enabledProviders || {};
+                      const isChecked = enabledProviders[prov.id] !== false;
+
+                      return (
+                        <label
+                          key={prov.id}
+                          className="flex items-center justify-between rounded-lg border border-border/50 bg-bg/40 px-3 py-2 text-xs text-text cursor-pointer hover:bg-bg/80 transition-colors"
+                        >
+                          <div className="flex items-center gap-2">
+                            <span>{prov.icon}</span>
+                            <span className="font-medium">{prov.label}</span>
+                          </div>
+                          <input
+                            type="checkbox"
+                            checked={isChecked}
+                            onChange={(e) => {
+                              const cur = settings.agentModelSettings || {
+                                modelDisplayMode: "auto_collapse",
+                                showZenModels: true,
+                                showByokModels: true,
+                                enabledProviders: {},
+                                modelAliases: {},
+                              };
+                              updateSettings({
+                                agentModelSettings: {
+                                  ...cur,
+                                  enabledProviders: {
+                                    ...(cur.enabledProviders || {}),
+                                    [prov.id]: e.target.checked,
+                                  },
+                                },
+                              });
+                            }}
+                            className="w-4 h-4 rounded border-border bg-bg/50 text-accent focus:ring-accent"
+                          />
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              {/* Section 3: Custom Model Display Aliases */}
+              <div className="space-y-3 rounded-md border border-border bg-card p-4">
+                <h4 className="text-xs font-semibold uppercase tracking-wider text-accent">Custom Model Display Aliases</h4>
+                <p className="text-[11px] text-muted">
+                  Map raw AI model tags to clean, friendly display names in the UI.
+                </p>
+
+                <div className="space-y-2">
+                  {Object.entries(settings.agentModelSettings?.modelAliases || {}).map(([raw, alias]) => (
+                    <div key={raw} className="flex items-center justify-between gap-2 rounded-lg border border-border/50 bg-bg/50 px-3 py-1.5 text-xs">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="font-mono text-[10.5px] text-muted truncate max-w-[140px]">{raw}</span>
+                        <span className="text-muted/40">→</span>
+                        <span className="font-medium text-text truncate">{alias}</span>
+                      </div>
+                      <button
+                        onClick={() => {
+                          const cur = settings.agentModelSettings || {
+                            modelDisplayMode: "auto_collapse",
+                            showZenModels: true,
+                            showByokModels: true,
+                            enabledProviders: {},
+                            modelAliases: {},
+                          };
+                          const nextAliases = { ...(cur.modelAliases || {}) };
+                          delete nextAliases[raw];
+                          updateSettings({
+                            agentModelSettings: { ...cur, modelAliases: nextAliases },
+                          });
+                        }}
+                        className="text-muted hover:text-red-400 cursor-pointer p-0.5 rounded transition-colors text-[10px]"
+                        title="Remove alias"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
                 </div>
               </div>
             </div>
@@ -1721,6 +2012,125 @@ export default function SettingsModal() {
                   A scheduled task is running — new runs wait for it to finish.
                 </div>
               )}
+            </div>
+          )}
+
+          {activeSection === "study_tools" && (
+            <div className="space-y-5">
+              <div>
+                <h3 className="text-base font-semibold text-white">Study Tools</h3>
+                <p className="text-xs text-muted">
+                  Reusable study aids the AI assistant can use — research lookups, paper search, vault
+                  grounding, and custom templates (flashcards, citations, ...). Presets ship disabled;
+                  you never lose your custom entries.
+                </p>
+              </div>
+
+              {studyToolError && (
+                <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+                  {studyToolError}
+                </div>
+              )}
+
+              {/* Add custom tool */}
+              <div className="rounded-md border border-border bg-bg/30 p-4 space-y-3">
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-medium">New custom tool</label>
+                  <input
+                    value={newToolName}
+                    onChange={(e) => setNewToolName(e.target.value)}
+                    placeholder="Flashcard gen"
+                    className="w-full rounded border border-border bg-bg/50 px-3 py-2 text-xs text-text outline-none focus:border-accent"
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <textarea
+                    value={newToolDesc}
+                    onChange={(e) => setNewToolDesc(e.target.value)}
+                    placeholder="Turn a note into 10 flashcards with answers."
+                    rows={2}
+                    className="w-full resize-y rounded border border-border bg-bg/50 px-3 py-2 text-xs text-text outline-none focus:border-accent"
+                  />
+                </div>
+                <button
+                  onClick={() => {
+                    if (!newToolName.trim()) {
+                      setStudyToolError("A name is required.");
+                      return;
+                    }
+                    setStudyToolError(null);
+                    setStudyTools(
+                      addStudyTool({
+                        id: `tool-custom-${Date.now()}`,
+                        name: newToolName.trim(),
+                        description: newToolDesc.trim() || "Custom study tool.",
+                        enabled: false,
+                      }),
+                    );
+                    setNewToolName("");
+                    setNewToolDesc("");
+                  }}
+                  className="rounded bg-accent px-3 py-1.5 text-xs font-medium text-white hover:bg-accent-hover cursor-pointer transition-colors"
+                >
+                  Add Tool
+                </button>
+              </div>
+
+              {/* Registry list */}
+              <div className="space-y-2">
+                {studyTools.length === 0 && (
+                  <div className="rounded-md border border-dashed border-border bg-bg/30 px-4 py-6 text-center text-[11px] text-muted">
+                    No study tools yet. Add one above.
+                  </div>
+                )}
+
+                {studyTools.map((t) => (
+                  <div
+                    key={t.id}
+                    className="flex items-center gap-2 rounded-md border border-border bg-bg/30 px-3 py-2.5 transition-colors hover:border-border/80"
+                  >
+                    <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${t.enabled ? "bg-emerald-400" : "bg-border"}`} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-1.5">
+                        <span className="truncate text-xs font-medium text-text">{t.name}</span>
+                        {t.id.startsWith("tool-custom") && (
+                          <span className="rounded px-1.5 py-px text-[9px] font-semibold uppercase bg-amber-500/15 text-amber-400">
+                            custom
+                          </span>
+                        )}
+                      </div>
+                      <div className="truncate text-[10px] text-muted">{t.description}</div>
+                      {t.defaultPrompt && (
+                        <div className="truncate text-[10px] italic text-muted/70 select-text">“{t.defaultPrompt}”</div>
+                      )}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      <input
+                        type="checkbox"
+                        checked={t.enabled}
+                        onChange={(e) => setStudyTools(setStudyToolEnabled(t.id, e.target.checked))}
+                        className="h-3.5 w-3.5 cursor-pointer rounded border-border bg-bg/50 text-accent focus:ring-accent"
+                        title={t.enabled ? "Disable tool" : "Enable tool"}
+                      />
+                      {t.id.startsWith("tool-custom") && (
+                        <button
+                          onClick={() => {
+                            if (window.confirm(`Remove tool "${t.name}"?`)) setStudyTools(deleteStudyTool(t.id));
+                          }}
+                          className="cursor-pointer rounded border border-border/60 px-1.5 py-0.5 text-[10px] text-red-400 hover:text-red-300 transition-colors"
+                          title="Remove tool"
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <p className="text-[10px] text-muted">
+                {studyTools.length} tool{studyTools.length === 1 ? "" : "s"} in the registry. Changes persist locally.
+              </p>
             </div>
           )}
 

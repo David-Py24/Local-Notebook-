@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Settings } from "../stores/useStore";
+import { Settings, ChatPart } from "../stores/useStore";
 import { buildEffectiveTools, executeWorkspaceTool } from "./workspaceTools";
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 30_000;
@@ -354,6 +354,7 @@ export async function streamAIResponse(options: {
   onChunk: (text: string) => void;
   onToolCall?: (toolName: string, args: Record<string, any>) => void;
   onStatusChange?: (status: string) => void;
+  onPart?: (part: ChatPart) => void;
   signal?: AbortSignal;
   /**
    * Internal: the tool schema for this conversation, computed once by the top-level call
@@ -362,8 +363,14 @@ export async function streamAIResponse(options: {
    * Callers should not pass this.
    */
   _cachedTools?: Record<string, any>[];
+  /**
+   * Internal: sequential text-part id budget across tool-loop recursions so each
+   * recursion's synthesis text lands in its own part instead of clobbering the
+   * pre-tool text part. Callers should not pass this.
+   */
+  _partSeq?: number;
 }): Promise<string> {
-  const { settings, onChunk, onToolCall, onStatusChange, signal: externalSignal } = options;
+  const { settings, onChunk, onToolCall, onStatusChange, onPart, signal: externalSignal } = options;
   const baseUrl = (settings.aiBaseUrl || "http://localhost:11434/v1").replace(/\/+$/, "");
   const endpoint = `${baseUrl}/chat/completions`;
   const model = settings.aiModelName || "hermes3:8b";
@@ -388,6 +395,10 @@ export async function streamAIResponse(options: {
   const currentMessages = [...options.messages];
   let accumulatedText = "";
   let toolCallsBuffer: Array<{ id: string; name: string; arguments: string }> = [];
+  // Text parts upsert by id; one part per recursion (pre-tool text, then each
+  // synthesis block) so live edits never clobber an earlier block in the UI.
+  const partSeq = options._partSeq ?? 0;
+  const textPartId = `text-${partSeq}`;
 
   const payload: Record<string, any> = {
     model,
@@ -522,6 +533,7 @@ export async function streamAIResponse(options: {
         if (delta.content) {
           accumulatedText += delta.content;
           onChunk(accumulatedText);
+          onPart?.({ kind: "text", id: textPartId, text: accumulatedText });
         }
 
         if (delta.tool_calls) {
@@ -571,7 +583,29 @@ export async function streamAIResponse(options: {
       onStatusChange?.(`Running tool: ${tc.name}...`);
       logDebug(settings.aiVerboseLogging, `call ${tc.name} args=${JSON.stringify(parsedArgs)}`);
 
+      const toolPartId = `tool-${tc.id}`;
+      const startedAt = Date.now();
+      onPart?.({
+        kind: "tool",
+        id: toolPartId,
+        name: tc.name,
+        state: "running",
+        args: parsedArgs,
+        startedAt,
+      });
+
       const result = await executeWorkspaceTool(tc.name, parsedArgs);
+      const failed = typeof result === "string" && result.startsWith("Error:");
+      onPart?.({
+        kind: "tool",
+        id: toolPartId,
+        name: tc.name,
+        state: failed ? "error" : "completed",
+        args: parsedArgs,
+        output: result,
+        startedAt,
+        durationMs: Date.now() - startedAt,
+      });
       logDebug(settings.aiVerboseLogging, `result ${tc.name} => ${result}`);
 
       currentMessages.push({
@@ -590,8 +624,10 @@ export async function streamAIResponse(options: {
       onChunk,
       onToolCall,
       onStatusChange,
+      onPart,
       signal: externalSignal,
       _cachedTools: effectiveTools,
+      _partSeq: partSeq + 1,
     });
   }
 

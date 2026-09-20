@@ -17,6 +17,8 @@ export interface AgentRun {
   lastVerdict: AuditorVerdict | null;
   startedAt: number;
   finishedAt: number | null;
+  /** Terminal text output of the last executed turn (used by Perspectives/Fusion). */
+  latestOutput?: string;
 }
 
 interface ExecuteTurnParams {
@@ -111,6 +113,9 @@ async function executeTurn(params: ExecuteTurnParams): Promise<string> {
       model: resolveOpencodeModel(settings),
       text: prompt,
       signal,
+      debug: settings.aiVerboseLogging,
+      workspaceDir: vaultRoot,
+      retry5xx: settings.opencodeAutoRetry,
       onChunk,
       onStatusChange: onStatus,
       onToolCall: (tool) => onToolCall?.(tool),
@@ -249,6 +254,7 @@ export async function runGoalLoop(opts: {
           iterations: run.iterations,
           stuckStrikes: run.stuckStrikes,
           status: "running",
+          tokenEstimate: run.tokenEstimate,
         });
       } catch {
         // Heartbeat best-effort; loop continues.
@@ -261,6 +267,7 @@ export async function runGoalLoop(opts: {
       status: opts.signal.aborted ? "stopped" : "failed",
       finishedAt: Date.now(),
       lastVerdict: run.lastVerdict ?? { verdict: "stuck", reason: `engine error: ${String(err)}` },
+      latestOutput: turnText,
     };
     opts.onRun(run);
     try {
@@ -269,6 +276,7 @@ export async function runGoalLoop(opts: {
         iterations: run.iterations,
         stuckStrikes: run.stuckStrikes,
         status: run.status,
+        tokenEstimate: run.tokenEstimate,
       });
     } catch {
       // best-effort
@@ -283,11 +291,13 @@ export async function runGoalLoop(opts: {
       iterations: run.iterations,
       stuckStrikes: run.stuckStrikes,
       status: run.status,
+      tokenEstimate: run.tokenEstimate,
     });
   } catch {
     // final write best-effort
   }
-  opts.onRun(run);
-  opts.onStatus?.(run.status);
-  return run;
+  const finished: AgentRun = { ...run, latestOutput: turnText };
+  opts.onRun(finished);
+  opts.onStatus?.(finished.status);
+  return finished;
 }

@@ -1,16 +1,18 @@
 import { useState, useRef, useEffect } from "react";
 import { useStore } from "../stores/useStore";
-import ReactMarkdown from "react-markdown";
-import { PROVIDER_PRESETS, getProviderPreset } from "../services/providerPresets";
 import { getPlatformInstallCmd } from "../services/opencodeClient";
+import SessionContextMenu from "./SessionContextMenu";
+import { ChatContainer } from "./chat/ChatContainer";
+import { Composer } from "./chat/Composer";
+import { ApproveGateCard } from "./chat/ApproveGateCard";
+import { FluxMark } from "./chat/FluxMark";
 
+// Layout shell for the fused assistant (OpenChamber-style redesign). Header + sessions
+// menu + options menu + goal bar + perspectives stay here; the message list, approval
+// gate and composer live in src/components/chat/*. Every engine renders through the same
+// parts pipeline (ChatContainer/Composer) — only the header dot/placeholder differ.
 export default function AssistantPanel() {
-  const assistantMessages = useStore((s) => s.assistantMessages);
-  const sendAssistantMessage = useStore((s) => s.sendAssistantMessage);
-  const cancelAssistantMessage = useStore((s) => s.cancelAssistantMessage);
   const clearAssistantMessages = useStore((s) => s.clearAssistantMessages);
-  const isAssistantStreaming = useStore((s) => s.isAssistantStreaming);
-  const assistantStatusText = useStore((s) => s.assistantStatusText);
   const settings = useStore((s) => s.settings);
   const updateSettings = useStore((s) => s.updateSettings);
   const assistantTopicTitle = useStore((s) => s.assistantTopicTitle);
@@ -21,14 +23,10 @@ export default function AssistantPanel() {
   const opencodeInstalled = useStore((s) => s.opencodeInstalled);
   const opencodeServerPid = useStore((s) => s.opencodeServerPid);
   const opencodeStatus = useStore((s) => s.opencodeStatus);
-  const pendingToolApprovals = useStore((s) => s.pendingToolApprovals);
-  const resolveToolApproval = useStore((s) => s.resolveToolApproval);
-  const clearToolApproval = useStore((s) => s.clearToolApproval);
   const agentSessions = useStore((s) => s.agentSessions);
   const activeAgentSessionId = useStore((s) => s.activeAgentSessionId);
   const loadAgentSessions = useStore((s) => s.loadAgentSessions);
   const createAgentSession = useStore((s) => s.createAgentSession);
-  const archiveAgentSession = useStore((s) => s.archiveAgentSession);
   const forkAgentSession = useStore((s) => s.forkAgentSession);
   const patchAgentSession = useStore((s) => s.patchAgentSession);
   const setActiveAgentSession = useStore((s) => s.setActiveAgentSession);
@@ -42,43 +40,24 @@ export default function AssistantPanel() {
 
   const engine = settings.assistantEngine;
 
-  const [inputVal, setInputVal] = useState("");
-  const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [showOptionsMenu, setShowOptionsMenu] = useState(false);
-  const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [showSessionsMenu, setShowSessionsMenu] = useState(false);
   const [goalInput, setGoalInput] = useState("");
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState(assistantTopicTitle);
+  const [perspectiveRunning, setPerspectiveRunning] = useState(false);
+  const [perspStatus, setPerspStatus] = useState<string | null>(null);
+  const [openContextMenuSessionId, setOpenContextMenuSessionId] = useState<string | null>(null);
+  const [hoveredSessionId, setHoveredSessionId] = useState<string | null>(null);
 
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const modelDropdownRef = useRef<HTMLDivElement | null>(null);
   const optionsMenuRef = useRef<HTMLDivElement | null>(null);
-  const attachMenuRef = useRef<HTMLDivElement | null>(null);
   const sessionsMenuRef = useRef<HTMLDivElement | null>(null);
 
-  const modelsList = [
-    ...PROVIDER_PRESETS.map((p) => ({ id: p.id, model: p.defaultModel, name: p.name, icon: p.icon, desc: p.desc })),
-    { id: "custom", model: settings.aiModelName || "custom-model", name: "Custom Endpoint", icon: "⚙️", desc: "vLLM / LM Studio / Local Proxy" },
-  ];
-
-  // Auto-scroll on new messages
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [assistantMessages]);
-
-  // Outside click handlers
+  // Outside click handlers for the header dropdowns.
   useEffect(() => {
     const handleOutsideClick = (e: MouseEvent) => {
-      if (modelDropdownRef.current && !modelDropdownRef.current.contains(e.target as Node)) {
-        setShowModelDropdown(false);
-      }
       if (optionsMenuRef.current && !optionsMenuRef.current.contains(e.target as Node)) {
         setShowOptionsMenu(false);
-      }
-      if (attachMenuRef.current && !attachMenuRef.current.contains(e.target as Node)) {
-        setShowAttachMenu(false);
       }
       if (sessionsMenuRef.current && !sessionsMenuRef.current.contains(e.target as Node)) {
         setShowSessionsMenu(false);
@@ -125,22 +104,6 @@ export default function AssistantPanel() {
     }
   };
 
-  const handleSend = () => {
-    if (!inputVal.trim()) return;
-    sendAssistantMessage(inputVal);
-    setInputVal("");
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-    }
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
-
   const handleTitleSubmit = () => {
     if (titleDraft.trim()) {
       setAssistantTopicTitle(titleDraft.trim());
@@ -181,30 +144,47 @@ export default function AssistantPanel() {
     setShowSessionsMenu(false);
   };
 
-  const handleAttachContext = (contextType: string) => {
-    if (contextType === "active_file") {
-      const activeFile = useStore.getState().activeLeftTabId || useStore.getState().activeRightTabId;
-      if (activeFile) {
-        const name = activeFile.split(/[\\/]/).pop();
-        setInputVal((prev) => prev + ` @[${name}] `);
-      }
-    } else if (contextType === "folder") {
-      const folder = useStore.getState().currentFolderPath;
-      if (folder) {
-        const name = folder.split(/[\\/]/).pop();
-        setInputVal((prev) => prev + ` @folder/${name} `);
-      }
+  // Phase 4 "Perspectives + Fusion": run N sequential framing goal-loops on the active
+  // note, save each draft as an artifact, then fuse into one balanced vault note.
+  const handleRunPerspectives = async () => {
+    if (perspectiveRunning) return;
+    const st = useStore.getState();
+    const isLeft = st.activePanel === "left";
+    const content = (isLeft ? st.leftDraft : st.rightDraft) ?? "";
+    if (!content.trim()) {
+      setPerspStatus("Open a note first — Perspectives analyzes the active note.");
+      return;
     }
-    setShowAttachMenu(false);
-    textareaRef.current?.focus();
+    const rawTitle = (isLeft ? st.activeLeftTabId : st.activeRightTabId)?.split(/[\\/]/).pop() ?? "Topic";
+    const title = rawTitle.replace(/\.md$/i, "");
+    setPerspectiveRunning(true);
+    setPerspStatus("🧭 Analyzing the note from multiple angles… (sequential runs)");
+    try {
+      const { runPerspectives } = await import("../services/perspectives");
+      const result = await runPerspectives({ topic: content, topicTitle: title });
+      let msg = `Perspectives done: ${result.drafts.length} draft${result.drafts.length === 1 ? "" : "s"} in Artifacts.`;
+      if (result.fusedNotePath) {
+        msg += ` Balanced note: ${result.fusedNotePath}`;
+        st.openFile(result.fusedNotePath).catch(() => {});
+        st.refreshExplorer().catch(() => {});
+      } else if (result.fusionArtifactId) {
+        msg += " Balanced view saved as an artifact.";
+      }
+      if (result.error) msg += ` ${result.error}`;
+      setPerspStatus(msg);
+    } catch (err) {
+      setPerspStatus(`Perspectives failed: ${String(err)}`);
+    } finally {
+      setPerspectiveRunning(false);
+    }
   };
 
   return (
     <div className="flex h-full flex-col overflow-hidden panel-rounded border border-border/60 bg-card">
       {/* Top Header */}
       <div className="flex shrink-0 items-center justify-between px-4 py-3">
-        <div className="flex items-center gap-2 min-w-0 flex-1">
-          <FluxMark className="h-4 w-4 text-accent shrink-0" />
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <FluxMark className="h-4 w-4 shrink-0 text-accent" />
           {isEditingTitle ? (
             <input
               autoFocus
@@ -215,32 +195,64 @@ export default function AssistantPanel() {
               className="min-w-0 flex-1 rounded border border-border bg-bg/80 px-2 py-0.5 text-xs text-white outline-none"
             />
           ) : (
-            <h2
-              onDoubleClick={() => {
-                setTitleDraft(assistantTopicTitle);
-                setIsEditingTitle(true);
-              }}
-              title="Double click to rename topic"
-              className="truncate text-[11px] font-medium tracking-wide text-muted select-none cursor-pointer hover:text-text"
-            >
-              {assistantTopicTitle}
-            </h2>
+            <div className="relative flex min-w-0 items-center gap-1">
+              <h2
+                onDoubleClick={() => {
+                  setTitleDraft(assistantTopicTitle);
+                  setIsEditingTitle(true);
+                }}
+                title="Double click to rename topic"
+                className="truncate text-[11px] font-medium tracking-wide text-muted cursor-pointer select-none hover:text-text"
+              >
+                {assistantTopicTitle}
+              </h2>
+              {activeAgentSessionId && (
+                <>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setOpenContextMenuSessionId(
+                        openContextMenuSessionId === activeAgentSessionId ? null : activeAgentSessionId
+                      );
+                    }}
+                    className="shrink-0 rounded p-0.5 text-muted hover:text-text cursor-pointer transition-colors"
+                    title="Active Session Options"
+                  >
+                    <svg className="h-3 w-3 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
+                      <circle cx="12" cy="12" r="1" />
+                      <circle cx="12" cy="5" r="1" />
+                      <circle cx="12" cy="19" r="1" />
+                    </svg>
+                  </button>
+                  <SessionContextMenu
+                    sessionId={activeAgentSessionId}
+                    isOpen={openContextMenuSessionId === activeAgentSessionId}
+                    onClose={() => setOpenContextMenuSessionId(null)}
+                    onTriggerRename={() => {
+                      setTitleDraft(assistantTopicTitle);
+                      setIsEditingTitle(true);
+                    }}
+                    align="left"
+                  />
+                </>
+              )}
+            </div>
           )}
         </div>
 
         {/* Header Right Actions */}
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex shrink-0 items-center gap-1.5">
           <div className="flex items-center gap-1 pl-0.5">
             {/* Engine status dot */}
             {engine === "opencode" && (
               <div
                 className={`h-1.5 w-1.5 rounded-full ${
                   opencodeStatus === "ready"
-                    ? "bg-emerald-500"
+                    ? "bg-chat-tool-ok"
                     : opencodeStatus === "error"
-                      ? "bg-red-500"
+                      ? "bg-chat-tool-error"
                       : opencodeStatus === "starting"
-                        ? "bg-amber-400 animate-pulse"
+                        ? "bg-chat-warn animate-pulse"
                         : "bg-border"
                 }`}
                 title={
@@ -256,9 +268,7 @@ export default function AssistantPanel() {
             )}
             {/* Memory-RAG status dot (M6 UX) */}
             <div
-              className={`h-1.5 w-1.5 rounded-full ${
-                settings.aiEnabled ? "bg-sky-500" : "bg-border"
-              }`}
+              className={`h-1.5 w-1.5 rounded-full ${settings.aiEnabled ? "bg-chat-tool-running" : "bg-border"}`}
               title={
                 settings.aiEnabled
                   ? `Memory-RAG on · ${settings.embedModel || "nomic-embed-text"} @ ${settings.embedBaseUrl || "localhost:11434"}`
@@ -274,7 +284,7 @@ export default function AssistantPanel() {
               className="rounded-full p-1 text-muted hover:bg-bg/60 hover:text-text cursor-pointer transition-colors"
               title="Agent Sessions"
             >
-              <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
+              <svg className="h-3.5 w-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
                 <rect x="3" y="4" width="18" height="14" rx="2" />
                 <path d="M8 21h8M9 8.5l2 2 4-4" />
               </svg>
@@ -282,9 +292,9 @@ export default function AssistantPanel() {
 
             {showSessionsMenu && (
               <div className="absolute right-0 top-7 z-30 flex w-64 flex-col rounded-xl border border-border/60 bg-card p-1 text-xs text-text shadow-xl">
-                <div className="px-2.5 pt-1 pb-1.5 text-[10px] font-semibold uppercase text-muted flex items-center justify-between">
+                <div className="flex items-center justify-between px-2.5 pb-1.5 pt-1 text-[10px] font-semibold uppercase text-muted">
                   <span>Agent Sessions</span>
-                  <span className="text-muted/70 normal-case font-normal">{agentSessions.length}</span>
+                  <span className="normal-case font-normal text-muted/70">{agentSessions.length}</span>
                 </div>
                 <button
                   onClick={handleNewSession}
@@ -292,7 +302,7 @@ export default function AssistantPanel() {
                 >
                   + New Session
                 </button>
-                <div className="h-px bg-border/50 my-0.5" />
+                <div className="my-0.5 h-px bg-border/50" />
                 <div className="max-h-56 overflow-y-auto scrollbar-thin">
                   {agentSessions.length === 0 ? (
                     <div className="px-2.5 py-2 text-[10px] text-muted">No saved sessions yet.</div>
@@ -300,45 +310,112 @@ export default function AssistantPanel() {
                     agentSessions.map((sess) => (
                       <div
                         key={sess.id}
-                        className={`group flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 cursor-pointer transition-colors ${
+                        onMouseEnter={() => setHoveredSessionId(sess.id)}
+                        onMouseLeave={() => setHoveredSessionId(null)}
+                        className={`group relative flex cursor-pointer items-center gap-1.5 rounded-lg px-2.5 py-1.5 transition-colors ${
                           sess.id === activeAgentSessionId ? "bg-bg/60" : "hover:bg-bg/40"
                         }`}
                         onClick={() => handleResumeSession(sess.id)}
                       >
                         <div className="min-w-0 flex-1">
                           <div className="truncate text-[11px] text-text">
-                            {sess.parentId && <span className="text-muted mr-1">↳</span>}
+                            {sess.parentId && <span className="mr-1 text-muted">↳</span>}
                             {sess.title || "Untitled session"}
                           </div>
                           <div className="truncate text-[9px] text-muted">
-                            {sess.engine || "opencode"} · {sess.agent || sess.model || "build"} ·{" "}
-                            {sess.status}
+                            {sess.engine || "opencode"} · {sess.agent || sess.model || "build"} · {sess.status}
                           </div>
                         </div>
+
+                        {/* Hover Peek Preview Card ("sneak conversation") */}
+                        {hoveredSessionId === sess.id && openContextMenuSessionId !== sess.id && (
+                          <div
+                            className="pointer-events-auto absolute right-full top-0 z-50 mr-2 w-64 space-y-2 rounded-xl border border-border/70 bg-card p-3 text-xs shadow-2xl select-none"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <div className="flex items-start justify-between gap-1 border-b border-border/50 pb-1.5">
+                              <div className="min-w-0 flex-1">
+                                <p className="truncate text-[11px] font-semibold text-text">{sess.title || "Untitled session"}</p>
+                                <p className="mt-0.5 truncate text-[9.5px] text-muted">
+                                  {sess.engine || "opencode"} · {sess.model || "build"} · {sess.status}
+                                </p>
+                              </div>
+                              <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[9px] font-medium text-accent">
+                                Peek 👁️
+                              </span>
+                            </div>
+
+                            {/* Message Sneak Preview */}
+                            <div className="max-h-32 space-y-1 overflow-y-auto rounded-lg bg-bg/50 p-2 text-[10.5px] text-text/80">
+                              {sess.summary ? (
+                                <p className="line-clamp-4 leading-relaxed text-muted/90">{sess.summary}</p>
+                              ) : sess.context ? (
+                                <div className="space-y-1">
+                                  <p className="text-[9px] font-semibold uppercase tracking-wide text-accent/80">Context Snapshot</p>
+                                  <p className="line-clamp-4 font-mono text-[10px] leading-relaxed text-muted/90">
+                                    {sess.context.length > 200 ? sess.context.slice(0, 200) + "…" : sess.context}
+                                  </p>
+                                </div>
+                              ) : (
+                                <p className="text-[10px] italic text-muted/60">No conversation transcript cached for preview.</p>
+                              )}
+                            </div>
+
+                            {/* Footer Quick Actions */}
+                            <div className="flex items-center justify-between border-t border-border/40 pt-1 text-[9.5px] text-muted">
+                              <span>{sess.tokens ? `${Math.round(sess.tokens / 1000)}k tokens` : "0 tokens"}</span>
+                              <div className="flex items-center gap-1">
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleForkSession(sess.id);
+                                  }}
+                                  className="rounded border border-border/60 bg-bg/40 px-1.5 py-0.5 text-text hover:bg-bg cursor-pointer transition-colors"
+                                >
+                                  Fork
+                                </button>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleResumeSession(sess.id);
+                                  }}
+                                  className="rounded bg-accent px-1.5 py-0.5 font-medium text-white hover:opacity-90 cursor-pointer transition-opacity"
+                                >
+                                  Open
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Session options button */}
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleForkSession(sess.id);
+                            setOpenContextMenuSessionId(openContextMenuSessionId === sess.id ? null : sess.id);
                           }}
-                          className="shrink-0 rounded p-0.5 text-muted opacity-0 group-hover:opacity-100 hover:text-accent cursor-pointer transition-all"
-                          title="Fork session (child inherits context, keeps lineage)"
+                          className="shrink-0 rounded p-0.5 text-muted opacity-0 transition-all group-hover:opacity-100 hover:text-text cursor-pointer"
+                          title="Session Options"
                         >
-                          <svg className="w-3 h-3 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
-                            <path d="M4 7h10M14 7v10M18 7a2 2 0 1 0 0-4 2 2 0 0 0 0 4zM14 17a2 2 0 1 0 0-4 2 2 0 0 0 0 4z" />
+                          <svg className="h-3 w-3 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
+                            <circle cx="12" cy="12" r="1" />
+                            <circle cx="12" cy="5" r="1" />
+                            <circle cx="12" cy="19" r="1" />
                           </svg>
                         </button>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            archiveAgentSession(sess.id);
+
+                        <SessionContextMenu
+                          sessionId={sess.id}
+                          isOpen={openContextMenuSessionId === sess.id}
+                          onClose={() => setOpenContextMenuSessionId(null)}
+                          onTriggerRename={() => {
+                            if (sess.id === activeAgentSessionId) {
+                              setTitleDraft(sess.title || assistantTopicTitle);
+                              setIsEditingTitle(true);
+                            }
                           }}
-                          className="shrink-0 rounded p-0.5 text-muted opacity-0 group-hover:opacity-100 hover:text-red-400 cursor-pointer transition-all"
-                          title="Archive session"
-                        >
-                          <svg className="w-3 h-3 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
-                            <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14" />
-                          </svg>
-                        </button>
+                          align="right"
+                        />
                       </div>
                     ))
                   )}
@@ -354,7 +431,7 @@ export default function AssistantPanel() {
               className="rounded-full p-1 text-muted hover:bg-bg/60 hover:text-text cursor-pointer transition-colors"
               title="Assistant Options"
             >
-              <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
+              <svg className="h-3.5 w-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
                 <circle cx="12" cy="12" r="1" />
                 <circle cx="12" cy="5" r="1" />
                 <circle cx="12" cy="19" r="1" />
@@ -363,15 +440,13 @@ export default function AssistantPanel() {
 
             {showOptionsMenu && (
               <div className="absolute right-0 top-7 z-30 flex w-48 flex-col rounded-xl border border-border/60 bg-card p-1 text-xs text-text shadow-xl">
-                <div className="px-2.5 pt-1 pb-1.5 text-[10px] font-semibold uppercase text-muted">Engine</div>
-                <div className="flex items-center rounded-full border border-border/50 bg-bg/30 p-0.5 mx-2 mb-1.5">
+                <div className="px-2.5 pb-1.5 pt-1 text-[10px] font-semibold uppercase text-muted">Engine</div>
+                <div className="mx-2 mb-1.5 flex items-center rounded-full border border-border/50 bg-bg/30 p-0.5">
                   <button
                     onClick={() => handleEngineSelect("opencode")}
                     title="OpenCode engine (primary) — agentic; falls back to BYOK if unavailable"
                     className={`flex-1 rounded-full px-2.5 py-1 text-[10px] font-medium transition-colors cursor-pointer ${
-                      engine === "opencode"
-                        ? "bg-accent text-white"
-                        : "text-muted hover:text-text"
+                      engine === "opencode" ? "bg-accent text-white" : "text-muted hover:text-text"
                     }`}
                   >
                     OpenCode
@@ -380,15 +455,13 @@ export default function AssistantPanel() {
                     onClick={() => handleEngineSelect("byok")}
                     title="BYOK engine — direct API (Ollama / OpenAI / Anthropic / Gemini)"
                     className={`flex-1 rounded-full px-2.5 py-1 text-[10px] font-medium transition-colors cursor-pointer ${
-                      engine === "byok"
-                        ? "bg-accent text-white"
-                        : "text-muted hover:text-text"
+                      engine === "byok" ? "bg-accent text-white" : "text-muted hover:text-text"
                     }`}
                   >
                     BYOK
                   </button>
                 </div>
-                <div className="h-px bg-border/50 my-0.5" />
+                <div className="my-0.5 h-px bg-border/50" />
                 <button
                   onClick={() => {
                     setTitleDraft(assistantTopicTitle);
@@ -404,11 +477,11 @@ export default function AssistantPanel() {
                     clearAssistantMessages();
                     setShowOptionsMenu(false);
                   }}
-                  className="rounded-lg px-2.5 py-1.5 text-left text-red-400 hover:bg-red-500/10 cursor-pointer transition-colors"
+                  className="rounded-lg px-2.5 py-1.5 text-left text-chat-tool-error hover:bg-chat-tool-error/10 cursor-pointer transition-colors"
                 >
                   Clear Chat
                 </button>
-                <div className="h-px bg-border/50 my-0.5" />
+                <div className="my-0.5 h-px bg-border/50" />
                 <button
                   onClick={() => {
                     toggleAssistantPanel();
@@ -426,15 +499,15 @@ export default function AssistantPanel() {
 
       {/* OpenCode not installed banner */}
       {engine === "opencode" && !opencodeInstalled && (
-        <div className="shrink-0 mx-3 mb-2 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] px-3.5 py-2.5 flex items-center justify-between gap-2">
+        <div className="mx-3 mb-2 flex shrink-0 items-center justify-between gap-2 rounded-xl border border-chat-warn/25 bg-chat-warn/[0.06] px-3.5 py-2.5">
           <div className="min-w-0 flex-1">
-            <p className="text-[11px] font-medium text-amber-300">OpenCode not found</p>
-            <p className="text-[10px] text-muted mt-0.5 leading-relaxed">
+            <p className="text-[11px] font-medium text-chat-warn">OpenCode not found</p>
+            <p className="mt-0.5 text-[10px] leading-relaxed text-muted">
               Install it to power the assistant — your BYOK keys will be used as fallback automatically.
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
-            <code className="rounded-md border border-amber-500/30 bg-bg/60 px-1.5 py-0.5 font-mono text-[10px] text-accent select-all">
+            <code className="rounded-md border border-chat-warn/30 bg-bg/60 px-1.5 py-0.5 font-mono text-[10px] text-accent select-all">
               {getPlatformInstallCmd()}
             </code>
             <button
@@ -447,103 +520,26 @@ export default function AssistantPanel() {
         </div>
       )}
 
-      {/* Messages Stream (fused: both engines render here) */}
-      <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4 scrollbar-thin">
-        {assistantMessages.length === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center text-center px-6 select-none">
-            <FluxMark className="h-11 w-11 text-accent/80 mb-3" />
-            <p className="text-sm font-semibold text-text tracking-tight">
-              {engine === "opencode" ? "OpenCode Agent" : "Study Assistant"}
-            </p>
-            <p className="text-[11px] text-muted mt-1.5 max-w-[230px] leading-relaxed">
-              {engine === "opencode"
-                ? "Ask it to write, edit, or refactor notes in your workspace."
-                : "Ask questions about your notes, summarize sources, or plan your study."}
-            </p>
-          </div>
-        ) : (
-          assistantMessages.map((msg) =>
-            msg.role === "user" ? (
-              <div key={msg.id} className="flex flex-col items-start">
-                <span className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted/70">User</span>
-                <div className="max-w-[88%] border-l-2 border-accent/40 pl-3 text-xs text-text leading-relaxed whitespace-pre-wrap">
-                  {msg.content}
-                </div>
-              </div>
-            ) : (
-              <div key={msg.id} className="flex flex-col items-end">
-                <span className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted/70">Agent</span>
-                <div className="max-w-[88%] border-r-2 border-border pr-3 text-right text-xs text-text/85 leading-relaxed markdown-preview">
-                  <ReactMarkdown>{msg.content}</ReactMarkdown>
-                </div>
-              </div>
-            )
-          )
-        )}
-        {assistantStatusText && (
-          <div className="flex items-center gap-2 text-[11px] text-muted font-medium w-fit">
-            <span className="h-1.5 w-1.5 rounded-full bg-accent animate-pulse" />
-            <span>{assistantStatusText}</span>
-          </div>
-        )}
-        <div ref={messagesEndRef} />
-      </div>
+      {/* Messages stream (engine-agnostic OpenChamber-style chat) */}
+      <ChatContainer />
 
-      {/* Pending file-tool approval gate (Phase 2b) */}
-      {pendingToolApprovals.length > 0 && (
-        <div className="space-y-2 px-3 pb-1">
-          {pendingToolApprovals
-            .filter((p) => p.status === "pending")
-            .map((p) => (
-              <div
-                key={p.id}
-                className="flex items-center justify-between gap-2 rounded-xl border border-amber-400/30 bg-amber-400/[0.07] px-3 py-2 text-xs"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5 font-medium text-amber-300">
-                    <span className="uppercase tracking-wide text-[10px]">AI wants to change your files</span>
-                  </div>
-                  <p className="mt-0.5 text-text/80 leading-relaxed break-words">{p.summary}</p>
-                </div>
-                <div className="flex shrink-0 items-center gap-1.5">
-                  <button
-                    onClick={() => {
-                      resolveToolApproval(p.id, "approved");
-                      setTimeout(() => clearToolApproval(p.id), 1200);
-                    }}
-                    className="rounded-full bg-emerald-500 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-emerald-400 cursor-pointer transition-colors"
-                  >
-                    Approve
-                  </button>
-                  <button
-                    onClick={() => {
-                      resolveToolApproval(p.id, "rejected");
-                      clearToolApproval(p.id);
-                    }}
-                    className="rounded-full border border-border/60 bg-bg/60 px-2.5 py-1 text-[11px] font-medium text-red-400 hover:bg-red-500/10 cursor-pointer transition-colors"
-                  >
-                    Deny
-                  </button>
-                </div>
-              </div>
-            ))}
-        </div>
-      )}
+      {/* Pending file-tool approval gate (shared PermissionCard analog) */}
+      <ApproveGateCard />
 
       {/* Goal mode bar (AGENTIC_ORCHESTRATION_PLAN.md Phase 2) */}
       <div className="shrink-0 px-3 pb-1">
         {goalRunning && agentRun ? (
-          <div className="flex items-center justify-between gap-2 rounded-2xl border border-accent/30 bg-accent/[0.06] px-3 py-2">
+          <div className="flex items-center justify-between gap-2 rounded-2xl border border-chat-tool-running/30 bg-chat-tool-running/[0.06] px-3 py-2">
             <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-accent">
+              <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-chat-tool-running">
                 {goalPaused ? (
                   <>
-                    <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                    <span className="h-1.5 w-1.5 rounded-full bg-chat-warn" />
                     Paused
                   </>
                 ) : (
                   <>
-                    <span className="h-1.5 w-1.5 rounded-full bg-accent animate-pulse" />
+                    <span className="h-1.5 w-1.5 rounded-full bg-chat-tool-running animate-pulse" />
                     Goal running
                   </>
                 )}
@@ -552,9 +548,7 @@ export default function AssistantPanel() {
               <p className="mt-0.5 text-[9px] text-muted">
                 iter {agentRun.iterations} · strikes {agentRun.stuckStrikes}/3 ·{" "}
                 {Math.round(agentRun.tokenEstimate / 1000)}k est tokens
-                {agentRun.lastVerdict && (
-                  <span className="ml-1 text-muted/80">· {agentRun.lastVerdict.verdict}</span>
-                )}
+                {agentRun.lastVerdict && <span className="ml-1 text-muted/80">· {agentRun.lastVerdict.verdict}</span>}
               </p>
             </div>
             <div className="flex shrink-0 items-center gap-1">
@@ -575,203 +569,67 @@ export default function AssistantPanel() {
               )}
               <button
                 onClick={stopGoalRun}
-                className="rounded-full bg-red-500 px-2.5 py-1 text-[10px] font-medium text-white hover:bg-red-400 cursor-pointer transition-colors"
+                className="rounded-full bg-chat-tool-error px-2.5 py-1 text-[10px] font-medium text-white hover:opacity-90 cursor-pointer transition-opacity"
               >
                 Stop
               </button>
             </div>
           </div>
         ) : (
-          <div className="flex items-center gap-1 flex-wrap">
-            <svg className="w-3 h-3 text-muted" viewBox="0 0 24 24" fill="none" strokeWidth="2" stroke="currentColor">
-              <circle cx="12" cy="12" r="10" />
-              <path d="M12 6v6l4 2" />
-            </svg>
-            <input
-              value={goalInput}
-              onChange={(e) => setGoalInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
+          <div className="flex flex-wrap items-center justify-between gap-1 rounded-xl border border-border/50 bg-bg/40 px-2 py-1">
+            <div className="flex min-w-0 flex-1 items-center gap-1">
+              <svg className="h-3 w-3 text-muted shrink-0" viewBox="0 0 24 24" fill="none" strokeWidth="2" stroke="currentColor">
+                <circle cx="12" cy="12" r="10" />
+                <path d="M12 6v6l4 2" />
+              </svg>
+              <input
+                value={goalInput}
+                onChange={(e) => setGoalInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    startGoalRun(goalInput);
+                    setGoalInput("");
+                  }
+                }}
+                placeholder="Arm a study goal..."
+                className="min-w-0 flex-1 bg-transparent text-[10.5px] text-text outline-none placeholder:text-muted/50"
+              />
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                onClick={() => {
                   startGoalRun(goalInput);
                   setGoalInput("");
-                }
-              }}
-              placeholder="Arm a study goal — the agent runs until an auditor calls it done (or budget/strikes block it)"
-              className="min-w-0 flex-1 bg-transparent text-[11px] text-text placeholder:text-muted/50 outline-none"
-            />
-            <button
-              onClick={() => {
-                startGoalRun(goalInput);
-                setGoalInput("");
-              }}
-              disabled={!goalInput.trim()}
-              className="shrink-0 rounded-full border border-border/50 bg-bg/40 px-2.5 py-0.5 text-[10px] font-medium text-accent hover:text-white disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
-            >
-              Run
-            </button>
+                }}
+                disabled={!goalInput.trim()}
+                className="shrink-0 rounded-full border border-border/50 bg-bg/60 px-2 py-0.5 text-[9.5px] font-medium text-accent hover:text-white disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer transition-colors"
+              >
+                Run
+              </button>
+              <button
+                onClick={() => handleRunPerspectives()}
+                disabled={perspectiveRunning}
+                title="Analyze the active note from five angles, then fuse into one balanced note"
+                className="shrink-0 rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[9.5px] font-medium text-accent hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer transition-colors"
+              >
+                {perspectiveRunning ? "Perspectives…" : "🧭 Perspectives"}
+              </button>
+            </div>
           </div>
         )}
       </div>
 
-      {/* Bottom Input Area (shared) */}
-      <div className="px-3 pb-3 pt-1">
-        <div className="flex flex-col rounded-3xl border border-border/50 bg-bg/50 px-4 py-3 focus-within:border-accent/50 transition-colors">
-          {/* Text Area */}
-          <textarea
-            ref={textareaRef}
-            rows={2}
-            value={inputVal}
-            onChange={(e) => setInputVal(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder={
-              engine === "opencode"
-                ? "Ask the OpenCode agent to write, edit, or explain code..."
-                : "Ask anything..."
-            }
-            className="w-full resize-none bg-transparent text-xs text-text placeholder:text-muted/50 outline-none leading-relaxed"
-          />
-
-          {/* Bottom Toolbar */}
-          <div className="mt-1 flex items-center justify-between">
-            {/* Left toolbar items */}
-            <div className="flex items-center gap-1.5">
-              {engine === "opencode" ? (
-                <span className="text-[10px] font-medium text-muted">
-                  OpenCode · file edit · LSP
-                </span>
-              ) : (
-                <>
-                  {/* Attach Context Button (+) */}
-                  <div className="relative" ref={attachMenuRef}>
-                    <button
-                      onClick={() => setShowAttachMenu(!showAttachMenu)}
-                      title="Add context attachment"
-                      className="flex h-6 w-6 items-center justify-center rounded-full text-muted hover:text-text hover:bg-bg/60 cursor-pointer transition-colors"
-                    >
-                      <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2.5">
-                        <line x1="12" y1="5" x2="12" y2="19" />
-                        <line x1="5" y1="12" x2="19" y2="12" />
-                      </svg>
-                    </button>
-
-                    {showAttachMenu && (
-                      <div className="absolute bottom-8 left-0 z-30 flex w-44 flex-col rounded-xl border border-border/60 bg-card p-1 text-xs text-text shadow-xl">
-                        <button
-                          onClick={() => handleAttachContext("active_file")}
-                          className="flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-left hover:bg-bg/70 cursor-pointer transition-colors"
-                        >
-                          <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
-                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                          </svg>
-                          Active Note Context
-                        </button>
-                        <button
-                          onClick={() => handleAttachContext("folder")}
-                          className="flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-left hover:bg-bg/70 cursor-pointer transition-colors"
-                        >
-                          <svg className="w-3.5 h-3.5 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2">
-                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                          </svg>
-                          Vault Workspace
-                        </button>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Model Dropdown Pill Badge */}
-                  <div className="relative" ref={modelDropdownRef}>
-                    <button
-                      onClick={() => setShowModelDropdown(!showModelDropdown)}
-                      className="flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium text-muted hover:text-text hover:bg-bg/60 cursor-pointer transition-colors"
-                    >
-                      <span className="text-[10px] text-accent font-bold">
-                        {modelsList.find((m) => m.id === settings.aiProvider)?.icon || "🦙"}
-                      </span>
-                      <span className="truncate max-w-[100px]">{settings.aiModelName || "hermes3:8b"}</span>
-                      <svg className="w-3 h-3 text-muted shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <polyline points="6 9 12 15 18 9" />
-                      </svg>
-                    </button>
-
-                    {showModelDropdown && (
-                      <div className="absolute bottom-8 left-0 z-30 flex w-56 flex-col rounded-xl border border-border/60 bg-card p-1 text-xs text-text shadow-xl">
-                        <div className="px-2 py-1 text-[10px] font-semibold uppercase text-muted">BYOK Fallback AI Engine & Model</div>
-                        {modelsList.map((m) => (
-                          <button
-                            key={m.id}
-                            onClick={() => {
-                              const defaultUrl = getProviderPreset(m.id)?.defaultBaseUrl ?? settings.aiBaseUrl;
-
-                              updateSettings({
-                                aiProvider: m.id,
-                                aiModelName: m.model,
-                                aiBaseUrl: defaultUrl,
-                              });
-                              setShowModelDropdown(false);
-                            }}
-                            className={`flex items-center justify-between rounded-lg px-2.5 py-1.5 text-left cursor-pointer transition-colors ${
-                              settings.aiProvider === m.id ? "bg-accent text-white font-medium" : "hover:bg-bg/70 text-text/90"
-                            }`}
-                          >
-                            <div className="flex flex-col min-w-0">
-                              <div className="flex items-center gap-1.5 font-medium truncate">
-                                <span>{m.icon}</span>
-                                <span className="truncate">{m.name}</span>
-                              </div>
-                              <span className="text-[10px] text-muted leading-tight truncate">{m.desc}</span>
-                            </div>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
-
-            {/* Right: Send / Stop Button */}
-            {isAssistantStreaming ? (
-              <button
-                onClick={cancelAssistantMessage}
-                className="flex h-7 w-7 items-center justify-center rounded-full bg-red-500/90 text-white hover:bg-red-500 cursor-pointer transition-all"
-                title="Stop generating"
-              >
-                <svg className="w-3 h-3 fill-current" viewBox="0 0 24 24">
-                  <rect x="5" y="5" width="14" height="14" rx="2" />
-                </svg>
-              </button>
-            ) : (
-              <button
-                onClick={handleSend}
-                disabled={!inputVal.trim()}
-                className={`flex h-7 w-7 items-center justify-center rounded-full transition-all ${
-                  inputVal.trim()
-                    ? "bg-accent text-white hover:bg-accent-hover cursor-pointer scale-100"
-                    : "bg-border/40 text-muted cursor-not-allowed opacity-50"
-                }`}
-                title="Send message"
-              >
-                <svg className="w-4 h-4 stroke-current" viewBox="0 0 24 24" fill="none" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                  <line x1="12" y1="19" x2="12" y2="5" />
-                  <polyline points="5 12 12 5 19 12" />
-                </svg>
-              </button>
-            )}
-          </div>
+      {/* Perspectives status line (Phase 4) */}
+      {perspStatus && (
+        <div className="shrink-0 px-3 pb-1">
+          <p className="rounded-xl border border-accent/20 bg-accent/[0.05] px-3 py-1.5 text-[10.5px] leading-relaxed text-text/80">
+            {perspStatus}
+          </p>
         </div>
-      </div>
-    </div>
-  );
-}
+      )}
 
-function FluxMark({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 64 64" fill="none" stroke="currentColor" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 24h12a8 8 0 0 1 8 8v0a8 8 0 0 0 8 8h12" />
-      <polyline points="44 32 52 40 44 48" />
-      <path d="M52 40H40a8 8 0 0 1-8-8v0a8 8 0 0 0-8-8H12" />
-      <polyline points="20 32 12 24 20 16" />
-      <circle cx="12" cy="40" r="2.5" fill="currentColor" stroke="none" />
-    </svg>
+      {/* Composer (engine-agnostic) */}
+      <Composer />
+    </div>
   );
 }

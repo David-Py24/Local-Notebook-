@@ -8,6 +8,11 @@ use tauri::{Manager, State};
 /// `kill_opencode_server` can remove it when the sidecar stops. This keeps the
 /// export non-destructive and leaves no artifact behind in the user's vault.
 static OPENCODE_MCP_CONFIG: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+// Path of the sidecar's stdout/stderr capture (`opencode-server.<port>.log`). Mirrors
+// OPENCODE_MCP_CONFIG: tracked so `kill_opencode_server` can clean it up on a clean
+// stop; on an unclean exit the file lingers in the app-data dir and is simply
+// truncated on the next spawn for the same port.
+static OPENCODE_SERVER_LOG: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
 
 // Local version history (DATA-3): before overwriting a tracked file, the previous content
 // is copied into <app_data_dir>/history/<hash-of-path>/<timestamp>.<ext>, capped at the
@@ -1609,17 +1614,38 @@ mod history_tests {
 // - Ollama/local provider needs no API key env var at all.
 // ---------------------------------------------------------------------------
 
-/// Checks whether the `opencode` binary is on PATH by running `opencode --version`.
-/// Returns true if the exit code is 0 (installed + accessible), false otherwise.
+/// Resolves the `opencode` binary via the OS (*not* a shell, so npm `.cmd` shims are
+/// ignored), returning whether it is runnable plus the version string for diagnostics
+/// (OPENCODE_HTTP500_DIAGNOSIS_PLAN.md, workstream B — the UI needs to tell a stale
+/// or foreign CLI apart from the one the sidecar actually runs).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeCheck {
+    pub installed: bool,
+    pub version: Option<String>,
+}
+
 #[tauri::command]
-pub fn check_opencode_installed() -> bool {
-    std::process::Command::new("opencode")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+pub fn check_opencode_installed() -> OpenCodeCheck {
+    match std::process::Command::new("opencode").arg("--version").output() {
+        Ok(out) => {
+            let installed = out.status.success();
+            let version = if installed {
+                let first = String::from_utf8_lossy(&out.stdout)
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if first.is_empty() { None } else { Some(first) }
+            } else {
+                None
+            };
+            OpenCodeCheck { installed, version }
+        }
+        Err(_) => OpenCodeCheck { installed: false, version: None },
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -1627,6 +1653,8 @@ pub fn check_opencode_installed() -> bool {
 pub struct OpenCodeSpawn {
     pub pid: u32,
     pub port: u16,
+    /// `opencode --version` output from the binary that was spawned, if resolvable.
+    pub version: Option<String>,
 }
 
 /// Finds a free TCP port at or after `start` by probe-binding 127.0.0.1.
@@ -1646,6 +1674,25 @@ fn find_free_port(start: u16) -> Result<u16, String> {
     ))
 }
 
+/// Chooses the sidecar port: honors the user's configured port while it is free,
+/// otherwise jumps to a RANDOM high port instead of deterministically walking the
+/// 4096-4100 range (OPENCODE_HTTP500_DIAGNOSIS_PLAN.md, workstream C). Foreign/own
+/// `opencode serve` processes pile up on the low range (four live on 4096-4099 on
+/// the developer machine), so a fresh spawn must not be pushed onto the same 50-port
+/// band every time. `find_free_port` then reserves a contiguous fallback band from
+/// the randomized base.
+fn pick_sidecar_port(configured: u16) -> Result<u16, String> {
+    if std::net::TcpListener::bind(("127.0.0.1", configured)).is_ok() {
+        return Ok(configured);
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0) as u64;
+    let base = 40000 + ((nanos + u64::from(std::process::id())) % 5000) as u16;
+    find_free_port(base)
+}
+
 /// Spawns `opencode serve --port <port>` in the given workspace directory.
 ///
 /// `provider_env` is a map of env var → value for the user's BYOK credentials
@@ -1656,6 +1703,7 @@ fn find_free_port(start: u16) -> Result<u16, String> {
 /// `port` if that one is already in use) on success, or an error string on failure.
 #[tauri::command]
 pub fn spawn_opencode_server(
+    app_handle: tauri::AppHandle,
     port: u16,
     workspace_path: String,
     server_password: String,
@@ -1671,7 +1719,31 @@ pub fn spawn_opencode_server(
         ));
     }
 
-    let actual_port = find_free_port(port)?;
+    // Paseo PID Lock check: before spawning a new sidecar, if an existing PID lock exists,
+    // attempt to kill any orphaned sidecar from a prior run.
+    if let Some(existing) = read_opencode_pid_lock(&app_handle) {
+        let _ = kill_opencode_server_internal(Some(&app_handle), existing.pid);
+    }
+
+    let actual_port = pick_sidecar_port(port)?;
+
+    // Capture the sidecar's stdout+stderr into the app-data dir instead of swallowing
+    // it (OPENCODE_HTTP500_DIAGNOSIS_PLAN.md, workstream B). Provider/model init failures,
+    // config-load errors and storage-lock problems all print here before the message
+    // endpoint 500s — without this the HTTP body is the only evidence, and it is often empty.
+    let server_log_path = {
+        let dir = app_handle
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("Could not resolve app data dir: {e}"))?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        dir.join(format!("opencode-server.{actual_port}.log"))
+    };
+    let log_file = std::fs::File::create(&server_log_path)
+        .map_err(|e| format!("Failed to create opencode server log: {e}"))?;
+    let log_file_err = log_file
+        .try_clone()
+        .map_err(|e| format!("Failed to clone opencode server log handle: {e}"))?;
 
     let mut cmd = std::process::Command::new("opencode");
     cmd.arg("serve")
@@ -1681,8 +1753,8 @@ pub fn spawn_opencode_server(
         .current_dir(workspace)
         // Authenticate the local HTTP endpoint per spec §"Corrected: Local Server Authentication"
         .env("OPENCODE_SERVER_PASSWORD", &server_password)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(log_file_err));
 
     // Inject BYOK credentials scoped to this child process only — never written to disk.
     for (key, value) in &provider_env {
@@ -1742,8 +1814,7 @@ pub fn spawn_opencode_server(
             if let Some(lock) = OPENCODE_MCP_CONFIG.get() {
                 lock.lock().map_err(|e| e.to_string())?.replace(config_file);
             } else {
-                let _ = OPENCODE_MCP_CONFIG
-                    .set(Mutex::new(Some(config_file)));
+                let _ = OPENCODE_MCP_CONFIG.set(Mutex::new(Some(config_file)));
             }
         }
     }
@@ -1752,43 +1823,138 @@ pub fn spawn_opencode_server(
         .spawn()
         .map_err(|e| format!("Failed to spawn opencode serve: {e}"))?;
 
+    let child_pid = child.id();
+    write_opencode_pid_lock(&app_handle, child_pid, actual_port);
+
+    if let Some(lock) = OPENCODE_SERVER_LOG.get() {
+        lock.lock()
+            .map_err(|e| e.to_string())?
+            .replace(server_log_path);
+    } else {
+        let _ = OPENCODE_SERVER_LOG.set(Mutex::new(Some(server_log_path)));
+    }
+
+    // Version of the binary we actually spawned — lets the UI/support tell a stale or
+    // foreign CLI apart from ours when triaging HTTP 500s (workstream B).
+    let version = std::process::Command::new("opencode")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let first = String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            (!first.is_empty()).then_some(first)
+        });
+
     Ok(OpenCodeSpawn {
-        pid: child.id(),
+        pid: child_pid,
         port: actual_port,
+        version,
     })
 }
 
-/// Kills a running OpenCode server process by PID.
-/// Uses taskkill on Windows, SIGTERM on Unix for a clean shutdown.
-#[tauri::command]
-pub fn kill_opencode_server(pid: u32) -> Result<(), String> {
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodePidLock {
+    pub pid: u32,
+    pub port: u16,
+    pub start_time: String,
+}
+
+pub fn get_opencode_pid_file(app_handle: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Could not resolve app data dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("opencode.pid"))
+}
+
+pub fn write_opencode_pid_lock(app_handle: &tauri::AppHandle, pid: u32, port: u16) {
+    if let Ok(pid_path) = get_opencode_pid_file(app_handle) {
+        let lock = OpenCodePidLock {
+            pid,
+            port,
+            start_time: now_iso(),
+        };
+        if let Ok(content) = serde_json::to_string(&lock) {
+            let _ = std::fs::write(pid_path, content);
+        }
+    }
+}
+
+pub fn remove_opencode_pid_lock(app_handle: &tauri::AppHandle) {
+    if let Ok(pid_path) = get_opencode_pid_file(app_handle) {
+        if pid_path.exists() {
+            let _ = std::fs::remove_file(pid_path);
+        }
+    }
+}
+
+pub fn read_opencode_pid_lock(app_handle: &tauri::AppHandle) -> Option<OpenCodePidLock> {
+    let pid_path = get_opencode_pid_file(app_handle).ok()?;
+    if !pid_path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(pid_path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+pub fn kill_opencode_server_internal(app_handle: Option<&tauri::AppHandle>, pid: u32) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| format!("taskkill failed: {e}"))?;
+            .status();
     }
     #[cfg(not(target_os = "windows"))]
     {
-        std::process::Command::new("kill")
+        let _ = std::process::Command::new("kill")
             .args(["-TERM", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| format!("kill failed: {e}"))?;
+            .status();
+    }
+
+    if let Some(app) = app_handle {
+        remove_opencode_pid_lock(app);
     }
 
     // Remove the connector-export config we wrote into the vault (if any).
-    let Ok(mut lock) = OPENCODE_MCP_CONFIG.get_or_init(Default::default).lock() else {
-        return Ok(());
-    };
-    if let Some(path) = lock.take() {
-        let _ = std::fs::remove_file(path);
+    if let Ok(mut lock) = OPENCODE_MCP_CONFIG.get_or_init(Default::default).lock() {
+        if let Some(path) = lock.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    // Remove the sidecar's stdout/stderr capture
+    if let Ok(mut lock) = OPENCODE_SERVER_LOG.get_or_init(Default::default).lock() {
+        if let Some(path) = lock.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
     Ok(())
+}
+
+/// App exit / shutdown hook: reads `opencode.pid` if present and terminates orphaned sidecar.
+pub fn cleanup_opencode_on_exit(app_handle: &tauri::AppHandle) {
+    if let Some(lock) = read_opencode_pid_lock(app_handle) {
+        let _ = kill_opencode_server_internal(Some(app_handle), lock.pid);
+    }
+}
+
+/// Kills a running OpenCode server process by PID (exposed as Tauri command).
+#[tauri::command]
+pub fn kill_opencode_server(app_handle: tauri::AppHandle, pid: u32) -> Result<(), String> {
+    kill_opencode_server_internal(Some(&app_handle), pid)
 }
 
 // ---------------------------------------------------------------------------
@@ -1847,6 +2013,7 @@ pub struct AgentSession {
     pub status: String,
     pub goal: Option<String>,
     pub parent_id: Option<String>,
+    pub opencode_session_id: Option<String>,
     pub project_path: Option<String>,
     pub context: Option<String>,
     pub summary: Option<String>,
@@ -1866,6 +2033,7 @@ fn session_from_row(row: &rusqlite::Row) -> rusqlite::Result<AgentSession> {
         status: row.get("status")?,
         goal: row.get("goal")?,
         parent_id: row.get("parent_id")?,
+        opencode_session_id: row.get("opencode_session_id").unwrap_or(None),
         project_path: row.get("project_path")?,
         context: row.get("context")?,
         summary: row.get("summary")?,
@@ -1887,14 +2055,14 @@ fn create_agent_session_internal(
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_millis();
     conn.execute(
-        "INSERT INTO agent_sessions (id, title, agent, engine, model, status, goal, parent_id, context, summary, tokens, cost, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'idle', NULL, ?6, NULL, NULL, 0, 0, ?7, ?7)",
+        "INSERT INTO agent_sessions (id, title, agent, engine, model, status, goal, parent_id, opencode_session_id, context, summary, tokens, cost, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'idle', NULL, ?6, NULL, NULL, NULL, 0, 0, ?7, ?7)",
         rusqlite::params![id, title, agent, engine, model, parent_id, now],
     )
     .map_err(|e| format!("Failed to create agent session: {e}"))?;
 
     conn.query_row(
-        "SELECT id, title, agent, engine, model, status, goal, parent_id, project_path, context, summary, tokens, cost, created_at, updated_at
+        "SELECT id, title, agent, engine, model, status, goal, parent_id, opencode_session_id, project_path, context, summary, tokens, cost, created_at, updated_at
          FROM agent_sessions WHERE id = ?1",
         [&id],
         session_from_row,
@@ -1905,7 +2073,7 @@ fn create_agent_session_internal(
 fn list_agent_sessions_internal(conn: &rusqlite::Connection) -> Result<Vec<AgentSession>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, agent, engine, model, status, goal, parent_id, project_path, context, summary, tokens, cost, created_at, updated_at
+            "SELECT id, title, agent, engine, model, status, goal, parent_id, opencode_session_id, project_path, context, summary, tokens, cost, created_at, updated_at
              FROM agent_sessions WHERE status != 'archived' ORDER BY updated_at DESC",
         )
         .map_err(|e| format!("Failed to prepare list_agent_sessions: {e}"))?;
@@ -1924,7 +2092,7 @@ fn get_agent_session_internal(
     id: String,
 ) -> Result<AgentSession, String> {
     conn.query_row(
-        "SELECT id, title, agent, engine, model, status, goal, parent_id, project_path, context, summary, tokens, cost, created_at, updated_at
+        "SELECT id, title, agent, engine, model, status, goal, parent_id, opencode_session_id, project_path, context, summary, tokens, cost, created_at, updated_at
          FROM agent_sessions WHERE id = ?1",
         [&id],
         session_from_row,
@@ -1940,6 +2108,7 @@ pub struct SessionPatch {
     pub summary: Option<String>,
     pub status: Option<String>,
     pub context: Option<String>,
+    pub opencode_session_id: Option<String>,
     pub tokens: Option<i64>,
     pub cost: Option<f64>,
 }
@@ -1959,7 +2128,8 @@ fn patch_agent_session_internal(
              context = COALESCE(?6, context),
              tokens = COALESCE(?7, tokens),
              cost = COALESCE(?8, cost),
-             updated_at = ?9
+             opencode_session_id = COALESCE(?9, opencode_session_id),
+             updated_at = ?10
          WHERE id = ?1",
         rusqlite::params![
             id,
@@ -1970,13 +2140,14 @@ fn patch_agent_session_internal(
             fields.context,
             fields.tokens,
             fields.cost,
+            fields.opencode_session_id,
             now
         ],
     )
     .map_err(|e| format!("Failed to patch agent session: {e}"))?;
 
     conn.query_row(
-        "SELECT id, title, agent, engine, model, status, goal, parent_id, project_path, context, summary, tokens, cost, created_at, updated_at
+        "SELECT id, title, agent, engine, model, status, goal, parent_id, opencode_session_id, project_path, context, summary, tokens, cost, created_at, updated_at
          FROM agent_sessions WHERE id = ?1",
         [&id],
         session_from_row,
@@ -2021,8 +2192,8 @@ fn fork_agent_session_internal(
     let now = now_millis();
     let child_title = parent.title.as_ref().map(|t| format!("{t} (fork)"));
     conn.execute(
-        "INSERT INTO agent_sessions (id, title, agent, engine, model, status, goal, parent_id, project_path, context, summary, tokens, cost, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'idle', ?6, ?7, ?8, ?9, NULL, 0, 0, ?10, ?10)",
+        "INSERT INTO agent_sessions (id, title, agent, engine, model, status, goal, parent_id, opencode_session_id, project_path, context, summary, tokens, cost, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'idle', ?6, ?7, NULL, ?8, ?9, NULL, 0, 0, ?10, ?10)",
         rusqlite::params![
             id,
             child_title,
@@ -2039,7 +2210,7 @@ fn fork_agent_session_internal(
     .map_err(|e| format!("Failed to fork agent session: {e}"))?;
 
     conn.query_row(
-        "SELECT id, title, agent, engine, model, status, goal, parent_id, project_path, context, summary, tokens, cost, created_at, updated_at
+        "SELECT id, title, agent, engine, model, status, goal, parent_id, opencode_session_id, project_path, context, summary, tokens, cost, created_at, updated_at
          FROM agent_sessions WHERE id = ?1",
         [&id],
         session_from_row,
@@ -2073,6 +2244,18 @@ pub fn patch_agent_session(
 pub fn archive_agent_session(state: State<DbState>, id: String) -> Result<(), String> {
     let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
     archive_agent_session_internal(&conn, id)
+}
+
+fn delete_agent_session_internal(conn: &rusqlite::Connection, id: String) -> Result<(), String> {
+    conn.execute("DELETE FROM agent_sessions WHERE id = ?1", [id])
+        .map_err(|e| format!("Failed to delete agent session: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_agent_session(state: State<DbState>, id: String) -> Result<(), String> {
+    let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
+    delete_agent_session_internal(&conn, id)
 }
 
 #[derive(serde::Serialize)]
@@ -2144,6 +2327,8 @@ fn record_run_turn_internal(
     iterations: i64,
     stuck_strikes: i64,
     status: String,
+    token_estimate: Option<i64>,
+    cost: Option<f64>,
 ) -> Result<(), String> {
     let finished_at = if status == "done" || status == "blocked" || status == "failed" || status == "stopped" {
         Some(now_millis())
@@ -2151,8 +2336,12 @@ fn record_run_turn_internal(
         None
     };
     conn.execute(
-        "UPDATE agent_runs SET iterations = ?2, stuck_strikes = ?3, status = ?4, finished_at = ?5 WHERE id = ?1",
-        rusqlite::params![run_id, iterations, stuck_strikes, status, finished_at],
+        "UPDATE agent_runs
+         SET iterations = ?2, stuck_strikes = ?3, status = ?4, finished_at = ?5,
+             token_estimate = COALESCE(?6, token_estimate),
+             cost = COALESCE(?7, cost)
+         WHERE id = ?1",
+        rusqlite::params![run_id, iterations, stuck_strikes, status, finished_at, token_estimate, cost],
     )
     .map_err(|e| format!("Failed to record run turn: {e}"))?;
     Ok(())
@@ -2176,9 +2365,11 @@ pub fn record_run_turn(
     iterations: i64,
     stuck_strikes: i64,
     status: String,
+    token_estimate: Option<i64>,
+    cost: Option<f64>,
 ) -> Result<(), String> {
     let conn = state.vault_index.lock().map_err(|e| e.to_string())?;
-    record_run_turn_internal(&conn, run_id, iterations, stuck_strikes, status)
+    record_run_turn_internal(&conn, run_id, iterations, stuck_strikes, status, token_estimate, cost)
 }
 
 #[derive(serde::Serialize)]
@@ -2542,6 +2733,7 @@ mod agent_orchestration_tests {
                  status        TEXT NOT NULL DEFAULT 'idle',
                  goal          TEXT,
                  parent_id     TEXT REFERENCES agent_sessions(id),
+                 opencode_session_id TEXT,
                  project_path  TEXT,
                  context       TEXT,
                  summary       TEXT,
@@ -2558,6 +2750,8 @@ mod agent_orchestration_tests {
                  iterations     INTEGER DEFAULT 0,
                  stuck_strikes  INTEGER DEFAULT 0,
                  token_budget   INTEGER DEFAULT 80000,
+                 token_estimate INTEGER DEFAULT 0,
+                 cost           REAL DEFAULT 0,
                  auditor_model  TEXT,
                  result_summary TEXT,
                  started_at     INTEGER NOT NULL,
@@ -2624,6 +2818,7 @@ mod agent_orchestration_tests {
                 summary: None,
                 status: Some("working".to_string()),
                 context: None,
+                opencode_session_id: Some("sess-rehydrate-1".to_string()),
                 tokens: Some(42),
                 cost: None,
             },
@@ -2633,13 +2828,17 @@ mod agent_orchestration_tests {
         assert_eq!(patched.goal.as_deref(), Some("Summarize chapter 3"));
         assert_eq!(patched.status, "working");
         assert_eq!(patched.tokens, 42);
+        assert_eq!(patched.opencode_session_id.as_deref(), Some("sess-rehydrate-1"));
 
         let fetched = get_agent_session_internal(&conn, created.id).unwrap();
         assert_eq!(fetched.title.as_deref(), Some("Review Physics v2"));
 
-        archive_agent_session_internal(&conn, fetched.id).unwrap();
+        archive_agent_session_internal(&conn, fetched.id.clone()).unwrap();
         let listed_after_archive = list_agent_sessions_internal(&conn).unwrap();
         assert!(listed_after_archive.is_empty());
+
+        conn.execute("DELETE FROM agent_sessions WHERE id = ?1", [&fetched.id]).unwrap();
+        assert!(get_agent_session_internal(&conn, fetched.id).is_err());
     }
 
     #[test]
@@ -2663,6 +2862,7 @@ mod agent_orchestration_tests {
                 summary: None,
                 status: None,
                 context: Some("[{\"role\":\"user\",\"content\":\"hi\"}]".to_string()),
+                opencode_session_id: None,
                 tokens: None,
                 cost: None,
             },
@@ -2703,7 +2903,7 @@ mod agent_orchestration_tests {
         let session_after = get_agent_session_internal(&conn, session.id).unwrap();
         assert_eq!(session_after.status, "working");
 
-        record_run_turn_internal(&conn, run.id.clone(), 3, 2, "done".to_string()).unwrap();
+        record_run_turn_internal(&conn, run.id.clone(), 3, 2, "done".to_string(), Some(1200), Some(0.0042)).unwrap();
         let finished: Option<i64> = conn
             .query_row(
                 "SELECT finished_at FROM agent_runs WHERE id = ?1",
@@ -2712,6 +2912,14 @@ mod agent_orchestration_tests {
             )
             .unwrap();
         assert!(finished.is_some());
+        let accounted: (i64, f64) = conn
+            .query_row(
+                "SELECT token_estimate, cost FROM agent_runs WHERE id = ?1",
+                [&run.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(accounted, (1200, 0.0042));
     }
 
     #[test]
@@ -2795,5 +3003,26 @@ mod agent_orchestration_tests {
         // The picked port must actually be bindable.
         let probe = std::net::TcpListener::bind(("127.0.0.1", free));
         assert!(probe.is_ok(), "reported port {free} is still in use");
+    }
+
+    #[test]
+    fn pick_sidecar_port_honors_a_free_configured_port() {
+        let free = find_free_port(4110).unwrap();
+        assert_eq!(pick_sidecar_port(free).unwrap(), free);
+        drop(std::net::TcpListener::bind(("127.0.0.1", free)));
+    }
+
+    #[test]
+    fn pick_sidecar_port_jumps_to_high_band_when_configured_is_taken() {
+        // Occupy the configured port, then verify the picker lands in the random
+        // high band (40000-45049) instead of deterministically walking 4xxx.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 4199)).unwrap();
+        let picked = pick_sidecar_port(4199).unwrap();
+        assert_ne!(picked, 4199);
+        assert!(
+            (40000..=45049).contains(&picked),
+            "picked {picked} not in the random high band"
+        );
+        drop(listener);
     }
 }

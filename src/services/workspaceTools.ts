@@ -86,6 +86,12 @@ function mcpResultToString(result: McpCallResult): string {
 export async function buildEffectiveTools(): Promise<ToolDefinition[]> {
   const tools: ToolDefinition[] = [...WORKSPACE_TOOLS];
   const settings = useStore.getState().settings;
+  // Agent control meta tools (create/fork sessions, set goal, schedule tasks) — no file
+  // writes, gated behind aiEnableAgentControls (default true) so a model can never
+  // invoke them when the user has opted out.
+  if (settings.aiEnableAgentControls) {
+    tools.push(...CONTROL_TOOLS);
+  }
   // File-mutation tools are gated off entirely unless aiEnableFileWrite is on (Phase 2b).
   if (settings.aiEnableFileWrite) {
     tools.push(...FILE_WRITE_TOOLS);
@@ -547,9 +553,119 @@ export const FILE_WRITE_TOOLS: ToolDefinition[] = [
   },
 ];
 
-/** Whether a possible file-mutation tool name is one of the gated write tools. */
-export function isFileWriteTool(name: string): boolean {
-  return FILE_WRITE_TOOLS.some((t) => t.function.name === name);
+/**
+ * Agent control meta tools (AGENTIC_ORCHESTRATION_PLAN.md Phase 6). These let the
+ * agent create/fork sessions, arm/stop a goal run, and schedule study tasks from chat.
+ * They perform NO file writes, so unlike FILE_WRITE_TOOLS they pass through the normal
+ * router without the destructive-approval gate. Exposed to models only when
+ * `settings.aiEnableAgentControls` is on (default true) — see buildEffectiveTools().
+ * Each dispatcher returns the resulting session/task id as text so the model can cite it.
+ */
+export const CONTROL_TOOLS: ToolDefinition[] = [
+  {
+    type: "function",
+    function: {
+      name: "create_session",
+      description:
+        "Create a new agent session (durable, resumable). Returns the new session id. Optional title and engine ('opencode' | 'byok').",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Session title (optional)." },
+          engine: { type: "string", description: "Engine: 'opencode' or 'byok' (defaults to the app's current engine)." },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_sessions",
+      description: "List recent agent sessions (id, title, engine, status).",
+      parameters: {
+        type: "object",
+        properties: {},
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "fork_session",
+      description:
+        "Fork an existing agent session into a new child session that inherits its context (keeps parent lineage). Returns the new child session id.",
+      parameters: {
+        type: "object",
+        properties: {
+          session_id: { type: "string", description: "The parent session id." },
+        },
+        required: ["session_id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_goal",
+      description:
+        "Arm an autonomous study goal on the active (or given) session. The agent runs a capped loop with a built-in auditor until it judges the goal done, it hits the token budget, or 3 stuck strikes block it. Returns a start confirmation.",
+      parameters: {
+        type: "object",
+        properties: {
+          goal: { type: "string", description: "The study goal to pursue." },
+          session_id: { type: "string", description: "Session to run on (defaults to the active one)." },
+        },
+        required: ["goal"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "stop_goal",
+      description: "Hard-stop any running goal loop. Stop always wins over a running agent.",
+      parameters: {
+        type: "object",
+        properties: {},
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_scheduled_task",
+      description:
+        "Create a scheduled study task that fires while the app is open. Returns the new task id. `schedule_sel` is 'once' | 'daily' | 'weekly' | 'cron'; weekly tasks take `weekday` (comma-separated 0-6, 0=Mon), daily/weekly/once take `time` (HH:mm), cron tasks take a `cron` expression.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Task name." },
+          prompt: { type: "string", description: "Goal/prompt executed when the task fires." },
+          schedule_sel: { type: "string", description: "'once' | 'daily' | 'weekly' | 'cron'." },
+          time: { type: "string", description: "HH:mm for daily/weekly/once (default '09:00')." },
+          weekday: { type: "string", description: "Comma-separated 0-6 for weekly (0=Mon)." },
+          cron: { type: "string", description: "Cron expression for 'cron'." },
+        },
+        required: ["name", "prompt", "schedule_sel"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_scheduled_tasks",
+      description: "List scheduled study tasks (id, name, schedule, next run, enabled).",
+      parameters: {
+        type: "object",
+        properties: {},
+      },
+    },
+  },
+];
+
+/** Whether a tool name is one of the agent control meta tools. */
+export function isControlTool(name: string): boolean {
+  return CONTROL_TOOLS.some((t) => t.function.name === name);
 }
 
 /**
@@ -829,6 +945,92 @@ export async function executeWorkspaceTool(name: string, args: Record<string, an
       if (!id) return "Error: delete_artifact requires an artifact ID.";
       store.deleteArtifact(id);
       return `Artifact "${id}" deleted.`;
+    }
+
+    // ---- Phase 6a: agent control meta tools (gated by aiEnableAgentControls) ----
+    // No file writes, so no approval gate. The defensive `isControlTool` check keeps a
+    // stray model from invoking them even if a stale tool list was cached when the
+    // setting was on but has since been turned off.
+
+    if (name === "create_session") {
+      const session = await store.createAgentSession({
+        title: args.title ? String(args.title) : undefined,
+        engine: args.engine === "byok" ? "byok" : args.engine === "opencode" ? "opencode" : store.settings.assistantEngine,
+      });
+      if (!session) return "Error: Failed to create agent session.";
+      return `Created session "${session.title || session.id}" with id: ${session.id}`;
+    }
+
+    if (name === "list_sessions") {
+      await store.loadAgentSessions();
+      const sessions = useStore.getState().agentSessions;
+      if (!sessions.length) return "No agent sessions yet.";
+      return sessions
+        .map(
+          (s) => `- [${s.id}] "${s.title || "Untitled"}" · ${s.engine || "unknown"} · ${s.status}${s.parentId ? ` (fork of ${s.parentId})` : ""}`
+        )
+        .join("\n");
+    }
+
+    if (name === "fork_session") {
+      const sessionId = String(args.session_id || "").trim();
+      if (!sessionId) return "Error: fork_session requires a session_id.";
+      const child = await store.forkAgentSession(sessionId);
+      if (!child) return `Error: Could not fork session "${sessionId}".`;
+      return `Forked session "${sessionId}" -> new child id: ${child.id}`;
+    }
+
+    if (name === "set_goal") {
+      const goal = String(args.goal || "").trim();
+      if (!goal) return "Error: set_goal requires a goal.";
+      const active = useStore.getState().goalRunning;
+      if (active) return "Error: A goal run is already active — stop it first (stop_goal).";
+      const sessionId = args.session_id ? String(args.session_id).trim() : null;
+      if (sessionId) {
+        // Point the active session at the target so the goal loop runs on it.
+        useStore.getState().setActiveAgentSession(sessionId);
+        // startGoalRun uses the active (or freshly created) session, so a resume-able
+        // run lands on the requested one rather than a brand-new session.
+      }
+      store.startGoalRun(goal).catch((err) => {
+        console.error("set_goal startGoalRun failed", err);
+      });
+      return `Goal armed on the active session: "${goal.slice(0, 80)}"${goal.length > 80 ? "…" : ""}`;
+    }
+
+    if (name === "stop_goal") {
+      store.stopGoalRun();
+      return "Goal run stopped (if one was active).";
+    }
+
+    if (name === "create_scheduled_task") {
+      const nameArg = String(args.name || "").trim();
+      const promptArg = String(args.prompt || "").trim();
+      const scheduleSel = String(args.schedule_sel || "once").toLowerCase();
+      if (!nameArg) return "Error: create_scheduled_task requires a name.";
+      if (!promptArg) return "Error: create_scheduled_task requires a prompt.";
+      const task = await store.createScheduledTask({
+        name: nameArg,
+        prompt: promptArg,
+        scheduleSel,
+        cron: args.cron ? String(args.cron) : undefined,
+        weekday: args.weekday ? String(args.weekday) : undefined,
+        time: args.time ? String(args.time) : "09:00",
+      });
+      if (!task) return "Error: Failed to create scheduled task.";
+      return `Created scheduled task "${task.name}" with id: ${task.id} (${task.scheduleSel}${task.nextRun ? `, next run ${new Date(task.nextRun).toLocaleString()}` : ""}).`;
+    }
+
+    if (name === "list_scheduled_tasks") {
+      await store.loadScheduledTasks();
+      const tasks = useStore.getState().scheduledTasks;
+      if (!tasks.length) return "No scheduled tasks yet.";
+      return tasks
+        .map(
+          (t) =>
+            `- [${t.id}] "${t.name}" · ${t.scheduleSel}${t.weekday ? ` (weekday ${t.weekday})` : ""}${t.time ? ` at ${t.time}` : ""} · ${t.disabled ? "disabled" : "enabled"}${t.nextRun ? ` · next ${new Date(t.nextRun).toLocaleString()}` : ""}`
+        )
+        .join("\n");
     }
 
     // ---- Phase 2b: file-mutation tools (gated + approval-required) ----

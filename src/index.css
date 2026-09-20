@@ -8,6 +8,12 @@
   --color-text: #eceff4;
   --color-muted: #788296;
   --color-border: #26272b;
+  --color-chat-user-bubble: #1f2633;
+  --color-chat-tool-running: #3b82f6;
+  --color-chat-tool-ok: #34d399;
+  --color-chat-tool-error: #f87171;
+  --color-chat-warn: #fbbf24;
+  --color-chat-reasoning-bg: #22262e;
 }
 
 html,

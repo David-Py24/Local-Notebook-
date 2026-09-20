@@ -299,11 +299,27 @@ them in chat. Keep the inventory table in `AGENT_TOOLS_PLAN.md` in sync when the
 - **Fusion**: one more turn on a fresh session that reads all drafts (context bundle +
   raw drafts) and produces the synthesis note via `create_note` (already a gated write tool).
 
+**Status (Milestone C — shipped):** `src/services/perspectives.ts` +
+`assistant runPerspectives()` (useStore `runGoalOnSession`). Scope decision: **same model,
+N framings run sequentially** — one goal loop at a time (the `goalRunning` wait-for-idle
+invariant) instead of parallel BYOK/OpenCode streams, to avoid a concurrency refactor of
+the orchestrator. Drafts are stored as artifacts (`addArtifact`) then forked once more into
+a fusion session whose goal asks for a "balanced view" note; the expected output path is
+`<attachments>/orchestration/<topic>-balanced-view.md`, verified by re-reading the file —
+if the write did not land, the fusion text is stored as an artifact instead. The 5 framings
+(technical / exam / debate / beginner / outlook) live in `PERSPECTIVE_FRAMINGS`.
+
 ### Phase 5 — Changes Walkthrough (pillar 5)
 - Diff-hunk grouping service (`src/services/walkthroughDiff.ts`) on top of existing
   `git_diff` (`git.rs`); small-model narration; stops anchored to real lines.
 - UI in `WorkTreePanel`/`DiffView`: "Walkthrough" button beside the diff tabs.
 - Cache per diff+model+lang in localStorage keyed by diff hash.
+
+**Status (Milestone C — shipped):** `walkthroughDiff.ts` (per-hunk narration via the small
+model, localStorage cache `lsn_walkthrough_*` keyed by SHA-256 of the patch, capped at 50
+entries), `DiffView.tsx` "Walkthrough" toggle + narration list. Hunk-model fix: narrate the
+**individual unified diff hunks**, not the whole-file diff (whole-file diffs blow the small
+model's context).
 
 ### Phase 6 — Agent Control Tool + study-tool registry
 - Meta tools (§6) through the existing router + approval gate.
@@ -311,6 +327,20 @@ them in chat. Keep the inventory table in `AGENT_TOOLS_PLAN.md` in sync when the
   settings URL) that maps to MCP connector endpoints — reuse the MCP host rather than a
   novel extension API. (This is deliberately lighter than OpenChamber's sandboxed guest
   iframes; a study app does not need untrusted third-party panels.)
+
+**Status (Milestone C — shipped):**
+- **P6a meta tools:** `CONTROL_TOOLS` in `src/services/workspaceTools.ts` (7 schemas:
+  `create_session`, `list_sessions`, `fork_session`, `set_goal`, `stop_goal`,
+  `create_scheduled_task`, `list_scheduled_tasks`), guarded by `settings.aiEnableAgentControls`
+  in `buildEffectiveTools` — they are never exposed when the control toggle is off.
+  `set_goal` fires the store's `startGoalRun` (fire-and-forget, respects the single-loop
+  invariant). Tests: `workspaceTools.control.test.ts`.
+- **P6b study-tool registry:** `src/services/studyTools.ts` + Settings → **Study Tools**.
+  Ships 4 disabled presets mirroring `CONNECTOR_PRESETS` (Wikipedia / Arxiv / Filesystem /
+  Fetch) + custom tools (flashcards/citation templates). Persistence is localStorage
+  (`lsn_study_tools`) — same seed-once, never-clobber rule as the connector presets. This is
+  the "manifest" surface; tools map to their connector via the existing MCP host, no novel
+  extension API. Tests: `studyTools.test.ts`.
 
 ---
 
@@ -358,7 +388,9 @@ No, we are not building OpenChamber:
 - **Milestone A (Phase 0 + 1):** crisply "the agent system remembers." Ship, verify, use.
 - **Milestone B (Phase 2 + 3):** "the agent system runs itself." Goal mode + scheduler live.
 - **Milestone C (Phase 4–6):** "the agent system thinks in parallel and reviews." Perspectives,
-  fusion, walkthrough, meta tools, study-tool registry.
+  fusion, walkthrough, meta tools, study-tool registry. **SHIPPED** — see the Status notes on
+  Phases 4–6. Schema is now `user_version` 2 (`agent_runs.token_estimate` / `cost`, added by a
+  guarded migration in `db.rs`); tests: 72 frontend (8 files) + 32 Rust.
 
 Each milestone ends with: `npx tsc --noEmit`, `npm run build`, `npm test`, `cargo check`,
 `cargo test`, and a manual smoke launch.

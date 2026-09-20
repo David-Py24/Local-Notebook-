@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use rusqlite::Connection;
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultFile {
@@ -143,8 +143,9 @@ impl DbState {
                      model         TEXT,
                      status        TEXT NOT NULL DEFAULT 'idle',
                      goal          TEXT,
-                     parent_id     TEXT REFERENCES agent_sessions(id),
-                     project_path  TEXT,
+parent_id     TEXT REFERENCES agent_sessions(id),
+                 opencode_session_id TEXT,
+                 project_path  TEXT,
                      context       TEXT,
                      summary       TEXT,
                      tokens        INTEGER DEFAULT 0,
@@ -161,6 +162,8 @@ impl DbState {
                      iterations     INTEGER DEFAULT 0,
                      stuck_strikes  INTEGER DEFAULT 0,
                      token_budget   INTEGER DEFAULT 80000,
+                     token_estimate INTEGER DEFAULT 0,
+                     cost           REAL DEFAULT 0,
                      auditor_model  TEXT,
                      result_summary TEXT,
                      started_at     INTEGER NOT NULL,
@@ -202,7 +205,7 @@ impl DbState {
             )
             .map_err(|e| format!("Failed to create agent tables: {e}"))?;
 
-            conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))
+            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
                 .map_err(|e| format!("Failed to set user_version: {e}"))?;
         } else {
             // Schema already at target version; ensure PRAGMAs are applied
@@ -214,10 +217,61 @@ impl DbState {
             .map_err(|e| format!("Failed to apply PRAGMAs: {e}"))?;
         }
 
+        // Migration to version 2: add per-run token/cost accounting to agent_runs.
+        // Existing v1 databases reach this block via the `else` above; fresh databases
+        // created in the v1 branch already have the columns (guarded so ALTER never
+        // re-runs on them).
+        if current_version < 2 {
+            if !column_exists(&conn, "agent_runs", "token_estimate") {
+                conn.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN token_estimate INTEGER DEFAULT 0",
+                    [],
+                )
+                .map_err(|e| format!("Failed to add token_estimate column: {e}"))?;
+            }
+            if !column_exists(&conn, "agent_runs", "cost") {
+                conn.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN cost REAL DEFAULT 0",
+                    [],
+                )
+                .map_err(|e| format!("Failed to add cost column: {e}"))?;
+            }
+            conn.execute_batch("PRAGMA user_version = 2")
+                .map_err(|e| format!("Failed to set user_version to 2: {e}"))?;
+        }
+
+        // Migration to version 3: record the OpenCode sidecar session id per agent
+        // session so message history can be re-hydrated from the live server
+        // (plan_openchamber_paseo_flaws.md workstream B). Fresh v1 databases already
+        // have the column via the CREATE above; this guards the ALTER for existing DBs.
+        if current_version < 3 {
+            if !column_exists(&conn, "agent_sessions", "opencode_session_id") {
+                conn.execute(
+                    "ALTER TABLE agent_sessions ADD COLUMN opencode_session_id TEXT",
+                    [],
+                )
+                .map_err(|e| format!("Failed to add opencode_session_id column: {e}"))?;
+            }
+            conn.execute_batch("PRAGMA user_version = 3")
+                .map_err(|e| format!("Failed to set user_version to 3: {e}"))?;
+        }
+
         Ok(Self {
             vault_index: Arc::new(Mutex::new(conn)),
         })
     }
+}
+
+/// Whether `table` has a column named `column` (used to guard idempotent ALTERs).
+fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+        return false;
+    };
+    let names: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .and_then(|iter| iter.collect())
+        .unwrap_or_default();
+    names.iter().any(|name| name == column)
 }
 
 #[cfg(test)]

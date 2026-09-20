@@ -15,7 +15,7 @@ Surfaces that use the tool system:
 
 1. **Study Assistant** (`AssistantPanel.tsx`, study mode) — tool loop enabled.
 2. **Micro Agent panel** (`AgentPanel.tsx`) — runs through `runAgentTask`
-   (`agentKnowledge.ts`) which also enters the tool loop (see Known gaps, §9).
+   (`agentKnowledge.ts`) which also enters the tool loop (see Known gaps, §10).
 3. **OpenCode Agent** (`OpenCodeView.tsx`) — **does NOT** use `executeWorkspaceTool`; it has
    its own native toolset (file edit, git, shell, LSP). It is included here only because
    OpenCode file edits post-trigger `reindex_vault` so the Assistant/RAG see the changes.
@@ -139,7 +139,51 @@ Post-write behaviour: every successful write calls `triggerPostWriteReindex`
 - MCP tools are not part of the file-write gate (they are externals); their own auth/env
   config governs safety.
 
-## 9. Known gaps & risks (as of 2026-09-11)
+## 9. Agent control meta-tools + study-tool registry (Milestone C — shipped)
+
+Part of AGENTIC_ORCHESTRATION_PLAN.md Milestone C (Phases 6a/6b). New chokepoints were added
+**alongside** the existing ones — the read/write gating matrix (§4) is unchanged.
+
+### 9.1 `CONTROL_TOOLS` (`workspaceTools.ts`)
+
+Seven meta tools registered in a third list, `CONTROL_TOOLS` (adjacent to
+`WORKSPACE_TOOLS`/`FILE_WRITE_TOOLS`; `isControlTool()` distinguishes them):
+
+| Tool | Dispatches to | Notes |
+|---|---|---|
+| `create_session` | `createAgentSession` | table-backed session |
+| `list_sessions` | `listAgentSessions` | |
+| `fork_session` | `forkAgentSession(sessionId)` | isolation primitive for Perspectives (P4) |
+| `set_goal` | `setActiveAgentSession` + `startGoalRun` | fire-and-forget; respects the single-loop invariant (`goalRunning`) |
+| `stop_goal` | `stopActiveRun` | Stop button always wins semantics |
+| `create_scheduled_task` | `createScheduledTask` | `cron`/`weekday`/`time` optional strings |
+| `list_scheduled_tasks` | `listScheduledTasks` | |
+
+Gating: `buildEffectiveTools()` only appends `CONTROL_TOOLS` when
+`settings.aiEnableAgentControls` is on. They are **not** in the file-write approval gate
+(they mutate the session/schedule tables, not files) but the `set_goal` dispatch still
+funnels the actual run through the same orchestrator the UI uses. Tests:
+`workspaceTools.control.test.ts` (15).
+
+### 9.2 Study-tool registry (`src/services/studyTools.ts`)
+
+- Persistence: localStorage `lsn_study_tools`, seeded **once** from `STUDY_TOOL_PRESETS`
+  (4 disabled presets mirroring `CONNECTOR_PRESETS`: Wikipedia / Arxiv / Filesystem / Fetch)
+  — the same seed-once / never-clobber rule as the connectors; user-added custom tools are
+  retained verbatim. Capped at 50 entries.
+- Each tool is metadata (id, name, description, enabled, optional `defaultPrompt`/`config`);
+  tools map to capability through the **existing MCP connector host**, not a novel extension
+  API.
+- UI: Settings → **Study Tools** tab (list + enable toggles + add/remove custom
+  flashcards/citation templates). Tests: `studyTools.test.ts` (8).
+
+### 9.3 Orchestration additions that call tools (context)
+
+- P4 Perspectives/fusion (`perspectives.ts`) drives its own fork + `runGoalOnSession`
+  sessions and produces the balanced-view note through the **existing gated `create_note`**
+  path — no second write path (`resolveVaultPath` sandbox preserved).
+- P5 walkthrough (`walkthroughDiff.ts`) is read-only: narrates diff hunks via the small
+  model and caches in localStorage; it calls no workspace tools.
 
 | Gap | Impact | Proposed fix (roadmap) |
 |---|---|---|
@@ -150,7 +194,7 @@ Post-write behaviour: every successful write calls `triggerPostWriteReindex`
 | Tool payload re-embeds query each call (`embedTexts`) | latency | memoize embedded query within a turn (T2.3) |
 | No `append_note` (edit is full overwrite) | long-assistant outputs risk clobbering | add `append_note` behind approval-if-exists (T1.2) |
 
-## 10. Roadmap — forward plan for the tool system
+## 11. Roadmap — forward plan for the tool system
 
 ### T1 — round out reads & artifact hygiene (no new gating surfaces)
 
@@ -164,7 +208,7 @@ Post-write behaviour: every successful write calls `triggerPostWriteReindex`
 
 | Item | Notes |
 |---|---|
-| T2.1 AgentPanel onToolCall + approval rows | fixes §9 hang; render amber rows in `AgentPanel.tsx` |
+| T2.1 AgentPanel onToolCall + approval rows | fixes §10 hang; render amber rows in `AgentPanel.tsx` |
 | T2.2 Strict tool schemas (`json_schema`/`strict`) for OpenAI-class providers; required-args list already present | reduces malformed `arguments` JSON |
 | T2.3 per-turn embed memoization + `onToolCall` status streaming in AssistantPanel | latency + visibility |
 | T2.4 tool-count caps + abort-on-user-stop during tool loop | trust/safety |
@@ -178,7 +222,7 @@ Post-write behaviour: every successful write calls `triggerPostWriteReindex`
   (`src-tauri/src/drive.rs`) reuse unchanged.
 - `solve_math` / `flashcard_gen` structured tools.
 
-## 11. Milestones
+## 12. Milestones
 
 | Milestone | Scope | Exit criteria |
 |---|---|---|
@@ -188,9 +232,10 @@ Post-write behaviour: every successful write calls `triggerPostWriteReindex`
 | **T1-export** | `export_markdown` + `export_pdf` + `exportArtifact` + Artifacts-panel buttons | `cargo test` 27/27, `tsc`, `npm run build` green — **DONE 2026-09-11** (M7) |
 | **T2.1** | AgentPanel tool loop + approval rows | micro-agent file-write calls resolve via UI, no hang |
 | **T2.2** | Strict schemas + embed memoization | `tsc` green; tool-call latency down |
-| **T3** | Extended read/export/cloud-sink tools (§10) | per-item acceptance |
+| **T3** | Extended read/export/cloud-sink tools (§11) | per-item acceptance |
+| **Orch-C** | Milestone C (§9): `CONTROL_TOOLS` + study-tool registry | `setup: CONTROL_TOOLS` gated on `aiEnableAgentControls`, test-documented — **DONE 2026-09-19** (with AGENTIC_ORCHESTRATION_PLAN P4–P6) |
 
-## 12. Verification checklist (per tools milestone)
+## 13. Verification checklist (per tools milestone)
 
 1. `npx tsc --noEmit`
 2. `cargo check` (in `src-tauri/`)
@@ -203,7 +248,7 @@ Post-write behaviour: every successful write calls `triggerPostWriteReindex`
 6. Release: bump `tauri.conf.json` `version` + About + `CHANGELOG.md` together; deferred
    release-exe smoke remains outstanding.
 
-## 13. Progress log
+## 14. Progress log
 
 - **2026-09-05 — T0 + T1-read/T1-write done.** Tool loop end-to-end; 8 read/memory tools;
   5 file-write tools behind `aiEnableFileWrite` with interactive approval. See
@@ -212,4 +257,10 @@ Post-write behaviour: every successful write calls `triggerPostWriteReindex`
   `FILE_WRITE_TOOLS`; `export_markdown_to_pdf` command + `pdf_export.rs` (printpdf 0.7);
   `exportArtifact` shared sink; Artifacts `.md`/`.pdf` buttons. `cargo test` 27/27, `tsc`
   green, `npm run build` green.
-- **Next:** T2.1 (AgentPanel approval fix) is the highest-value gap (see §9).
+- **2026-09-19 — Orch-C (Milestone C) done.** `CONTROL_TOOLS` (7 meta tools) behind
+  `settings.aiEnableAgentControls` (§9.1); study-tool registry with 4 disabled presets +
+  custom tools in Settings (§9.2); Perspectives/fusion + walkthrough shipped with
+  AGENTIC_ORCHESTRATION_PLAN P4–P6. Frontend 72 tests (8 files) + Rust 32 tests, `tsc`,
+  `npm run build`, `cargo check`/`cargo test` all green. Schema `user_version` 2
+  (`agent_runs.token_estimate`/`cost`).
+- **Next:** T2.1 (AgentPanel approval fix) is the highest-value gap (see §10).

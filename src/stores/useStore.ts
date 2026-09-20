@@ -3,11 +3,31 @@ import { invoke } from "@tauri-apps/api/core";
 import { getThemeById, applyThemeToDocument } from "../themes";
 import type { Project, McpConnector, GitRepoStatus, GitStatusEntry } from "../types";
 import { streamAIResponse, fetchAvailableModels } from "../services/aiProvider";
+import { opencodeFallbackMessage } from "../services/opencodeClient";
 import { applyProjectTemplate } from "../utils/projectTemplates";
 import type { AgentRun, RunStatus } from "../services/agentOrchestrator";
 
 // Debounce window for the lazy Memory-RAG embedding pass that runs after vault reindex.
 let pendingEmbedRebuildTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Error message and classifier for OpenCode's free-tier restriction.
+// When no BYOK model is resolved, the OpenCode sidecar defaults to the built-in
+// Console/Cloudflare free tier which is restricted to the OpenCode desktop app (HTTP 403).
+const FREE_TIER_ERROR_MSG =
+  "⚠️ OpenCode's free tier can only be used from within the OpenCode desktop app. " +
+  "To use the OpenCode agent here, configure a BYOK model in **Settings → AI & BYOK Model** " +
+  "(e.g. Anthropic, OpenAI, or Ollama) — the sidecar will then use that key instead of the free tier. " +
+  "Alternatively, enable **Fallback to BYOK** in **Settings → OpenCode Agent** so the assistant " +
+  "automatically falls back to your configured model when the agent isn't available.";
+
+function isFreeTierError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes("FreeTierError") ||
+    msg.includes("free tier") ||
+    (msg.includes("403") && msg.includes("Console"))
+  );
+}
 
 
 // Built-in research connector presets (offline-first: shipped disabled). Users opt in
@@ -58,7 +78,7 @@ export type SidePanelId = "assistant" | "sources" | "artifacts" | "agent" | "wor
 export interface Artifact {
   id: string;
   title: string;
-  type: "code" | "markdown" | "html";
+  type: "code" | "markdown" | "html" | "plan";
   content: string;
   createdAt: number;
 }
@@ -124,11 +144,85 @@ export interface GoogleAccount {
   email: string;
 }
 
+export type ExecutionStepKind = "thought" | "tool" | "text" | "timer" | "status";
+
+export interface ExecutionStep {
+  id: string;
+  kind: ExecutionStepKind;
+  title: string;
+  content?: string;
+  durationMs?: number;
+  toolName?: string;
+  toolArgs?: Record<string, any>;
+  status: "running" | "completed" | "failed";
+  collapsed?: boolean;
+}
+
+// OpenChamber-style part model (CHAT_UI_REDESIGN_PLAN.md). Each assistant message
+// renders as an ordered list of typed parts; both engines (OpenCode SSE and BYOK
+// OpenAI-compat) emit into the same normalized shape so the renderer never branches
+// on engine. `content` (the text-only concat) is kept alongside for RAG, memory
+// persist, Markdown export and legacy rendering.
+export type ChatPartState = "pending" | "running" | "completed" | "error";
+
+export type ChatPart =
+  | { kind: "text"; id: string; text: string }
+  | {
+      kind: "reasoning";
+      id: string;
+      text: string;
+      state: ChatPartState;
+      startedAt?: number;
+      durationMs?: number;
+    }
+  | {
+      kind: "tool";
+      id: string;
+      name: string;
+      state: ChatPartState;
+      args?: Record<string, any>;
+      output?: string;
+      title?: string;
+      startedAt?: number;
+      durationMs?: number;
+    }
+  | { kind: "file"; id: string; path: string };
+
 export interface AssistantMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   timestamp: string;
+  parts?: ChatPart[];
+  engine?: "opencode" | "byok";
+  model?: string | null;
+  steps?: ExecutionStep[];
+  isPinned?: boolean;
+  durationMs?: number;
+}
+
+// Concatenates only the text parts of a message (mirrors the pre-parts "content"
+// semantics so RAG/export/copy keep identical text while parts add structure).
+export function partsToContent(parts?: ChatPart[]): string {
+  if (!parts) return "";
+  return parts
+    .filter((p): p is Extract<ChatPart, { kind: "text" }> => p.kind === "text")
+    .map((p) => p.text)
+    .join("");
+}
+
+// Returns a string rendered label for a non-text part (used by hover/info rows).
+export function describeChatPart(part: ChatPart): string {
+  switch (part.kind) {
+    case "text":
+      return "Text";
+    case "reasoning":
+      return "Thinking";
+    case "tool":
+      return `Tool · ${part.name}`;
+    case "file":
+      return `File · ${part.path}`;
+  }
 }
 
 // Persistent agent session (AGENTIC_ORCHESTRATION_PLAN.md Phase 1). Mirrors the
@@ -142,6 +236,7 @@ export interface AgentSession {
   status: string;
   goal: string | null;
   parentId: string | null;
+  opencodeSessionId: string | null;
   projectPath: string | null;
   context: string | null;
   summary: string | null;
@@ -239,6 +334,7 @@ async function runGoalLoopWithHandlers(opts: {
   engine: "opencode" | "byok";
   abort: AbortController;
   pausedRef: { value: boolean };
+  onToolCall?: (tool: string) => void;
 }): Promise<AgentRun> {
   const { runGoalLoop, setActiveGoalRun } = await import("../services/agentOrchestrator");
   const store = useStore.getState();
@@ -250,6 +346,7 @@ async function runGoalLoopWithHandlers(opts: {
     vaultRoot: store.currentFolderPath,
     signal: opts.abort.signal,
     pausedRef: opts.pausedRef,
+    onToolCall: opts.onToolCall,
     onRun: (run) => useStore.setState({ agentRun: run }),
     onStatus: (status) => {
       setActiveGoalRun(null);
@@ -266,6 +363,14 @@ async function runGoalLoopWithHandlers(opts: {
   });
   void finished;
   return finished;
+}
+
+export interface AgentModelSettings {
+  modelDisplayMode: "auto_collapse" | "compact_pill" | "full_badge";
+  showZenModels: boolean;
+  showByokModels: boolean;
+  enabledProviders: Record<string, boolean>;
+  modelAliases: Record<string, string>;
 }
 
 export interface Settings {
@@ -310,6 +415,9 @@ export interface Settings {
   assistantEngine: "opencode" | "byok";
   opencodeFallbackToByok: boolean; // route to BYOK automatically when OpenCode is unavailable
 
+  // Dedicated Agent Models & Display Settings
+  agentModelSettings: AgentModelSettings;
+
   // Memory-RAG (Agent Knowledge) settings
   embedBaseUrl: string; // Ollama HTTP root, e.g. http://localhost:11434
   embedModel: string;   // embedding model tag, e.g. nomic-embed-text
@@ -318,6 +426,7 @@ export interface Settings {
 
   // File-mutation tools (create/update/delete) — off by default
   aiEnableFileWrite: boolean;
+  aiEnableWebFetch?: boolean;
 
   // Diagnostics: append tool-calling activity (tools offered, calls made, results
   // returned) to a local debug log file — off by default, opt-in for troubleshooting.
@@ -326,6 +435,7 @@ export interface Settings {
   // OpenCode Agent Settings
   opencodePort: number;       // default 4096 (OpenCode's own default for `opencode serve`)
   opencodeAutoStart: boolean; // auto-start server when switching to OpenCode Agent tab
+  opencodeAutoRetry: boolean; // retry a failed message once on a fresh session when the sidecar 5xxs
 
   // MCP Connectors
   connectors: McpConnector[];
@@ -358,6 +468,7 @@ const DEFAULT_SETTINGS: Settings = {
   aiApiKey: "",
   aiModelName: "hermes3:8b",
   aiEnableWorkspaceTools: true,
+  aiEnableWebFetch: true,
   aiSystemPrompt: "You are an intelligent study assistant for Local Study Notebook. Use workspace tools and context to provide accurate study summaries.",
 
   // Goal mode defaults: auditor pins to the main model + URL until the user supplies
@@ -367,6 +478,39 @@ const DEFAULT_SETTINGS: Settings = {
   goalTokenBudget: 80000,
   goalMaxIterations: 12,
   aiEnableAgentControls: true,
+
+  // Primary engine defaults: OpenCode first, auto-fallback to BYOK
+  assistantEngine: "opencode",
+  opencodeFallbackToByok: true,
+
+  // Agent model settings defaults
+  agentModelSettings: {
+    modelDisplayMode: "auto_collapse",
+    showZenModels: true,
+    showByokModels: true,
+    enabledProviders: {
+      opencode_zen: true,
+      opencode_big_pickle: true,
+      opencode_zen_smart: true,
+      opencode_zen_fast: true,
+      opencode_zen_deepseek: true,
+      ollama_hermes: true,
+      openrouter: true,
+      openai: true,
+      anthropic: true,
+      gemini: true,
+    },
+    modelAliases: {
+      "big-pickle": "Big Pickle",
+      "gemini-2.0-flash": "Gemini 2.0 Flash",
+      "gpt-4o-mini": "GPT-4o Mini",
+      "claude-sonnet-5": "Claude Sonnet 5",
+      "hermes3:8b": "Hermes 3 (8B)",
+      "opencode-zen-smart": "Zen Smart",
+      "opencode-zen-fast": "Zen Fast",
+      "deepseek-r1": "DeepSeek R1",
+    },
+  },
 
   // Memory-RAG defaults
   embedBaseUrl: "http://localhost:11434",
@@ -379,12 +523,10 @@ const DEFAULT_SETTINGS: Settings = {
   aiVerboseLogging: false,
 
   // Primary engine defaults: OpenCode first, auto-fallback to BYOK
-  assistantEngine: "opencode",
-  opencodeFallbackToByok: true,
-
   // OpenCode Agent defaults
   opencodePort: 4096,        // OpenCode's actual documented default port for `opencode serve`
   opencodeAutoStart: true,
+  opencodeAutoRetry: true,   // fresh-session retry on 5xx is on by default
 
   // MCP Connectors — all disabled by default (offline-first, opt-in). Ship with the
   // research presets below so the user can flip them on in Settings -> Connectors.
@@ -420,6 +562,12 @@ interface AppState {
   rightLivePreviewActive: boolean;
   sourcePreviewHeight: number;
   sourcePanelWidth: number;
+  leftNavWidth: number;     // pixel width of the left chat+projects panel (LEFT_NAV_CHATS_AND_PROJECTS_PLAN.md)
+  setLeftNavWidth: (w: number) => void;
+  loadLeftNavPrefs: () => void;                  // hydrate collapsed-section + width from localStorage
+  // collapse flags for the left-nav sections (Projects / Recents / All Chats)
+  leftNavSections: { projects: boolean; recents: boolean; allChats: boolean };
+  toggleLeftNavSection: (which: "projects" | "recents" | "allChats") => void;
   splitLeftWidth: number;   // pixel width of the left split pane (right pane absorbs the rest)
 
   // Artifacts panel
@@ -544,8 +692,12 @@ interface AppState {
   }) => Promise<AgentSession | null>;
   patchAgentSession: (id: string, fields: Partial<AgentSession>) => Promise<void>;
   archiveAgentSession: (id: string) => Promise<void>;
+  deleteAgentSession: (id: string) => Promise<void>;
   forkAgentSession: (sessionId: string) => Promise<AgentSession | null>;
+  autoRenameAgentSessionWithAI: (id: string) => Promise<string | null>;
+  exportAgentSessionMarkdown: (id: string) => Promise<string | null>;
   setActiveAgentSession: (id: string | null) => void;
+  rehydrateActiveSessionFromOpencode: () => Promise<void>;
   loadScheduledTasks: () => Promise<void>;
   createScheduledTask: (opts: {
     name: string;
@@ -564,6 +716,14 @@ interface AppState {
   stopGoalRun: () => void;
   pauseGoalRun: () => void;
   resumeGoalRun: () => void;
+  // Phase 4 Perspectives: run one goal loop against an explicit session and await the
+  // finished AgentRun (latestOutput captures the turn's terminal text for fusion).
+  runGoalOnSession: (
+    sessionId: string,
+    goal: string,
+    engine?: "opencode" | "byok",
+    onToolCall?: (tool: string) => void
+  ) => Promise<AgentRun | null>;
   patchScheduledTask: (id: string, fields: Partial<ScheduledTask>) => Promise<void>;
   deleteScheduledTask: (id: string) => Promise<void>;
   checkDueTasks: () => Promise<ScheduledTask[]>;
@@ -572,6 +732,7 @@ interface AppState {
 
   // OpenCode Agent runtime state (never persisted to localStorage)
   opencodeInstalled: boolean;                            // result of check_opencode_installed
+  opencodeBinaryVersion: string | null;                  // `opencode --version` resolution (diagnostics)
   opencodeServerPid: number | null;                      // PID of running opencode serve
   opencodeServerPort: number | null;                     // actual port the sidecar bound (may differ from settings.opencodePort if that was busy)
   opencodeServerPassword: string | null;                 // in-memory only, never persisted
@@ -587,6 +748,10 @@ interface AppState {
   sendAssistantMessage: (text: string) => Promise<void>;
   cancelAssistantMessage: () => void;
   clearAssistantMessages: () => void;
+  togglePinMessage: (messageId: string) => void;
+  saveMessageToNote: (message: AssistantMessage) => Promise<string | null>;
+  saveMessageAsPlan: (message: AssistantMessage) => void;
+  openMessageInNoteTab: (message: AssistantMessage) => Promise<void>;
   setAssistantWidth: (w: number) => void;
   toggleAssistantPanel: () => void;
   setSelectedModel: (m: string) => void;
@@ -598,6 +763,7 @@ interface AppState {
   checkOpencodeInstalled: () => Promise<void>;
   startOpencodeServer: () => Promise<void>;
   stopOpencodeServer: () => Promise<void>;
+  restartOpencodeServer: () => Promise<void>;
   ensureOpencodeReady: () => Promise<void>;   // server + session up, routes study chat
   resetOpencodeSession: () => void;           // starts a fresh opencode session on next turn
 
@@ -816,6 +982,8 @@ export const useStore = create<AppState>((set, get) => {
     rightLivePreviewActive: false,
     sourcePreviewHeight: 250,
     splitLeftWidth: 0,
+    leftNavWidth: 240,
+    leftNavSections: { projects: false, recents: false, allChats: true },   // Projects & Recents collapsed by default, All Chats expanded
 
     // Artifacts
     showArtifactsPanel: false,
@@ -1467,6 +1635,30 @@ export const useStore = create<AppState>((set, get) => {
     setSourcePreviewHeight: (h) => set({ sourcePreviewHeight: h }),
     setSourcePanelWidth: (w) => set({ sourcePanelWidth: w }),
     setSplitLeftWidth: (w) => set({ splitLeftWidth: Math.max(w, 200) }),
+    setLeftNavWidth: (w) => {
+      set({ leftNavWidth: w });
+      localStorage.setItem("lsn_left_nav_width", JSON.stringify(get().leftNavWidth));
+    },
+    toggleLeftNavSection: (which) => {
+      set((s) => ({ leftNavSections: { ...s.leftNavSections, [which]: !s.leftNavSections[which] } }));
+      localStorage.setItem("lsn_left_nav_sections", JSON.stringify(get().leftNavSections));
+    },
+    loadLeftNavPrefs: () => {
+      try {
+        const rawWidth = localStorage.getItem("lsn_left_nav_width");
+        const rawSections = localStorage.getItem("lsn_left_nav_sections");
+        const width = rawWidth ? Number(rawWidth) : NaN;
+        const sections = rawSections ? JSON.parse(rawSections) : null;
+        set({
+          leftNavWidth: Number.isFinite(width) && width >= 120 ? width : 240,
+          leftNavSections: sections && typeof sections === "object"
+            ? { projects: !!sections.projects, recents: !!sections.recents, allChats: sections.allChats !== false }
+            : { projects: false, recents: false, allChats: true },
+        });
+      } catch {
+        // fall through to defaults
+      }
+    },
     toggleArtifactsPanel: () => set((s) => ({ showArtifactsPanel: !s.showArtifactsPanel })),
     setArtifactsWidth: (w) => set({ artifactsWidth: w }),
     setActiveArtifact: (a) => set({ activeArtifact: a }),
@@ -1555,6 +1747,21 @@ export const useStore = create<AppState>((set, get) => {
         console.error("archive_agent_session failed", err);
       }
     },
+    deleteAgentSession: async (id) => {
+      try {
+        await invoke<void>("delete_agent_session", { id });
+        set((s) => {
+          const agentSessions = s.agentSessions.filter((x) => x.id !== id);
+          return {
+            agentSessions,
+            activeAgentSessionId:
+              s.activeAgentSessionId === id ? (agentSessions[0]?.id ?? null) : s.activeAgentSessionId,
+          };
+        });
+      } catch (err) {
+        console.error("delete_agent_session failed", err);
+      }
+    },
     forkAgentSession: async (sessionId) => {
       try {
         const child = await invoke<AgentSession>("fork_agent_session", { sessionId });
@@ -1568,19 +1775,161 @@ export const useStore = create<AppState>((set, get) => {
         return null;
       }
     },
+    autoRenameAgentSessionWithAI: async (id) => {
+      const state = get();
+      const session = state.agentSessions.find((s) => s.id === id);
+      if (!session) return null;
+
+      const msgs = state.assistantMessages;
+      let generatedTitle = "";
+      if (msgs && msgs.length > 0) {
+        const conversationText = msgs
+          .slice(-6)
+          .map((m) => `${m.role}: ${m.content.slice(0, 150)}`)
+          .join("\n");
+        const prompt = `Summarize the following study session context into a concise 3 to 5 word title. Respond ONLY with the title, no quotes or punctuation.\n\n${conversationText}`;
+
+        try {
+          const response = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${state.settings.aiApiKey || ""}`,
+            },
+            body: JSON.stringify({
+              model: state.settings.aiModelName || "gemini-2.5-flash",
+              messages: [{ role: "user", content: prompt }],
+              max_tokens: 25,
+            }),
+          }).catch(() => null);
+
+          if (response && response.ok) {
+            const data = await response.json();
+            generatedTitle = data.choices?.[0]?.message?.content?.trim() || "";
+          }
+        } catch (e) {
+          console.error("autoRenameAgentSessionWithAI error", e);
+        }
+
+        if (!generatedTitle) {
+          const firstUserMsg = msgs.find((m) => m.role === "user")?.content || "Study Session";
+          generatedTitle = firstUserMsg.slice(0, 30).trim();
+        }
+      } else if (session.goal) {
+        generatedTitle = session.goal.slice(0, 30).trim();
+      } else {
+        generatedTitle = session.title || "Untitled Session";
+      }
+
+      generatedTitle = generatedTitle.replace(/^["']|["']$/g, "").trim();
+      await state.patchAgentSession(id, { title: generatedTitle });
+      if (id === state.activeAgentSessionId) {
+        state.setAssistantTopicTitle(generatedTitle);
+      }
+      return generatedTitle;
+    },
+    exportAgentSessionMarkdown: async (id) => {
+      const state = get();
+      const session = state.agentSessions.find((s) => s.id === id);
+      const title = session?.title || state.assistantTopicTitle || "Agentic System Plan";
+      const engine = session?.engine || state.settings.assistantEngine || "opencode";
+      const model = session?.model || state.settings.aiModelName || "default";
+
+      let content = `# ${title}\n\n`;
+      content += `- **Session ID:** \`${id}\`\n`;
+      content += `- **Engine:** \`${engine}\` | **Model:** \`${model}\`\n`;
+      content += `- **Exported At:** ${new Date().toLocaleString()}\n\n`;
+      content += `---\n\n`;
+
+      if (state.assistantMessages && state.assistantMessages.length > 0) {
+        content += `## Conversation Transcript\n\n`;
+        state.assistantMessages.forEach((m) => {
+          const icon = m.role === "user" ? "👤 **User**" : "🤖 **Assistant**";
+          content += `### ${icon}\n${m.content}\n\n`;
+        });
+      } else if (session?.summary) {
+        content += `## Session Summary\n\n${session.summary}\n\n`;
+      } else {
+        content += `*No conversation transcript available for this session.*\n\n`;
+      }
+
+      const folderPath = state.currentFolderPath;
+      if (folderPath) {
+        const safeTitle = title.replace(/[^a-zA-Z0-9_\-\s]/g, "").trim() || "session_export";
+        const fileName = `${safeTitle}.md`;
+        const filePath = `${folderPath}/${fileName}`;
+        try {
+          await invoke("write_local_file", { path: filePath, content });
+          await state.refreshExplorer();
+        } catch (e) {
+          console.warn("Could not write export to vault path", e);
+        }
+      }
+      return content;
+    },
     setActiveAgentSession: (id) => {
-      set((s) => {
-        const sess = s.agentSessions.find((x) => x.id === id);
-        const restored = sess
-          ? deserializeThread(sess.context) ??
-            (readThreadMirror()[sess.id] as AssistantMessage[] | undefined) ??
-            null
-          : null;
-        return {
-          activeAgentSessionId: id,
-          assistantMessages: restored ?? s.assistantMessages,
-        };
-      });
+      const sess = get().agentSessions.find((x) => x.id === id);
+      const restored = sess
+        ? deserializeThread(sess.context) ??
+          (readThreadMirror()[sess.id] as AssistantMessage[] | undefined) ??
+          null
+        : null;
+      const hasLocalThread = Array.isArray(restored) && restored.length > 0;
+      set((s) => ({
+        activeAgentSessionId: id,
+        assistantMessages: restored ?? s.assistantMessages,
+      }));
+      if (sess?.opencodeSessionId && !hasLocalThread && id !== null) {
+        void get().rehydrateActiveSessionFromOpencode();
+      }
+    },
+
+    // OpenChamber session re-hydration (plan_openchamber_paseo_flaws.md workstream B).
+    // When a session points at a live OpenCode sidecar session but its local thread
+    // mirror is empty (crash mid-turn, app restarted while the sidecar survived), pull
+    // message history from GET /session/:id/message and restore it into the store, the
+    // DB context column, and the localStorage mirror. Best-effort: any failure leaves
+    // the local (possibly empty) thread untouched.
+    rehydrateActiveSessionFromOpencode: async () => {
+      const store = get();
+      const sessId = store.activeAgentSessionId;
+      const sess = sessId ? store.agentSessions.find((s) => s.id === sessId) : null;
+      if (!sess?.opencodeSessionId) return;
+      if (!store.opencodeServerPid || !store.opencodeServerPassword || !store.opencodeServerPort) return;
+      const existing =
+        deserializeThread(sess.context) ??
+        (readThreadMirror()[sess.id] as AssistantMessage[] | undefined) ??
+        null;
+      if (existing && existing.length > 0) return;
+      try {
+        const { rehydrateOpencodeSession } = await import("../services/opencodeClient");
+        const history = await rehydrateOpencodeSession({
+          port: store.opencodeServerPort,
+          password: store.opencodeServerPassword,
+          sessionId: sess.opencodeSessionId,
+        });
+        if (!history || history.length === 0) return;
+        const restored: AssistantMessage[] = history.map((m) => ({
+          id: m.id || "restored-" + Math.random().toString(36).slice(2),
+          role: m.role,
+          content: m.text,
+          timestamp: "",
+        } satisfies AssistantMessage));
+        set({ assistantMessages: restored });
+        if (sessId) {
+          get()
+            .patchAgentSession(sessId, { context: serializeThread(restored) })
+            .catch(() => {});
+          if (typeof localStorage !== "undefined") {
+            const mirror = readThreadMirror();
+            mirror[sessId] = restored;
+            localStorage.setItem("lsn_assistant_threads", JSON.stringify(mirror));
+            localStorage.setItem("lsn_active_thread_id", sessId);
+          }
+        }
+      } catch {
+        // Keep the local (possibly empty) thread — never block on re-hydration.
+      }
     },
 
     // Goal mode (AGENTIC_ORCHESTRATION_PLAN.md Phase 2). The loop service owns the
@@ -1633,6 +1982,40 @@ export const useStore = create<AppState>((set, get) => {
         abort,
         pausedRef,
       }).catch((err) => console.error("goal run loop failed", err));
+    },
+    runGoalOnSession: async (sessionId, goal, engine, onToolCall) => {
+      const goalText = goal.trim();
+      if (!goalText || !sessionId) return null;
+      const store = get();
+      if (store.goalRunning) return null; // wait-for-idle invariant: one loop at a time
+
+      const abort = new AbortController();
+      const pausedRef = { value: false };
+      const control = { abort, paused: pausedRef };
+      await import("../services/agentOrchestrator").then(({ setActiveGoalRun }) =>
+        setActiveGoalRun(control)
+      );
+      useStore.setState({
+        goalRunning: true,
+        goalPaused: false,
+        assistantStatusText: "🎯 Running goal…",
+      });
+      try {
+        const finished = await runGoalLoopWithHandlers({
+          sessionId,
+          goal: goalText,
+          engine: engine ?? store.settings.assistantEngine,
+          abort,
+          pausedRef,
+          onToolCall,
+        });
+        return finished;
+      } catch (err) {
+        console.error("runGoalOnSession failed", err);
+        return null;
+      } finally {
+        useStore.setState({ goalRunning: false });
+      }
     },
     stopGoalRun: () => {
       import("../services/agentOrchestrator").then(({ getActiveGoalRun, setActiveGoalRun }) => {
@@ -1964,6 +2347,7 @@ export const useStore = create<AppState>((set, get) => {
 
     // OpenCode Agent runtime state — never persisted (no localStorage)
     opencodeInstalled: false,
+    opencodeBinaryVersion: null,
     opencodeServerPid: null,
     opencodeServerPort: null,
     opencodeServerPassword: null,
@@ -1987,6 +2371,10 @@ export const useStore = create<AppState>((set, get) => {
       set((s) => ({ pendingToolApprovals: s.pendingToolApprovals.filter((p) => p.id !== id) })),
 
 
+    // Free-tier guard helpers — OpenCode's built-in Console/Cloudflare tier is restricted
+    // to the OpenCode desktop app itself (HTTP 403). When no BYOK model is resolved the
+    // sidecar falls back to that tier and rejects with a FreeTierError. We detect it here
+    // and surface a clear, actionable message instead of the raw JSON blob.
     sendAssistantMessage: async (text: string) => {
       if (!text.trim()) return;
       const store = get();
@@ -2041,9 +2429,77 @@ export const useStore = create<AppState>((set, get) => {
         role: "assistant",
         content: "",
         timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        engine: store.settings.assistantEngine,
+        model: store.settings.aiModelName || null,
       };
 
       set({ assistantMessages: [...updatedMessages, assistantMsg] });
+
+      // OpenChamber-style part pipeline (CHAT_UI_REDESIGN_PLAN.md). Upserts parts by
+      // id (live text/reasoning/tool edits land in place), stamps startedAt on running
+      // parts and derives durationMs on completion so tool/reasoning chips can show
+      // live durations even when a producer omits them. content stays the text-only
+      // concat for RAG/export/legacy rendering.
+      const applyPart = (msgId: string, part: ChatPart) => {
+        set((state) => ({
+          assistantMessages: state.assistantMessages.map((m) => {
+            if (m.id !== msgId) return m;
+            const existing = m.parts ?? [];
+            const idx = existing.findIndex((p) => p.id === part.id);
+            let nextParts: ChatPart[];
+            if (idx >= 0) {
+              const prev = existing[idx];
+              nextParts = existing.slice();
+              if (
+                (part.kind === "tool" || part.kind === "reasoning") &&
+                (prev.kind === "tool" || prev.kind === "reasoning")
+              ) {
+                const now = Date.now();
+                const startedAt = (part.kind === "tool" || part.kind === "reasoning") ? part.startedAt ?? prev.startedAt ?? now : now;
+                const prevRunning =
+                  prev.kind === "tool" || prev.kind === "reasoning"
+                    ? prev.state === "running" || prev.state === "pending"
+                    : false;
+                nextParts[idx] =
+                  part.state === "running"
+                    ? { ...part, startedAt }
+                    : {
+                        ...part,
+                        startedAt,
+                        durationMs:
+                          part.state === "completed" || part.state === "error"
+                            ? part.durationMs ?? (prevRunning ? now - startedAt : undefined)
+                            : part.durationMs,
+                      };
+              } else {
+                nextParts[idx] = part;
+              }
+            } else {
+              const stamped: ChatPart =
+                (part.kind === "tool" || part.kind === "reasoning") && part.state === "running"
+                  ? { ...part, startedAt: Date.now() }
+                  : part;
+              nextParts = [...existing, stamped];
+            }
+            return { ...m, parts: nextParts, content: partsToContent(nextParts) };
+          }),
+        }));
+      };
+
+      // Appends terminal text (empty-response warning / error/cancel notice) as a text
+      // part when the message already has structured parts, else falls back to content.
+      const appendTerminalText = (msgId: string, text: string) => {
+        set((state) => ({
+          assistantMessages: state.assistantMessages.map((m) => {
+            if (m.id !== msgId) return m;
+            if (m.parts && m.parts.length > 0) {
+              const nextParts: ChatPart[] = [...m.parts, { kind: "text", id: "text-final-" + Date.now(), text }];
+              return { ...m, parts: nextParts, content: partsToContent(nextParts) };
+            }
+            return { ...m, content: text };
+          }),
+        }));
+      };
 
       const controller = new AbortController();
       set({ assistantAbortController: controller });
@@ -2055,10 +2511,17 @@ export const useStore = create<AppState>((set, get) => {
         // ─── OpenCode engine path ──────────────────────────────────────────────
         if (store.settings.assistantEngine === "opencode") {
           try {
-            const { streamOpencodeReply, reindexOpencodeVault, resolveOpencodeModel } = await import("../services/opencodeClient");
+            const { streamOpencodeReply, reindexOpencodeVault, resolveOpencodeModel, verifyOpencodeModelCapability, routeModelPreCheck, OpenCodeError } = await import("../services/opencodeClient");
             await get().ensureOpencodeReady();
             const { opencodeSessionId, opencodeServerPassword, opencodeServerPort, settings, currentFolderPath } = get();
             if (!opencodeSessionId || !opencodeServerPassword) throw new Error("no opencode session");
+            // Persist the sidecar session id on the active agent session so the
+            // transcript can be re-hydrated if the local mirror is ever lost
+            // (plan_openchamber_paseo_flaws.md workstream B).
+            const activeSessionForOpencode = get().activeAgentSessionId;
+            if (activeSessionForOpencode && opencodeSessionId) {
+              get().patchAgentSession(activeSessionForOpencode, { opencodeSessionId }).catch(() => {});
+            }
 
             let payloadText = text;
             const hasPriorUserTurn = store.assistantMessages.filter((m) => m.role === "user" && m.id !== userMsg.id).length > 0;
@@ -2088,13 +2551,61 @@ export const useStore = create<AppState>((set, get) => {
               }
             }
 
-            finalText = await streamOpencodeReply({
+            const resolvedModel = resolveOpencodeModel(settings);
+            if (!resolvedModel && !settings.opencodeFallbackToByok) {
+              // No BYOK model mapped → sidecar would use free tier → will 403.
+              // Short-circuit here with a friendly, actionable error instead.
+              throw new Error("FreeTierError: No BYOK model configured for the OpenCode sidecar.");
+            }
+
+            // OpenChamber gateway pre-validation: confirm the sidecar actually offers the
+            // configured model BEFORE streaming, so a bad model name fails fast with an
+            // actionable error instead of a generic 500 mid-run. `known:false` (network
+            // error, unknown provider/models shape) always proceeds — never block on an
+            // unverifiable state.
+            let modelRoute: "stream" | "byok" | "error" = "stream";
+            if (resolvedModel) {
+              const cap = await verifyOpencodeModelCapability({
+                port: opencodeServerPort ?? settings.opencodePort,
+                password: opencodeServerPassword,
+                providerID: resolvedModel.providerID,
+                modelID: resolvedModel.modelID,
+              });
+              modelRoute = routeModelPreCheck(cap, settings.opencodeFallbackToByok);
+              if (settings.aiVerboseLogging) {
+                invoke("append_ai_debug_log", {
+                  line: `[${new Date().toISOString()}] [OpenCode] model pre-check ${resolvedModel.providerID}/${resolvedModel.modelID} known=${cap.known} ok=${cap.ok} route=${modelRoute}`,
+                }).catch(() => {});
+              }
+            }
+
+            if (modelRoute === "byok") {
+              servedBy = "byok";
+            } else if (modelRoute === "error") {
+              throw new OpenCodeError(
+                null,
+                "provider",
+                `provider "${resolvedModel!.providerID}" does not offer model "${resolvedModel!.modelID}"` +
+                  ` (confirmed via GET /provider). Check the model name in Settings → AI & BYOK Model,` +
+                  ` then Restart server.`,
+                ""
+              );
+            } else {
+              finalText = await streamOpencodeReply({
               sessionId: opencodeSessionId,
               port: opencodeServerPort ?? settings.opencodePort,
               password: opencodeServerPassword,
-              model: resolveOpencodeModel(settings),
+              model: resolvedModel,
               text: payloadText,
               signal: controller.signal,
+              debug: settings.aiVerboseLogging,
+              workspaceDir: currentFolderPath,
+              retry5xx: settings.opencodeAutoRetry,
+              onSessionRecycled: (sessionId) => {
+                set({ opencodeSessionId: sessionId });
+                const sid = get().activeAgentSessionId;
+                if (sid) get().patchAgentSession(sid, { opencodeSessionId: sessionId }).catch(() => {});
+              },
               onChunk: (accumulatedText) => {
                 set((state) => ({
                   assistantMessages: state.assistantMessages.map((m) =>
@@ -2102,16 +2613,24 @@ export const useStore = create<AppState>((set, get) => {
                   ),
                 }));
               },
+              onPart: (part) => applyPart(assistantMsgId, part),
               onStatusChange: (status) => set({ assistantStatusText: status }),
               onToolCall: (tool, status) => set({ assistantStatusText: `🔧 ${tool} · ${status}` }),
               onFileEdit: () => {
                 if (currentFolderPath) reindexOpencodeVault(currentFolderPath);
               },
             });
+            }
           } catch (opencodeErr) {
             const wasCancelled = opencodeErr instanceof DOMException && opencodeErr.name === "AbortError";
             if (wasCancelled) throw opencodeErr;
-            if (store.settings.opencodeFallbackToByok) {
+            if (isFreeTierError(opencodeErr)) {
+              if (store.settings.opencodeFallbackToByok) {
+                servedBy = "byok";
+              } else {
+                throw new Error(FREE_TIER_ERROR_MSG);
+              }
+            } else if (store.settings.opencodeFallbackToByok) {
               servedBy = "byok";
             } else {
               throw opencodeErr;
@@ -2141,32 +2660,26 @@ export const useStore = create<AppState>((set, get) => {
                 ),
               }));
             },
+            onPart: (part) => applyPart(assistantMsgId, part),
             onStatusChange: (status) => set({ assistantStatusText: status }),
             signal: controller.signal,
           });
         }
 
-        // ─── Post-processing: empty check, fallback notice, memory save ────────
+        // ─── Post-processing: empty check, engine stamp, memory save ──────────
         if (!finalText.trim()) {
+          appendTerminalText(
+            assistantMsgId,
+            "⚠️ The AI provider returned an empty response. This can happen when a safety/content filter blocks the output, or the model produced nothing for this prompt. Try rephrasing your message."
+          );
+        } else {
+          // Engine stamped on the message (badge in the UI) instead of appending a
+          // fallback footer — the renderer is engine-agnostic (CHAT_UI_REDESIGN_PLAN.md).
           set((state) => ({
             assistantMessages: state.assistantMessages.map((m) =>
               m.id === assistantMsgId
-                ? {
-                    ...m,
-                    content:
-                      "⚠️ The AI provider returned an empty response. This can happen when a safety/content filter blocks the output, or the model produced nothing for this prompt. Try rephrasing your message.",
-                  }
+                ? { ...m, content: finalText.trim(), engine: servedBy, model: m.model ?? (store.settings.aiModelName || null) }
                 : m
-            ),
-          }));
-        } else {
-          const displayText =
-            servedBy !== store.settings.assistantEngine
-              ? `${finalText.trim()}\n\n---\n_Routed via BYOK fallback (OpenCode unavailable)._`
-              : finalText;
-          set((state) => ({
-            assistantMessages: state.assistantMessages.map((m) =>
-              m.id === assistantMsgId ? { ...m, content: displayText } : m
             ),
           }));
           if (store.settings.memoryAutoSave !== false) {
@@ -2178,20 +2691,24 @@ export const useStore = create<AppState>((set, get) => {
         const wasCancelled = err instanceof DOMException && err.name === "AbortError";
         const isOpenCodePath = servedBy === "opencode";
         const fallbackMessage = isOpenCodePath
-          ? `⚠️ OpenCode Agent error: ${String(err)}.\n\nConfirm the OpenCode CLI is installed (\`winget install SST.opencode\`) and close other OpenCode servers hogging the port in **Settings -> OpenCode Agent**.`
-          : `⚠️ Unable to connect to AI server at \`${store.settings.aiBaseUrl}\` (${String(err)}).\n\nCheck your endpoint configuration in **Settings -> AI & BYOK Model**.`;
+          ? isFreeTierError(err)
+            ? FREE_TIER_ERROR_MSG
+            : opencodeFallbackMessage(err, { installed: get().opencodeInstalled })
+          : `⚠️ Unable to connect to AI server at \`${store.settings.aiBaseUrl}\` (${String(err)}).\n\nCheck your endpoint configuration in **Settings → AI & BYOK Model**.`;
         set((state) => ({
           assistantMessages: state.assistantMessages.map((m) =>
             m.id === assistantMsgId
               ? {
                   ...m,
-                  content: wasCancelled
-                    ? m.content || "_Cancelled._"
-                    : m.content || fallbackMessage,
+                  engine: servedBy,
+                  content: wasCancelled ? m.content || "_Cancelled._" : m.content || fallbackMessage,
                 }
               : m
           ),
         }));
+        if (!wasCancelled && !assistantMsg.content) {
+          appendTerminalText(assistantMsgId, fallbackMessage);
+        }
       } finally {
         set({ isAssistantStreaming: false, assistantStatusText: "", assistantAbortController: null });
 
@@ -2215,6 +2732,54 @@ export const useStore = create<AppState>((set, get) => {
       get().assistantAbortController?.abort();
     },
     clearAssistantMessages: () => { set({ assistantMessages: [] }); get().resetOpencodeSession(); },
+    togglePinMessage: (messageId) => {
+      set((s) => ({
+        assistantMessages: s.assistantMessages.map((m) =>
+          m.id === messageId ? { ...m, isPinned: !m.isPinned } : m
+        ),
+      }));
+    },
+    saveMessageToNote: async (message) => {
+      const content = partsToContent(message.parts) || message.content;
+      if (!content.trim()) return null;
+      const vaultPath = get().currentFolderPath;
+      const timeStr = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+      const fileName = `AI Note - ${timeStr}.md`;
+      if (vaultPath) {
+        const fullPath = `${vaultPath.replace(/[/\\]+$/, "")}/${fileName}`;
+        try {
+          await invoke("write_local_file", { path: fullPath, content });
+          await get().refreshExplorer();
+          await get().openFile(fullPath);
+          return fullPath;
+        } catch (err) {
+          console.error("Failed to save note", err);
+        }
+      }
+      get().openNewNote();
+      return null;
+    },
+    saveMessageAsPlan: (message) => {
+      const content = partsToContent(message.parts) || message.content;
+      if (!content.trim()) return;
+      const title = `Study Plan - ${message.timestamp || new Date().toLocaleTimeString()}`;
+      get().addArtifact({
+        id: `plan-${Date.now()}`,
+        title,
+        type: "plan",
+        content,
+        createdAt: Date.now(),
+      });
+      set({ showArtifactsPanel: true });
+    },
+    openMessageInNoteTab: async (message) => {
+      const content = partsToContent(message.parts) || message.content;
+      if (!content.trim()) return;
+      get().openNewNote();
+      const isLeft = get().activePanel === "left";
+      if (isLeft) set({ leftDraft: content });
+      else set({ rightDraft: content });
+    },
     setAssistantWidth: (w) => set({ assistantWidth: w }),
     toggleAssistantPanel: () => set((s) => ({ showAssistantPanel: !s.showAssistantPanel })),
     setSelectedModel: (m) => set({ selectedModel: m }),
@@ -2237,10 +2802,10 @@ export const useStore = create<AppState>((set, get) => {
 
     checkOpencodeInstalled: async () => {
       try {
-        const installed = await invoke<boolean>("check_opencode_installed");
-        set({ opencodeInstalled: installed });
+        const check = await invoke<{ installed: boolean; version: string | null }>("check_opencode_installed");
+        set({ opencodeInstalled: check.installed, opencodeBinaryVersion: check.installed ? check.version : null });
       } catch {
-        set({ opencodeInstalled: false });
+        set({ opencodeInstalled: false, opencodeBinaryVersion: null });
       }
     },
 
@@ -2270,6 +2835,8 @@ export const useStore = create<AppState>((set, get) => {
           providerEnv["GOOGLE_GENERATIVE_AI_API_KEY"] = settings.aiApiKey.trim();
         } else if (settings.aiProvider === "openrouter") {
           providerEnv["OPENROUTER_API_KEY"] = settings.aiApiKey.trim();
+        } else if (settings.aiProvider === "opencode_zen") {
+          providerEnv["OPENCODE_API_KEY"] = settings.aiApiKey.trim();
         }
         // ollama_hermes / custom: no API key env var needed
       }
@@ -2278,15 +2845,28 @@ export const useStore = create<AppState>((set, get) => {
         const { config: mcpOverride, env: mcpEnv } = buildOpencodeMcpExport(
           get().settings.connectors ?? [],
         );
-        const { pid, port } = await invoke<{ pid: number; port: number }>("spawn_opencode_server", {
-          port: settings.opencodePort,
-          workspacePath: workspace,
-          serverPassword: password,
-          providerEnv,
-          mcpOverride,
-          mcpEnv,
+        const { pid, port, version }: { pid: number; port: number; version: string | null } = await invoke(
+          "spawn_opencode_server",
+          {
+            port: settings.opencodePort,
+            workspacePath: workspace,
+            serverPassword: password,
+            providerEnv,
+            mcpOverride,
+            mcpEnv,
+          }
+        );
+        set({
+          opencodeServerPid: pid,
+          opencodeServerPort: port,
+          opencodeServerPassword: password,
+          opencodeBinaryVersion: version,
         });
-        set({ opencodeServerPid: pid, opencodeServerPort: port, opencodeServerPassword: password });
+        if (settings.aiVerboseLogging) {
+          invoke("append_ai_debug_log", {
+            line: `[${new Date().toISOString()}] [OpenCode] spawned server pid=${pid} port=${port} (configured ${settings.opencodePort}) version=${version ?? "unknown"}`,
+          }).catch(() => {});
+        }
       } catch (err) {
         console.error("[OpenCode] Failed to start server:", err);
       }
@@ -2304,8 +2884,16 @@ export const useStore = create<AppState>((set, get) => {
       }
     },
 
+    // One-click recovery for poisoned sessions / stale servers (workstream C + D of
+    // OPENCODE_HTTP500_DIAGNOSIS_PLAN.md): clean kill (removes the managed opencode.json
+    // export and the per-port server log), then a fresh spawn on a fresh port/session.
+    restartOpencodeServer: async () => {
+      await get().stopOpencodeServer();
+      await get().startOpencodeServer();
+    },
+
     ensureOpencodeReady: async () => {
-      const { settings, opencodeInstalled, opencodeServerPid, opencodeSessionId, currentFolderPath } = get();
+      const { settings, opencodeInstalled, opencodeServerPid, opencodeSessionId } = get();
       if (!opencodeInstalled) {
         await get().checkOpencodeInstalled();
         if (!get().opencodeInstalled) {
@@ -2331,7 +2919,7 @@ export const useStore = create<AppState>((set, get) => {
           const res = await fetch(`${baseUrl}/session`, {
             method: "POST",
             headers,
-            body: JSON.stringify({ workspaceDir: currentFolderPath || "." }),
+            body: JSON.stringify({}),
           });
           if (res.ok) {
             const data = await res.json();

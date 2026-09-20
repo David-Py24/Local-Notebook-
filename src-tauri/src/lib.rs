@@ -15,7 +15,7 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
@@ -85,6 +85,7 @@ pub fn run() {
             commands::patch_agent_session,
             commands::fork_agent_session,
             commands::archive_agent_session,
+            commands::delete_agent_session,
             commands::start_agent_run,
             commands::record_run_turn,
             commands::create_scheduled_task,
@@ -94,7 +95,13 @@ pub fn run() {
             commands::check_due_tasks,
             commands::log_task_run
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
+            commands::cleanup_opencode_on_exit(app_handle);
+        }
+    });
 }
 

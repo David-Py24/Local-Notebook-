@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useStore, AgentTask } from "../stores/useStore";
+import { ApproveGateCard } from "./chat/ApproveGateCard";
 
 const TASKS: { id: AgentTask; label: string }[] = [
   { id: "summarize", label: "Summarize" },
@@ -18,9 +19,6 @@ export default function AgentPanel() {
   const setAgentContext = useStore((s) => s.setAgentContext);
   const addAgentMessage = useStore((s) => s.addAgentMessage);
   const toggleAgentPanel = useStore((s) => s.toggleAgentPanel);
-  const pendingToolApprovals = useStore((s) => s.pendingToolApprovals);
-  const resolveToolApproval = useStore((s) => s.resolveToolApproval);
-  const clearToolApproval = useStore((s) => s.clearToolApproval);
 
   const [inputVal, setInputVal] = useState("");
   const [statusText, setStatusText] = useState("");
@@ -213,47 +211,8 @@ export default function AgentPanel() {
         </div>
       )}
 
-      {/* Pending file-tool approval gate (T2.1) */}
-      {pendingToolApprovals.length > 0 && (
-        <div className="space-y-2 px-3 py-2 border-t border-border/40 bg-bg/40 shrink-0">
-          {pendingToolApprovals
-            .filter((p) => p.status === "pending")
-            .map((p) => (
-              <div
-                key={p.id}
-                className="flex items-center justify-between gap-2 rounded-lg border border-amber-400/40 bg-amber-400/10 px-2.5 py-1.5 text-xs"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1 font-medium text-amber-300">
-                    <span>⚠️</span>
-                    <span className="uppercase tracking-wide text-[9px]">Approval Required</span>
-                  </div>
-                  <p className="mt-0.5 text-[11px] text-text/90 leading-snug break-words">{p.summary}</p>
-                </div>
-                <div className="flex shrink-0 items-center gap-1">
-                  <button
-                    onClick={() => {
-                      resolveToolApproval(p.id, "approved");
-                      setTimeout(() => clearToolApproval(p.id), 1200);
-                    }}
-                    className="rounded bg-emerald-500 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-emerald-400 cursor-pointer transition-colors"
-                  >
-                    Approve
-                  </button>
-                  <button
-                    onClick={() => {
-                      resolveToolApproval(p.id, "rejected");
-                      clearToolApproval(p.id);
-                    }}
-                    className="rounded border border-border bg-bg/60 px-2 py-0.5 text-[10px] font-semibold text-red-400 hover:bg-red-500/20 cursor-pointer transition-colors"
-                  >
-                    Deny
-                  </button>
-                </div>
-              </div>
-            ))}
-        </div>
-      )}
+      {/* Pending file-tool approval gate (shared PermissionCard analog) */}
+      <ApproveGateCard />
 
       {/* Input */}
       <div className="shrink-0 border-t border-border/30 p-2">

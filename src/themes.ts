@@ -7,6 +7,14 @@ export type ThemeColorMap = {
   muted: string;
   border: string;
   serif?: string;
+  // Chat surface tokens (CHAT_UI_REDESIGN_PLAN.md) — semantic status/chat colors so
+  // the chatbox follows the active theme instead of hardcoded Tailwind palette colors.
+  chatUserBubble: string;
+  chatToolRunning: string;
+  chatToolOk: string;
+  chatToolError: string;
+  chatWarn: string;
+  chatReasoningBg: string;
 };
 
 export interface ThemeDef {
@@ -30,6 +38,12 @@ export const THEMES: ThemeDef[] = [
       text: "#e5e5e5",
       muted: "#737373",
       border: "#2a2a2a",
+      chatUserBubble: "#1f2633",
+      chatToolRunning: "#3b82f6",
+      chatToolOk: "#34d399",
+      chatToolError: "#f87171",
+      chatWarn: "#fbbf24",
+      chatReasoningBg: "#22262e",
     },
   },
   {
@@ -44,6 +58,12 @@ export const THEMES: ThemeDef[] = [
       text: "#dbeafe",
       muted: "#64748b",
       border: "#1e293b",
+      chatUserBubble: "#1a2840",
+      chatToolRunning: "#38bdf8",
+      chatToolOk: "#34d399",
+      chatToolError: "#f87171",
+      chatWarn: "#fbbf24",
+      chatReasoningBg: "#1a2136",
     },
   },
   {
@@ -58,6 +78,12 @@ export const THEMES: ThemeDef[] = [
       text: "#eceff4",
       muted: "#8b93a5",
       border: "#4c566a",
+      chatUserBubble: "#3d4558",
+      chatToolRunning: "#88c0d0",
+      chatToolOk: "#a3be8c",
+      chatToolError: "#bf616a",
+      chatWarn: "#ebcb8b",
+      chatReasoningBg: "#3b4252",
     },
   },
   {
@@ -72,6 +98,12 @@ export const THEMES: ThemeDef[] = [
       text: "#f8f8f2",
       muted: "#6272a4",
       border: "#282a36",
+      chatUserBubble: "#262939",
+      chatToolRunning: "#bd93f9",
+      chatToolOk: "#50fa7b",
+      chatToolError: "#ff5555",
+      chatWarn: "#f1fa8c",
+      chatReasoningBg: "#242532",
     },
   },
   {
@@ -86,6 +118,12 @@ export const THEMES: ThemeDef[] = [
       text: "#c0caf5",
       muted: "#565f89",
       border: "#292e42",
+      chatUserBubble: "#242b40",
+      chatToolRunning: "#7aa2f7",
+      chatToolOk: "#9ece6a",
+      chatToolError: "#f7768e",
+      chatWarn: "#e0af68",
+      chatReasoningBg: "#22263b",
     },
   },
 ];
@@ -105,4 +143,10 @@ export function applyThemeToDocument(colors: ThemeColorMap): void {
   root.style.setProperty("--color-text", colors.text);
   root.style.setProperty("--color-muted", colors.muted);
   root.style.setProperty("--color-border", colors.border);
+  root.style.setProperty("--color-chat-user-bubble", colors.chatUserBubble);
+  root.style.setProperty("--color-chat-tool-running", colors.chatToolRunning);
+  root.style.setProperty("--color-chat-tool-ok", colors.chatToolOk);
+  root.style.setProperty("--color-chat-tool-error", colors.chatToolError);
+  root.style.setProperty("--color-chat-warn", colors.chatWarn);
+  root.style.setProperty("--color-chat-reasoning-bg", colors.chatReasoningBg);
 }
