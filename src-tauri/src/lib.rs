@@ -11,7 +11,13 @@ mod pdf_export;
 use db::DbState;
 use mcp::McpState;
 use mcp_bridge::McpBridgeState;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
+
+// Single-shot guard for the exit-time OpenCode sidecar cleanup (plan D1). Tauri can
+// fire both `ExitRequested` and `Exit` during teardown; without this the cleanup body
+// would run (and taskkill) twice.
+static OPENCODE_CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -100,7 +106,9 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
-            commands::cleanup_opencode_on_exit(app_handle);
+            if !OPENCODE_CLEANUP_DONE.swap(true, Ordering::SeqCst) {
+                commands::cleanup_opencode_on_exit(app_handle);
+            }
         }
     });
 }

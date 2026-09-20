@@ -1719,10 +1719,18 @@ pub fn spawn_opencode_server(
         ));
     }
 
-    // Paseo PID Lock check: before spawning a new sidecar, if an existing PID lock exists,
-    // attempt to kill any orphaned sidecar from a prior run.
+    // Paseo PID Lock sweep (plan C3/D3): before spawning a new sidecar, reap any
+    // leftover lock from a prior run — but ONLY when the recorded PID is both a live
+    // opencode process (identity check inside kill_opencode_server_internal) and not
+    // stale (TTL). A stale or foreign lock is merely deleted, never signaled, so a
+    // recycled PID can never be taskkilled. `pick_sidecar_port` below still dodges
+    // occupied ports, so a foreign server is skipped, never killed.
     if let Some(existing) = read_opencode_pid_lock(&app_handle) {
-        let _ = kill_opencode_server_internal(Some(&app_handle), existing.pid);
+        if pid_lock_is_stale(&existing) {
+            remove_opencode_pid_lock(&app_handle);
+        } else {
+            let _ = kill_opencode_server_internal(Some(&app_handle), existing.pid);
+        }
     }
 
     let actual_port = pick_sidecar_port(port)?;
@@ -1876,6 +1884,49 @@ pub fn get_opencode_pid_file(app_handle: &tauri::AppHandle) -> Result<std::path:
     Ok(dir.join("opencode.pid"))
 }
 
+/// TTL after which a recorded PID lock is treated as stale and never signaled
+/// (plan C3/D3: PID-reuse windows and long-crashed runs must not kill a process
+/// that merely happens to reuse the recorded PID).
+const OPENCODE_PID_TTL_SECS: i64 = 6 * 60 * 60;
+
+/// Atomic PID-lock write (plan C1): serialize to a temp file in the same directory,
+/// `File::sync_all()`, then `rename` into place — atomic on the same volume. Leftover
+/// `opencode.pid.*.tmp` files from a crash between create and rename are swept on the
+/// next read.
+fn write_opencode_pid_lock_file(pid_path: &std::path::Path, lock: &OpenCodePidLock) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = pid_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp_path = dir.join(format!("opencode.pid.{}.{}.tmp", lock.pid, std::process::id()));
+    let content = serde_json::to_string(lock)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    {
+        let mut tmp = std::fs::File::create(&tmp_path)?;
+        tmp.write_all(content.as_bytes())?;
+        tmp.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, pid_path)
+}
+
+/// Sweeps leftover `opencode.pid.*.tmp` files (interrupted atomic writes), then reads
+/// the lock if present (plan C1).
+fn read_opencode_pid_lock_file(pid_path: &std::path::Path) -> Option<OpenCodePidLock> {
+    if let Some(dir) = pid_path.parent() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("opencode.pid.") && name.ends_with(".tmp") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    if !pid_path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(pid_path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 pub fn write_opencode_pid_lock(app_handle: &tauri::AppHandle, pid: u32, port: u16) {
     if let Ok(pid_path) = get_opencode_pid_file(app_handle) {
         let lock = OpenCodePidLock {
@@ -1883,8 +1934,10 @@ pub fn write_opencode_pid_lock(app_handle: &tauri::AppHandle, pid: u32, port: u1
             port,
             start_time: now_iso(),
         };
-        if let Ok(content) = serde_json::to_string(&lock) {
-            let _ = std::fs::write(pid_path, content);
+        if write_opencode_pid_lock_file(&pid_path, &lock).is_err() {
+            // Fall back to a plain write so the orphan reference is never lost; the
+            // identity/TTL guards make a non-atomic fallback benign.
+            let _ = std::fs::write(&pid_path, serde_json::to_string(&lock).unwrap_or_default());
         }
     }
 }
@@ -1899,33 +1952,134 @@ pub fn remove_opencode_pid_lock(app_handle: &tauri::AppHandle) {
 
 pub fn read_opencode_pid_lock(app_handle: &tauri::AppHandle) -> Option<OpenCodePidLock> {
     let pid_path = get_opencode_pid_file(app_handle).ok()?;
-    if !pid_path.exists() {
-        return None;
-    }
-    let content = std::fs::read_to_string(pid_path).ok()?;
-    serde_json::from_str(&content).ok()
+    read_opencode_pid_lock_file(&pid_path)
 }
 
-pub fn kill_opencode_server_internal(app_handle: Option<&tauri::AppHandle>, pid: u32) -> Result<(), String> {
+/// Whether a stored PID lock is too old to act on (plan C3). Unparsable timestamps
+/// are treated as stale: never signal on a lock we cannot date. start_time is written
+/// in `now_iso()` format (local, `%Y-%m-%dT%H:%M:%S%.3f`).
+fn pid_lock_is_stale(lock: &OpenCodePidLock) -> bool {
+    let Ok(start) = chrono::NaiveDateTime::parse_from_str(&lock.start_time, "%Y-%m-%dT%H:%M:%S%.3f") else {
+        return true;
+    };
+    let elapsed = (chrono::Local::now().naive_local() - start).num_seconds();
+    elapsed > OPENCODE_PID_TTL_SECS
+}
+
+/// Parses one `tasklist /FO CSV /NH` row: `"opencode.exe","<pid>","Console",...`.
+/// Returns true when the image-name column is opencode(.exe), case-insensitively.
+/// Non-CSV rows (headers, `INFO:` notes) never match.
+fn pid_is_opencode_row(row: &str) -> bool {
+    let trimmed = row.trim();
+    if !trimmed.starts_with('"') {
+        return false;
+    }
+    let end = trimmed[1..].find('"').map(|i| i + 1).unwrap_or(0);
+    if end == 0 {
+        return false;
+    }
+    let image = &trimmed[1..end];
+    image.eq_ignore_ascii_case("opencode") || image.eq_ignore_ascii_case("opencode.exe")
+}
+
+/// Process-identity guard (plan C2/C5): true only when PID `pid` currently belongs to
+/// an `opencode` binary. Windows checks `tasklist /FI "PID eq {pid}" /FO CSV /NH`;
+/// Unix checks `ps -p <pid> -o comm=`. This keeps taskkill from ever signaling a
+/// recycled / foreign / already-exited PID.
+fn pid_is_opencode(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let filter = format!("PID eq {pid}");
+        let Ok(out) = std::process::Command::new("tasklist")
+            .args(["/FI", filter.as_str(), "/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines().any(pid_is_opencode_row)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        // Parity (plan C5): single-process kill on Unix; name-check via `ps -o comm=`
+        // so a recycled PID is never signaled here either.
+        let pid_str = pid.to_string();
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-p", pid_str.as_str(), "-o", "comm="])
+            .output()
+        else {
+            return false;
+        };
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_ascii_lowercase();
+        name == "opencode" || name.ends_with("/opencode")
+    }
+}
+
+/// Records an orphan trace at app-data root when a verified kill could not be
+/// completed (plan C4: keep the lock AND leave a breadcrumb).
+fn append_opencode_orphan_log(app_handle: &tauri::AppHandle, pid: u32) {
+    use std::io::Write;
+    if let Ok(dir) = app_handle.path().app_data_dir() {
+        let path = dir.join(format!("opencode-server.orphan.{pid}.log"));
+        let line = format!(
+            "[{}] kill_opencode_server pid={pid} FAILED - taskkill returned non-success; lock retained for traceability",
+            now_iso()
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+pub fn kill_opencode_server_internal(app_handle: Option<&tauri::AppHandle>, pid: u32) -> Result<(), String> {
+    // Process-identity guard (plan C2): never taskkill a PID we cannot prove is an
+    // opencode binary. A recycled/foreign/already-exited PID is left untouched; the
+    // lock is dropped (it no longer describes a sidecar we own) and no kill is issued.
+    if !pid_is_opencode(pid) {
+        if let Some(app) = app_handle {
+            remove_opencode_pid_lock(app);
+        }
+        return Ok(());
     }
 
-    if let Some(app) = app_handle {
-        remove_opencode_pid_lock(app);
+    let kill_ok = {
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Parity (plan C5): single-process kill -TERM on Unix (no tree walk;
+            // the sidecar has no children on these targets). Windows-only build scope
+            // documented in AGENTS.md.
+            std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+    };
+
+    // Verified removal (plan C4): remove the PID lock only when the kill succeeded.
+    // On failure keep the lock AND write an orphan log line so the process stays
+    // traceable for the next sweep or manual check.
+    if kill_ok {
+        if let Some(app) = app_handle {
+            remove_opencode_pid_lock(app);
+        }
+    } else if let Some(app) = app_handle {
+        append_opencode_orphan_log(app, pid);
     }
 
     // Remove the connector-export config we wrote into the vault (if any).
@@ -1945,10 +2099,23 @@ pub fn kill_opencode_server_internal(app_handle: Option<&tauri::AppHandle>, pid:
 }
 
 /// App exit / shutdown hook: reads `opencode.pid` if present and terminates orphaned sidecar.
+/// Runs on a background thread bounded by a short receive-timeout so the exit event loop
+/// never blocks on taskkill (plan D2); the single-shot guard in lib.rs makes re-entry a no-op.
 pub fn cleanup_opencode_on_exit(app_handle: &tauri::AppHandle) {
-    if let Some(lock) = read_opencode_pid_lock(app_handle) {
-        let _ = kill_opencode_server_internal(Some(app_handle), lock.pid);
-    }
+    let handle = app_handle.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if let Some(lock) = read_opencode_pid_lock(&handle) {
+            if pid_lock_is_stale(&lock) {
+                // Stale lock (plan C3): drop it, never signal a possibly-recycled PID.
+                remove_opencode_pid_lock(&handle);
+            } else {
+                let _ = kill_opencode_server_internal(Some(&handle), lock.pid);
+            }
+        }
+        let _ = tx.send(());
+    });
+    let _ = rx.recv_timeout(std::time::Duration::from_secs(3));
 }
 
 /// Kills a running OpenCode server process by PID (exposed as Tauri command).
@@ -3024,5 +3191,72 @@ mod agent_orchestration_tests {
             "picked {picked} not in the random high band"
         );
         drop(listener);
+    }
+
+    #[test]
+    fn pid_is_opencode_row_parses_tasklist_csv() {
+        // Real tasklist `//FO CSV //NH` rows: image name is the first quoted field.
+        assert!(pid_is_opencode_row("\"opencode.exe\",\"1234\",\"Console\",\"1\",\"45,000 K\""));
+        assert!(pid_is_opencode_row("\"opencode\",\"1234\",\"Console\",\"1\""));
+        // Case-insensitive match.
+        assert!(pid_is_opencode_row("\"OpenCode.EXE\",\"9\",\"Console\",\"1\""));
+        // A foreign process must not be treated as ours.
+        assert!(!pid_is_opencode_row("\"notepad.exe\",\"1235\",\"Console\",\"1\""));
+        assert!(!pid_is_opencode_row("\"taskhostw.exe\",\"1236\",\"Console\",\"1\""));
+        // Non-CSV rows (tasklist headers / "INFO: no tasks" notes / junk) never match.
+        assert!(!pid_is_opencode_row(""));
+        assert!(!pid_is_opencode_row("INFO: No tasks are running which match the specified criteria."));
+        assert!(!pid_is_opencode_row("opencode string,1234"));
+    }
+
+    #[test]
+    fn pid_lock_is_stale_honors_ttl_and_unparsable_timestamps() {
+        let lock = |start_time: String| OpenCodePidLock { pid: 4242, port: 4096, start_time };
+
+        // A just-written lock is fresh.
+        assert!(!pid_lock_is_stale(&lock(now_iso())));
+
+        // An unparsable timestamp is treated as stale (never signal on an undated lock).
+        assert!(pid_lock_is_stale(&lock("not-a-timestamp".to_string())));
+        assert!(pid_lock_is_stale(&lock(String::new())));
+
+        // Fresh-ish (1h old) stays live; older than the 6h TTL becomes stale.
+        let one_hour_ago = (chrono::Local::now() - chrono::Duration::hours(1))
+            .format("%Y-%m-%dT%H:%M:%S%.3f")
+            .to_string();
+        assert!(!pid_lock_is_stale(&lock(one_hour_ago)));
+
+        let seven_hours_ago = (chrono::Local::now() - chrono::Duration::hours(7))
+            .format("%Y-%m-%dT%H:%M:%S%.3f")
+            .to_string();
+        assert!(pid_lock_is_stale(&lock(seven_hours_ago)));
+    }
+
+    #[test]
+    fn pid_lock_atomic_write_roundtrips_and_sweeps_tmp_leftovers() {
+        let dir = std::env::temp_dir().join(format!("lsn_pidlock_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_path = dir.join("opencode.pid");
+
+        let lock = OpenCodePidLock { pid: 777, port: 4096, start_time: now_iso() };
+        write_opencode_pid_lock_file(&pid_path, &lock).unwrap();
+        assert!(pid_path.exists());
+
+        // Simulate a crash-leftover temp file from an interrupted atomic write.
+        let leftover = dir.join("opencode.pid.9999.42.tmp");
+        std::fs::write(&leftover, "\x00partial").unwrap();
+
+        // The read both returns the lock and sweeps the temp file.
+        let read = read_opencode_pid_lock_file(&pid_path).expect("lock round-trips");
+        assert_eq!(read.pid, 777);
+        assert_eq!(read.port, 4096);
+        assert!(!leftover.exists(), "interrupted-write temp file must be swept on read");
+
+        // Reading with no lock file at all returns None.
+        let missing = dir.join("opencode.pid.missing");
+        assert!(read_opencode_pid_lock_file(&missing).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
