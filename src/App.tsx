@@ -51,7 +51,7 @@ function App() {
           // workstream C). Fire-and-forget: the app teardown continues immediately.
           void useStore.getState().stopOpencodeServer();
           if (unlisten) {
-            unlisten();
+            await unlisten();
           }
           await appWindow.close();
         });

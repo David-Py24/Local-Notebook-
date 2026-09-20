@@ -151,12 +151,39 @@ Gate E: `npm test` 127 passed (14 files), `npx tsc --noEmit` exit 0.
 
 ---
 
+## Gate D manual smoke test — COMPLETE
+
+**Status: done** (debug binary `src-tauri/target/debug/local-study-notebook.exe`, live app-data in
+`%APPDATA%\com.localstudynotebook.app`). All plan smoke items passed:
+
+1. **Close app with a live sidecar → no orphan, `opencode.pid` removed.** Launched the app, sidecar came
+   up (observed twice: PIDs 101664 and 96140), sent a clean `WM_CLOSE`, then verified the sidecar was
+   taskkilled and the lock deleted both times. Pre-existing orphans (PIDs 93440/97988, foreign provenance)
+   were left untouched, as required by the identity guard.
+2. **Foreign/stale lock → nothing killed, new server starts.** Planted a foreign `opencode.pid` with a
+   fresh timestamp pointing at (a) a dead PID — dropped, no kill; then (b) live PID 4 (`System`) — the
+   sweep refused to kill it, spawned a fresh sidecar (PID 96140, port 4096), and rewrote the lock to the
+   real server `{"pid":96140,"port":4096,...}`.
+3. **Platform contract**: real `tasklist /FO CSV` output validated against `pid_is_opencode_row` —
+   `opencode.exe` matches; `powershell.exe`/`System`/`INFO:` none-match rows are rejected.
+
+### Fix found during smoke: App.tsx close-loop race (pre-existing)
+
+`onCloseRequested` re-called `appWindow.close()` **without awaiting `unlisten()`** (`src/App.tsx:46-56`),
+so the re-close re-fired the handler → `preventDefault` → infinite close loop → the process never exited
+(reproduced twice; the sidecar was still killed by the fire-and-forget `stopOpencodeServer()`, so no
+orphan — but the Rust-side exit cleanup could never actually run on exit). Fixed by awaiting the unlisten
+before the re-close. Verified: `npm test` 127 passed, `npx tsc --noEmit` exit 0, `npm run build` ok,
+exe rebuilt (`cargo clean -p local-study-notebook && cargo build`), and a final launch + `WM_CLOSE`
+confirm the process now **exits cleanly**.
+
 ## Remaining work
 
 | Item | What | Why deferred |
 |---|---|---|
-| **Gate D manual smoke test** | (1) Launch the release exe, open a vault, let the OpenCode sidecar start, close the app → assert no `opencode.exe` orphan and `opencode.pid` removed. (2) Write a stale/foreign `opencode.pid` pointing at a non-opencode PID, relaunch/spawn → assert nothing is killed and the new server starts. | Requires launching the actual GUI (release binary), which wasn't done in this session. |
+| Optional: kill the two pre-existing foreign `opencode serve` orphans (93440 / 97988) | They predate the PID lock's scope; the identity guard rightly never touches them. `taskkill /PID 93440 /T /F` and `taskkill /PID 97988 /T /F` will clear them. | They are the user's own stray servers; out of the app's ownership model by design. |
 | Post-smoke PR/signing | If desired, cut a `v*` tag to trigger `.github/workflows/release.yml` (NSIS + signed update manifest). | Not requested. |
 
-Exit condition for the plan: run the Gate D smoke test, then re-run the full verification suite from
-`walkthrough_integration.md` (already green above) and update this file's status table accordingly.
+Exit condition for the plan: the Gate D smoke test is complete (all items pass + close-loop fix
+verified), the full verification suite is green (`walkthrough_integration.md`: 14 files / 127 frontend
+tests, `tsc`/`build` clean) — plan is exited.
