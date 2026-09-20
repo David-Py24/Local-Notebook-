@@ -4,6 +4,13 @@ Reviewed against the working tree at HEAD `4b35a8b` plus uncommitted changes. Ve
 `npx tsc --noEmit` (exit 0), `npm test` (13 files / 108 tests, 3.25s), and a source walk of
 `src-tauri/src/commands.rs`, `src-tauri/src/lib.rs`, `src/services/opencodeClient.ts`, `src/stores/useStore.ts`.
 
+> **Status update (all resolutions landed in commits `5a36509`, `2217163`, `30bfe42`):**
+> every flaw below is fixed and gated green — see `plan_openchamber_paseo_flaws.md`. Final state:
+> frontend `npm test` 14 files / 127 tests, `npx tsc --noEmit` exit 0, `cargo test` 37 tests, `cargo check`
+> clean. Both Phase 2 features are now live (model pre-check routes stream/byok/error; session history
+> re-hydrates on resume from a persisted `opencode_session_id`), the PID lifecycle only ever signals a
+> verified `opencode` process under a non-stale lock, and the exit cleanup is single-shot on a bounded thread.
+
 ## Bottom line
 
 Phase 1 (PID lock, process-tree kill, exit hook) is real and wired, but has a **process-identity gap**
@@ -12,8 +19,8 @@ wired**: `EventPipeline` is live, but **`verifyOpencodeModelCapability` and `reh
 are dead code — exported but never called anywhere in `src/`** — so the walkthrough's claims that they
 "prevent streaming sessions with invalid models" and "re-hydrate on resume" are not true in the running app.
 
-The reported verification numbers are accurate. The whole upgrade is **uncommitted** — `HEAD` predates it,
-so there is no commit-level traceability yet.
+The reported verification numbers are accurate. The whole upgrade was **uncommitted** — `HEAD` predates it,
+so there was no commit-level traceability (now added: commits `5a36509`, `2217163`, `30bfe42`).
 
 ## What was verified as accurate
 
@@ -112,5 +119,7 @@ identity bugs below passing unnoticed.
 
 ## Additional note (pre-existing, not this upgrade)
 
-AGENTS.md flags a version drift still present: `src-tauri/tauri.conf.json` says `1.5.0`, Settings About shows
-`1.4.0`, and `package.json` is `1.0.0`. Resolve on next bump.
+AGENTS.md flagged a version drift: `src-tauri/tauri.conf.json` said `1.5.0`, Settings About showed
+`1.4.0`, and `package.json` is `1.0.0`. **Resolved** during this execution: Settings About now shows
+`1.5.0` (matching `tauri.conf.json` and `CHANGELOG.md`); `package.json`'s `1.0.0` is intentionally not
+the release version.
