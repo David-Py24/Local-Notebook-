@@ -252,6 +252,7 @@ export class EventPipeline {
   private timer: ReturnType<typeof setInterval> | null = null;
   private handler: (raw: string) => void;
   private intervalMs: number;
+  private readonly maxQueued = 500;
 
   constructor(handler: (raw: string) => void, intervalMs = 100) {
     this.handler = handler;
@@ -260,6 +261,13 @@ export class EventPipeline {
 
   public push(raw: string): void {
     this.queue.push(raw);
+    // Defensive bound (plan E2): under an SSE flood the queue must not grow
+    // unbounded. On overflow, drain the oldest slice synchronously.
+    if (this.queue.length > this.maxQueued) {
+      const overflow = this.queue.length - this.maxQueued;
+      const dropped = this.queue.splice(0, overflow);
+      for (const frame of dropped) this.handler(frame);
+    }
     if (!this.timer) {
       this.timer = setInterval(() => this.flush(), this.intervalMs);
     }
@@ -521,7 +529,7 @@ export async function streamOpencodeReply(options: {
       // idle, cf. opencode issue #26924 for part ordering) land in the final message.
       const settle = () => {
         if (settleTimer !== null) clearTimeout(settleTimer);
-        settleTimer = setTimeout(() => finish(resolve, reject), 300);
+        settleTimer = setTimeout(() => finish(resolve, reject), 150);
       };
 
       function handleEvent(raw: string) {
