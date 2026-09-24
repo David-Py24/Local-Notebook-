@@ -6,6 +6,8 @@ import { PROJECT_TEMPLATES } from "../utils/projectTemplates";
 export default function WorkspaceLauncherModal() {
   const showLauncherModal = useStore((s) => s.showLauncherModal);
   const setShowLauncherModal = useStore((s) => s.setShowLauncherModal);
+  const workspaceDraftProjectId = useStore((s) => s.workspaceDraftProjectId);
+  const setWorkspaceDraftProject = useStore((s) => s.setWorkspaceDraftProject);
   const openFolder = useStore((s) => s.openFolder);
   const scaffoldWorkspaceTemplate = useStore((s) => s.scaffoldWorkspaceTemplate);
   const projects = useStore((s) => s.projects);
@@ -24,6 +26,7 @@ export default function WorkspaceLauncherModal() {
         multiple: false,
       });
       if (selected && typeof selected === "string") {
+        setWorkspaceDraftProject(null);
         await openFolder(selected);
         setShowLauncherModal(false);
       }
@@ -108,10 +111,15 @@ export default function WorkspaceLauncherModal() {
                 <div
                   key={p.id}
                   onClick={async () => {
+                    setWorkspaceDraftProject(null);
                     await openProject(p.id);
                     setShowLauncherModal(false);
                   }}
-                  className="group flex items-center gap-3.5 rounded-2xl border border-border/10 bg-card/10 p-4 cursor-pointer hover:border-accent/40 hover:bg-card/30 transition-all duration-200"
+                  className={`group flex items-center gap-3.5 rounded-2xl border p-4 cursor-pointer transition-all duration-200 ${
+                    p.id === workspaceDraftProjectId
+                      ? "border-accent bg-accent/10"
+                      : "border-border/10 bg-card/10 hover:border-accent/40 hover:bg-card/30"
+                  }`}
                 >
                   <svg className="w-5 h-5 text-accent/60 group-hover:text-accent shrink-0 transition-colors" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />

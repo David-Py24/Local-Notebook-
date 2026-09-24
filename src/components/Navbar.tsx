@@ -1,10 +1,8 @@
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useStore } from "../stores/useStore";
 import type { Project } from "../types";
 import type { AgentSession } from "../stores/useStore";
 import EdgeResizer from "./EdgeResizer";
-
-type SectionKey = "projects" | "recents" | "allChats";
 
 export default function Navbar() {
   const showSidebar = useStore((s) => s.showSourcesPanel);
@@ -22,9 +20,13 @@ export default function Navbar() {
   const setLeftNavWidth = useStore((s) => s.setLeftNavWidth);
   const leftNavSections = useStore((s) => s.leftNavSections);
   const toggleLeftNavSection = useStore((s) => s.toggleLeftNavSection);
-  const loadLeftNavPrefs = useStore((s) => s.loadLeftNavPrefs);
+  const setWorkspaceDraftProject = useStore((s) => s.setWorkspaceDraftProject);
+  const setShowLauncherModal = useStore((s) => s.setShowLauncherModal);
   const projects = useStore((s) => s.projects);
   const openProject = useStore((s) => s.openProject);
+  const renameProject = useStore((s) => s.renameProject);
+  const deleteProject = useStore((s) => s.deleteProject);
+  const toggleProjectPinned = useStore((s) => s.toggleProjectPinned);
   const agentSessions = useStore((s) => s.agentSessions);
   const setActiveAgentSession = useStore((s) => s.setActiveAgentSession);
   const activeAgentSessionId = useStore((s) => s.activeAgentSessionId);
@@ -36,9 +38,11 @@ export default function Navbar() {
   const archiveAgentSession = useStore((s) => s.archiveAgentSession);
   const deleteAgentSession = useStore((s) => s.deleteAgentSession);
   const forkAgentSession = useStore((s) => s.forkAgentSession);
+  const userAccount = useStore((s) => s.userAccount);
 
   const [allChatsQuery, setAllChatsQuery] = useState("");
   const [hoverItem, setHoverItem] = useState<NavHover | null>(null);
+  const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>({});
   const closeHoverTimer = useRef<number | null>(null);
 
   const scheduleHoverClose = (delay = 300) => {
@@ -50,13 +54,45 @@ export default function Navbar() {
     setHoverItem(item);
   };
 
-  const sorted = [...agentSessions].sort(
-    (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)
+  const norm = (p: string) => p.toLowerCase().replace(/\\/g, "/");
+
+  const sorted = useMemo(
+    () => [...agentSessions].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)),
+    [agentSessions]
   );
-  const recents = sorted.slice(0, 5);
+
+  // Group sessions by their owning project; sessions without a matching project are
+  // "unassigned" and live in the Chats (Recents / All Chats) sections.
+  const grouped = useMemo(() => {
+    const projectIdByPath = new Map(projects.map((p) => [norm(p.path), p.id]));
+    const byProject = new Map<string, AgentSession[]>();
+    const unassigned: AgentSession[] = [];
+    for (const c of sorted) {
+      const pid = c.projectPath ? projectIdByPath.get(norm(c.projectPath)) : undefined;
+      if (pid) {
+        const arr = byProject.get(pid) ?? [];
+        arr.push(c);
+        byProject.set(pid, arr);
+      } else {
+        unassigned.push(c);
+      }
+    }
+    return { byProject, unassigned };
+  }, [sorted, projects]);
+
+  const sortedProjects = useMemo(
+    () =>
+      [...projects].sort((a, b) => {
+        if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+        return new Date(b.lastOpened).getTime() - new Date(a.lastOpened).getTime();
+      }),
+    [projects]
+  );
+
+  const recents = grouped.unassigned.slice(0, 5);
   const allChats = allChatsQuery
-    ? sorted.filter((c) => (c.title ?? "").toLowerCase().includes(allChatsQuery.toLowerCase()))
-    : sorted;
+    ? grouped.unassigned.filter((c) => (c.title ?? "").toLowerCase().includes(allChatsQuery.toLowerCase()))
+    : grouped.unassigned;
 
   const runSessionId = agentRun?.sessionId ?? null;
   const runProjectPath = runSessionId
@@ -69,24 +105,40 @@ export default function Navbar() {
     return "idle";
   };
 
+  const projectTone = (p: Project): Tone => {
+    const isOpen = currentFolderPath ? norm(currentFolderPath) === norm(p.path) : false;
+    if (isOpen) return "user";
+    if (runProjectPath && norm(runProjectPath) === norm(p.path) && goalRunning)
+      return goalPaused ? "pending" : "agent";
+    const projPending =
+      gitStatus?.isRepo === true &&
+      !!gitStatus.root &&
+      norm(gitStatus.root) === norm(p.path) &&
+      gitStatus.entries.length > 0;
+    return projPending ? "pending" : "idle";
+  };
+
   const openChat = (id: string) => {
     setActiveAgentSession(id);
     if (!showAssistant && !showAgent) toggleAssistant();
   };
 
+  const openWorkspaceLauncher = (projectId: string | null) => {
+    setWorkspaceDraftProject(projectId);
+    setShowLauncherModal(true);
+  };
+
   const handleResize = (delta: number) => {
-    setLeftNavWidth(Math.min(Math.max(leftNavWidth + delta, 140), 520));
+    setLeftNavWidth(Math.min(Math.max(leftNavWidth + delta, 190), 520));
   };
 
   return (
     <aside
-      className="relative flex h-full shrink-0 flex-col border-r border-border bg-card select-none"
+      className="relative flex h-full shrink-0 border-r border-border bg-card select-none"
       style={{ width: leftNavWidth }}
     >
-      <EdgeResizer onResize={handleResize} />
-
-      {/* Toolbar pinned to the top of the left panel */}
-      <div className="flex shrink-0 items-center gap-1 border-b border-border px-1.5 py-1">
+      {/* Vertical options rail on the left edge */}
+      <div className="flex w-9 shrink-0 flex-col items-center gap-0.5 border-r border-border py-1">
         <ToolbarButton onClick={toggleAssistant} title="Toggle Study Assistant" toggle active={showAssistant}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5 stroke-current">
             <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
@@ -111,7 +163,7 @@ export default function Navbar() {
           </svg>
         </ToolbarButton>
 
-        <div className="ml-auto flex items-center gap-1">
+        <div className="mt-auto flex flex-col items-center gap-0.5 border-t border-border pt-1">
           <ToolbarButton onClick={openNewNote} title="Create New Note (Ctrl+N)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5 stroke-current">
               <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
@@ -127,54 +179,150 @@ export default function Navbar() {
         </div>
       </div>
 
-      {/* Collapsible sections */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        <LeftNavSection title="Projects" expanded={leftNavSections.projects} onToggle={() => toggleLeftNavSection("projects")}>
-          {projects.map((p) => {
-            const isOpen = currentFolderPath?.toLowerCase() === p.path.toLowerCase();
-            const projPending =
-              gitStatus?.isRepo === true &&
-              !!gitStatus.root &&
-              gitStatus.root.toLowerCase() === p.path.toLowerCase() &&
-              gitStatus.entries.length > 0;
-            const tone = isOpen
-              ? "user"
-              : runProjectPath?.toLowerCase() === p.path.toLowerCase() && goalRunning
-                ? goalPaused
-                  ? "pending"
-                  : "agent"
-                : projPending
-                  ? "pending"
-                  : "idle";
+      {/* Content column: collapsible sections + pinned account */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <LeftNavSection title="Workspaces" expanded={leftNavSections.workspaces} onToggle={() => toggleLeftNavSection("workspaces")}>
+          {sortedProjects.map((p) => {
+            const isOpen = currentFolderPath ? norm(currentFolderPath) === norm(p.path) : false;
+            const expanded = !collapsedProjects[p.id];
+            const sessions = grouped.byProject.get(p.id) ?? [];
+            const tone = projectTone(p);
             return (
-              <button key={p.id} onClick={() => openProject(p.id)} title={isOpen ? `${p.name} (open) · ${TONE_LABEL[tone]}` : `${p.name} · ${TONE_LABEL[tone]}`}
-                style={isOpen ? SELECTED_ROW_GRADIENT : undefined}
-                onMouseEnter={(e) => { const r = e.currentTarget.getBoundingClientRect(); showHover({ kind: "project", project: p, tone, isCurrent: isOpen, x: r.right, y: r.top }); }}
-                onMouseLeave={() => scheduleHoverClose()}
-                className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs transition-colors cursor-pointer ${isOpen ? "text-red-400 font-medium" : "text-muted hover:text-white"} hover:bg-bg`}>
-                <StatusBullet tone={tone} />
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3 stroke-current">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                </svg>
-                <span className="truncate">{p.name}</span>
-                <span className="ml-auto shrink-0 text-[10px] text-muted/70">{p.lastOpened ? timeAgo(new Date(p.lastOpened).getTime()) : ""}</span>
-              </button>
+              <div key={p.id} className="px-1">
+                <div
+                  className="group flex w-full items-center gap-1 rounded-md px-1 py-1 text-left text-xs transition-colors hover:bg-bg"
+                  onMouseEnter={(e) => { const r = e.currentTarget.getBoundingClientRect(); showHover({ kind: "project", project: p, tone, isCurrent: isOpen, x: r.right, y: r.top }); }}
+                  onMouseLeave={() => scheduleHoverClose()}
+                >
+                  <button
+                    onClick={() => setCollapsedProjects((c) => ({ ...c, [p.id]: !c[p.id] }))}
+                    title={expanded ? "Collapse project" : "Expand project"}
+                    className={`shrink-0 rounded p-0.5 transition-transform cursor-pointer ${expanded ? "rotate-90" : ""}`}
+                  >
+                    <svg className="w-2.5 h-2.5 stroke-current text-muted" viewBox="0 0 24 24" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M9 18l6-6-6-6" />
+                    </svg>
+                  </button>
+                  <StatusBullet tone={tone} />
+                  <span className={`flex min-w-0 flex-1 items-center gap-1`}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3 shrink-0 stroke-current text-accent/70">
+                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                    </svg>
+                    <button
+                      onClick={() => openProject(p.id)}
+                      title={isOpen ? `${p.name} (open) · ${TONE_LABEL[tone]}` : `${p.name} · ${TONE_LABEL[tone]}`}
+                      className={`truncate text-left cursor-pointer ${isOpen ? "text-red-400 font-medium" : "text-muted hover:text-white"}`}
+                    >
+                      {p.name}
+                    </button>
+                  </span>
+                  {p.pinned && <span className="shrink-0 text-[10px] text-amber-500" title="Pinned">📌</span>}
+                  <span className="ml-auto shrink-0 text-[10px] text-muted/70">{p.lastOpened ? timeAgo(new Date(p.lastOpened).getTime()) : ""}</span>
+                  <RowKebab
+                    items={[
+                      { label: isOpen ? "Open (active)" : "Open", onClick: () => openProject(p.id) },
+                      { label: p.pinned ? "Unpin" : "Pin", onClick: () => toggleProjectPinned(p.id) },
+                      {
+                        label: "Rename",
+                        onClick: () => {
+                          const name = window.prompt("Rename project:", p.name);
+                          if (name && name.trim()) renameProject(p.id, name.trim());
+                        },
+                      },
+                      { label: "Delete", danger: true, confirm: true, onClick: () => deleteProject(p.id) },
+                    ]}
+                  />
+                  <ToolbarButton onClick={() => openWorkspaceLauncher(p.id)} title="New workspace in this project">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3 stroke-current">
+                      <line x1="12" y1="5" x2="12" y2="19" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                  </ToolbarButton>
+                </div>
+
+                {expanded && (
+                  <div className="ml-3 border-l border-border/40 pl-1.5">
+                    {sessions.map((c) => (
+                      <div
+                        key={c.id}
+                        className="group relative flex w-full items-center gap-1.5 rounded-md py-0.5 text-left text-xs"
+                        onMouseEnter={(e) => { const r = e.currentTarget.getBoundingClientRect(); showHover({ kind: "chat", session: c, tone: sessionTone(c), isCurrent: c.id === activeAgentSessionId, x: r.right, y: r.top }); }}
+                        onMouseLeave={() => scheduleHoverClose()}
+                      >
+                        <button
+                          onClick={() => openChat(c.id)}
+                          title={`${c.title ?? "Untitled"} · ${TONE_LABEL[sessionTone(c)]}`}
+                          style={c.id === activeAgentSessionId ? SELECTED_ROW_GRADIENT : undefined}
+                          className={`flex w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left transition-colors cursor-pointer ${c.id === activeAgentSessionId ? "text-red-400 font-medium" : "text-muted hover:text-white"} hover:bg-bg`}
+                        >
+                          <StatusBullet tone={sessionTone(c)} />
+                          <span className="truncate">{c.title ?? "Untitled"}</span>
+                          <span className="ml-auto shrink-0 text-[10px] text-muted/70">{timeAgo(c.updatedAt)}</span>
+                        </button>
+                        <RowKebab
+                          items={[
+                            { label: "Open", onClick: () => openChat(c.id) },
+                            { label: "Fork", onClick: () => { void forkAgentSession(c.id); } },
+                            { label: "Archive", onClick: () => { void archiveAgentSession(c.id); } },
+                            { label: "Delete", danger: true, confirm: true, onClick: () => { void deleteAgentSession(c.id); } },
+                          ]}
+                        />
+                      </div>
+                    ))}
+                    <button
+                      onClick={() => openWorkspaceLauncher(p.id)}
+                      className="flex w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left text-[11px] text-muted/70 transition-colors hover:bg-bg hover:text-white cursor-pointer"
+                      title="Create a new workspace (chat) in this project"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3 stroke-current">
+                        <line x1="12" y1="5" x2="12" y2="19" />
+                        <line x1="5" y1="12" x2="19" y2="12" />
+                      </svg>
+                      New workspace
+                    </button>
+                  </div>
+                )}
+              </div>
             );
           })}
-          {projects.length === 0 && <p className="px-2 py-1 text-[11px] text-muted">No projects yet.</p>}
+          {sortedProjects.length === 0 && (
+            <p className="px-2 py-1 text-[11px] text-muted">No projects yet.</p>
+          )}
+          <button
+            onClick={() => openWorkspaceLauncher(null)}
+            className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-[11px] text-muted/70 transition-colors hover:bg-bg hover:text-white cursor-pointer"
+            title="Add a project / workspace"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3 stroke-current">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+            Add project
+          </button>
         </LeftNavSection>
 
         <LeftNavSection title="Recents" expanded={leftNavSections.recents} onToggle={() => toggleLeftNavSection("recents")}>
           {recents.map((c) => (
-            <button key={c.id} onClick={() => openChat(c.id)} title={`${c.title ?? "Untitled"} · ${TONE_LABEL[sessionTone(c)]}`}
-              style={c.id === activeAgentSessionId ? SELECTED_ROW_GRADIENT : undefined}
-              onMouseEnter={(e) => { const r = e.currentTarget.getBoundingClientRect(); showHover({ kind: "chat", session: c, tone: sessionTone(c), isCurrent: c.id === activeAgentSessionId, x: r.right, y: r.top }); }}
-              onMouseLeave={() => scheduleHoverClose()}
-              className={`flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs transition-colors cursor-pointer ${c.id === activeAgentSessionId ? "text-red-400 font-medium" : "text-muted hover:text-white"} hover:bg-bg`}>
-              <StatusBullet tone={sessionTone(c)} />
-              <span className="truncate">{c.title ?? "Untitled"}</span>
-              <span className="ml-auto shrink-0 text-[10px] text-muted/70">{timeAgo(c.updatedAt)}</span>
-            </button>
+            <div key={c.id} className="group relative flex w-full items-center gap-1.5 rounded-md px-1 text-left text-xs">
+              <button onClick={() => openChat(c.id)} title={`${c.title ?? "Untitled"} · ${TONE_LABEL[sessionTone(c)]}`}
+                style={c.id === activeAgentSessionId ? SELECTED_ROW_GRADIENT : undefined}
+                onMouseEnter={(e) => { const r = e.currentTarget.getBoundingClientRect(); showHover({ kind: "chat", session: c, tone: sessionTone(c), isCurrent: c.id === activeAgentSessionId, x: r.right, y: r.top }); }}
+                onMouseLeave={() => scheduleHoverClose()}
+                className={`flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1 text-left text-xs transition-colors cursor-pointer ${c.id === activeAgentSessionId ? "text-red-400 font-medium" : "text-muted hover:text-white"} hover:bg-bg`}>
+                <StatusBullet tone={sessionTone(c)} />
+                <span className="truncate">{c.title ?? "Untitled"}</span>
+                <span className="ml-auto shrink-0 text-[10px] text-muted/70">{timeAgo(c.updatedAt)}</span>
+              </button>
+              <RowKebab
+                items={[
+                  { label: "Open", onClick: () => openChat(c.id) },
+                  { label: "Fork", onClick: () => { void forkAgentSession(c.id); } },
+                  { label: "Archive", onClick: () => { void archiveAgentSession(c.id); } },
+                  { label: "Delete", danger: true, confirm: true, onClick: () => { void deleteAgentSession(c.id); } },
+                ]}
+              />
+            </div>
           ))}
           {recents.length === 0 && <p className="px-2 py-1 text-[11px] text-muted">No recent chats.</p>}
         </LeftNavSection>
@@ -188,18 +336,42 @@ export default function Navbar() {
             className="mx-2 mb-1 w-[calc(100%-16px)] rounded-md border border-border bg-bg px-2 py-1 text-[11px] text-white placeholder:text-muted outline-none"
           />
           {allChats.map((c) => (
-            <button key={c.id} onClick={() => openChat(c.id)} title={`${c.title ?? "Untitled"} · ${TONE_LABEL[sessionTone(c)]}`}
-              style={c.id === activeAgentSessionId ? SELECTED_ROW_GRADIENT : undefined}
-              onMouseEnter={(e) => { const r = e.currentTarget.getBoundingClientRect(); showHover({ kind: "chat", session: c, tone: sessionTone(c), isCurrent: c.id === activeAgentSessionId, x: r.right, y: r.top }); }}
-              onMouseLeave={() => scheduleHoverClose()}
-              className={`flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs transition-colors cursor-pointer ${c.id === activeAgentSessionId ? "text-red-400 font-medium" : "text-muted hover:text-white"} hover:bg-bg`}>
-              <StatusBullet tone={sessionTone(c)} />
-              <span className="truncate">{c.title ?? "Untitled"}</span>
-              <span className="ml-auto shrink-0 text-[10px] text-muted/70">{timeAgo(c.updatedAt)}</span>
-            </button>
+            <div key={c.id} className="group relative flex w-full items-center gap-1.5 rounded-md px-1 text-left text-xs">
+              <button onClick={() => openChat(c.id)} title={`${c.title ?? "Untitled"} · ${TONE_LABEL[sessionTone(c)]}`}
+                style={c.id === activeAgentSessionId ? SELECTED_ROW_GRADIENT : undefined}
+                onMouseEnter={(e) => { const r = e.currentTarget.getBoundingClientRect(); showHover({ kind: "chat", session: c, tone: sessionTone(c), isCurrent: c.id === activeAgentSessionId, x: r.right, y: r.top }); }}
+                onMouseLeave={() => scheduleHoverClose()}
+                className={`flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1 text-left text-xs transition-colors cursor-pointer ${c.id === activeAgentSessionId ? "text-red-400 font-medium" : "text-muted hover:text-white"} hover:bg-bg`}>
+                <StatusBullet tone={sessionTone(c)} />
+                <span className="truncate">{c.title ?? "Untitled"}</span>
+                <span className="ml-auto shrink-0 text-[10px] text-muted/70">{timeAgo(c.updatedAt)}</span>
+              </button>
+              <RowKebab
+                items={[
+                  { label: "Open", onClick: () => openChat(c.id) },
+                  { label: "Fork", onClick: () => { void forkAgentSession(c.id); } },
+                  { label: "Archive", onClick: () => { void archiveAgentSession(c.id); } },
+                  { label: "Delete", danger: true, confirm: true, onClick: () => { void deleteAgentSession(c.id); } },
+                ]}
+              />
+            </div>
           ))}
         </LeftNavSection>
+        </div>
+
+        {/* Pinned bottom block: account */}
+        <div className="flex shrink-0 items-center gap-2 border-t border-border px-2 py-1.5">
+          <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-purple-600 font-bold text-xs text-white shadow-xs">
+            {userAccount?.avatarLetter || "D"}
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-[10px] font-semibold text-white">{userAccount?.name || "Developer Workspace"}</p>
+            <p className="truncate text-[9px] text-muted">{userAccount?.email || "developer@localnotebook.app"}</p>
+          </div>
+        </div>
       </div>
+
+      <EdgeResizer onResize={handleResize} />
 
       {hoverItem && (
         <HoverDetailCard
@@ -274,9 +446,92 @@ function StatusBullet({ tone }: { tone: Tone }) {
   return <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${cls}`} />;
 }
 
-type NavHover =
-  | { kind: "chat"; session: AgentSession; tone: Tone; isCurrent: boolean; x: number; y: number }
-  | { kind: "project"; project: Project; tone: Tone; isCurrent: boolean; x: number; y: number };
+interface RowMenuItem {
+  label: string;
+  onClick: () => void;
+  danger?: boolean;
+  /** two-step confirm: first click arms, second click fires */
+  confirm?: boolean;
+}
+
+/** ⋯ overflow menu, rendered fixed so it survives overflow-hidden parents. */
+function RowKebab({ items }: { items: RowMenuItem[] }) {
+  const [open, setOpen] = useState(false);
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+
+  const toggle = () => {
+    setOpen((o) => {
+      if (!o && btnRef.current) {
+        const r = btnRef.current.getBoundingClientRect();
+        setPos({ left: Math.max(4, r.right - 168), top: Math.max(4, r.bottom + 4) });
+      }
+      if (o) setConfirming(null);
+      return !o;
+    });
+  };
+
+  const run = (item: RowMenuItem) => {
+    if (item.confirm) {
+      if (confirming === item.label) {
+        item.onClick();
+        setConfirming(null);
+        setOpen(false);
+      } else {
+        setConfirming(item.label);
+      }
+      return;
+    }
+    item.onClick();
+    setOpen(false);
+  };
+
+  return (
+    <>
+      <button
+        ref={btnRef}
+        onClick={(e) => { e.stopPropagation(); toggle(); }}
+        title="More options"
+        className={`shrink-0 rounded-md p-1 text-muted/60 transition-colors hover:bg-bg hover:text-white cursor-pointer ${open ? "text-white bg-bg" : "opacity-0 group-hover:opacity-100 focus:opacity-100"}`}
+      >
+        <svg viewBox="0 0 24 24" fill="currentColor" className="w-3.5 h-3.5">
+          <circle cx="5" cy="12" r="1.6" />
+          <circle cx="12" cy="12" r="1.6" />
+          <circle cx="19" cy="12" r="1.6" />
+        </svg>
+      </button>
+      {open && pos && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => { setOpen(false); setConfirming(null); }} />
+          <div
+            style={{ left: pos.left, top: pos.top }}
+            className="fixed z-50 w-40 rounded-md border border-border bg-card p-1 text-xs text-text shadow-2xl animate-in fade-in zoom-in-95 duration-100"
+          >
+            {items.map((item) => {
+              const armed = item.confirm && confirming === item.label;
+              return (
+                <button
+                  key={item.label}
+                  onClick={() => run(item)}
+                  className={`block w-full rounded px-2 py-1 text-left transition-colors cursor-pointer ${
+                    item.danger
+                      ? armed
+                        ? "bg-red-500/80 font-semibold text-white"
+                        : "text-red-400 hover:bg-red-500/10"
+                      : "hover:bg-bg hover:text-white"
+                  }`}
+                >
+                  {armed ? `Confirm ${item.label.toLowerCase()}?` : item.label}
+                </button>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </>
+  );
+}
 
 function timeAgo(ts?: number | null): string {
   if (!ts || Number.isNaN(ts)) return "";
@@ -291,6 +546,10 @@ function timeAgo(ts?: number | null): string {
   if (days < 30) return `${Math.floor(days / 7)}w ago`;
   return new Date(ts).toLocaleDateString();
 }
+
+type NavHover =
+  | { kind: "chat"; session: AgentSession; tone: Tone; isCurrent: boolean; x: number; y: number }
+  | { kind: "project"; project: Project; tone: Tone; isCurrent: boolean; x: number; y: number };
 
 interface HoverDetailCardProps {
   item: NavHover;

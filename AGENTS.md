@@ -4,7 +4,7 @@ Cross-tool structural guide for AI coding agents (opencode, Claude Code, Cursor,
 
 ## What this project is
 
-An Obsidian-style, local-first **study notebook** desktop app built with **Tauri v2 + React 19 + TypeScript + Vite + SQLite**. Users browse local folders as "vaults", read sources, take Markdown notes in a split/continuous CodeMirror editor, manage projects with templates, and customize appearance with persistent dark themes. Everything is local — there is no server.
+An Obsidian-style, local-first **study notebook** desktop app built with **Tauri v2 + React 19 + TypeScript + Vite + SQLite**. Users browse local folders as "vaults", read sources, take Markdown notes in a split/continuous CodeMirror editor, manage projects with templates, and customize appearance with persistent dark themes. Everything is local — there is no server. 
 
 On top of the notebook core, the app embeds several AI/agent subsystems (see "AI & agent layers" below), so the surface area is larger than a plain notes app:
 

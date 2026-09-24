@@ -562,12 +562,15 @@ interface AppState {
   rightLivePreviewActive: boolean;
   sourcePreviewHeight: number;
   sourcePanelWidth: number;
-  leftNavWidth: number;     // pixel width of the left chat+projects panel (LEFT_NAV_CHATS_AND_PROJECTS_PLAN.md)
+  leftNavWidth: number;     // pixel width of the left chat+workspaces panel (Paseo-style nav)
   setLeftNavWidth: (w: number) => void;
   loadLeftNavPrefs: () => void;                  // hydrate collapsed-section + width from localStorage
-  // collapse flags for the left-nav sections (Projects / Recents / All Chats)
-  leftNavSections: { projects: boolean; recents: boolean; allChats: boolean };
-  toggleLeftNavSection: (which: "projects" | "recents" | "allChats") => void;
+  // collapse flags for the left-nav sections (Workspaces / Recents / All Chats)
+  leftNavSections: { workspaces: boolean; recents: boolean; allChats: boolean };
+  toggleLeftNavSection: (which: "workspaces" | "recents" | "allChats") => void;
+  // Paseo-style ghost-row: "+ New workspace" opens the launcher pre-selected to a project.
+  workspaceDraftProjectId: string | null;
+  setWorkspaceDraftProject: (id: string | null) => void;
   splitLeftWidth: number;   // pixel width of the left split pane (right pane absorbs the rest)
 
   // Artifacts panel
@@ -916,6 +919,23 @@ export const useStore = create<AppState>((set, get) => {
   const savedFolder = localStorage.getItem("lsn_last_folder");
   const localProjects = localStorage.getItem("lsn_projects");
   const initialProjects: Project[] = localProjects ? JSON.parse(localProjects) : [];
+  // Left-nav width + collapse flags hydrated at init so the panel doesn't flash defaults.
+  const rawLeftNavWidth = localStorage.getItem("lsn_left_nav_width");
+  const rawLeftNavSections = localStorage.getItem("lsn_left_nav_sections");
+  const parsedLeftNavWidth = rawLeftNavWidth ? Number(rawLeftNavWidth) : NaN;
+  let parsedLeftNavSections: { workspaces: boolean; recents: boolean; allChats: boolean } = {
+    workspaces: true, recents: false, allChats: true,
+  };
+  try {
+    const s = rawLeftNavSections ? JSON.parse(rawLeftNavSections) : null;
+    if (s && typeof s === "object") {
+      const workspaces =
+        typeof s.workspaces === "boolean" ? s.workspaces
+          : typeof s.projects === "boolean" ? s.projects // migration: old key was `projects`
+            : true;
+      parsedLeftNavSections = { workspaces, recents: !!s.recents, allChats: s.allChats !== false };
+    }
+  } catch { /* ignore malformed prefs */ }
   const localPanelOrder = localStorage.getItem("lsn_panel_order");
   const parsedPanelOrder: SidePanelId[] | null = localPanelOrder ? JSON.parse(localPanelOrder) : null;
   const VALID_PANEL_IDS: SidePanelId[] = ["assistant", "sources", "artifacts", "agent", "worktree"];
@@ -982,8 +1002,9 @@ export const useStore = create<AppState>((set, get) => {
     rightLivePreviewActive: false,
     sourcePreviewHeight: 250,
     splitLeftWidth: 0,
-    leftNavWidth: 240,
-    leftNavSections: { projects: false, recents: false, allChats: true },   // Projects & Recents collapsed by default, All Chats expanded
+    leftNavWidth: Number.isFinite(parsedLeftNavWidth) && parsedLeftNavWidth >= 120 ? parsedLeftNavWidth : 240,
+    leftNavSections: parsedLeftNavSections,
+    workspaceDraftProjectId: null,
 
     // Artifacts
     showArtifactsPanel: false,
@@ -1643,17 +1664,24 @@ export const useStore = create<AppState>((set, get) => {
       set((s) => ({ leftNavSections: { ...s.leftNavSections, [which]: !s.leftNavSections[which] } }));
       localStorage.setItem("lsn_left_nav_sections", JSON.stringify(get().leftNavSections));
     },
+    setWorkspaceDraftProject: (id) => set({ workspaceDraftProjectId: id }),
     loadLeftNavPrefs: () => {
       try {
         const rawWidth = localStorage.getItem("lsn_left_nav_width");
         const rawSections = localStorage.getItem("lsn_left_nav_sections");
         const width = rawWidth ? Number(rawWidth) : NaN;
         const sections = rawSections ? JSON.parse(rawSections) : null;
+        const workspaces =
+          sections && typeof sections === "object" && typeof sections.workspaces === "boolean"
+            ? sections.workspaces
+            : sections && typeof sections === "object" && typeof sections.projects === "boolean" // migration: old key was `projects`
+              ? sections.projects
+              : true;
         set({
           leftNavWidth: Number.isFinite(width) && width >= 120 ? width : 240,
           leftNavSections: sections && typeof sections === "object"
-            ? { projects: !!sections.projects, recents: !!sections.recents, allChats: sections.allChats !== false }
-            : { projects: false, recents: false, allChats: true },
+            ? { workspaces, recents: !!sections.recents, allChats: sections.allChats !== false }
+            : { workspaces: true, recents: false, allChats: true },
         });
       } catch {
         // fall through to defaults
